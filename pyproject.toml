@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forge"
+version = "0.1.0"
+description = "Forge: an open-source research-grade foundation LLM (MoE, 128K context, distributed training + inference)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Forge Team" }]
+keywords = ["llm", "transformer", "moe", "deep-learning", "pytorch", "ai"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.1",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+# None of these are required for Phase 1. flash-attn is the optimized attention
+# backend (hardware-specific); transformers is only used for later HF export.
+flash-attn = ["flash-attn>=2.0"]
+transformers = ["transformers>=4.36"]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[project.scripts]
+forge-tiny = "scripts.cli:main"
+forge-configs = "configs.compute:main"
+
+[tool.setuptools.packages.find]
+include = ["model*", "configs*", "utils*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.coverage.run]
+source = ["model", "configs"]
