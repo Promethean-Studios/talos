@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Tooling
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Model artifacts / checkpoints (never commit weights)
+*.pt
+*.ckpt
+*.safetensors
+*.bin
+checkpoints/
+runs/
+
+# Logs
+*.log
+logs/
