@@ -1,6 +1,6 @@
-"""Model configuration for Forge.
+"""Model configuration for Talos.
 
-A single :class:`ModelConfig` describes every Forge model from the tiny dev
+A single :class:`ModelConfig` describes every Talos model from the tiny dev
 config up to the ~400B MoE. The same code path in :mod:`model` is instantiated
 from any of these — only the numbers change.
 
@@ -15,7 +15,7 @@ from typing import Iterable, List, Optional, Tuple
 
 @dataclass
 class ModelConfig:
-    """Hyper-parameters for a Forge decoder-only MoE transformer.
+    """Hyper-parameters for a Talos decoder-only MoE transformer.
 
     All dimensions are derived from a small set of knobs. :meth:`derive`
     fills in any fields that can be computed from the rest, so callers can

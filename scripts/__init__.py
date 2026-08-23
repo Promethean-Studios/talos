@@ -1,4 +1,4 @@
-"""Developer CLI scripts for Forge.
+"""Developer CLI scripts for Talos.
 
 Entry points::
 

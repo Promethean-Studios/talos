@@ -10,7 +10,7 @@ This runs on CPU with only torch + pytest.
 """
 import torch
 
-from model import ForgeGPT, ModelConfig, PlainAttentionBackend
+from model import TalosGPT, ModelConfig, PlainAttentionBackend
 
 
 def build_long_config(seq_len: int) -> ModelConfig:
@@ -44,7 +44,7 @@ def test_long_context_hybrid_forward_at_max_len():
     cfg = build_long_config(seq_len)
     # Force the plain backend explicitly (no flash-attn here anyway).
     backend = PlainAttentionBackend(chunk_size=cfg.attention_chunk_size)
-    model = ForgeGPT(cfg, attention_backend=backend).eval()
+    model = TalosGPT(cfg, attention_backend=backend).eval()
 
     ids = torch.randint(0, cfg.vocab_size, (1, seq_len))
     with torch.no_grad():
@@ -62,7 +62,7 @@ def test_long_context_prefill_then_decode():
     seq_len = 8192
     torch.manual_seed(0)
     cfg = build_long_config(seq_len)
-    model = ForgeGPT(cfg, attention_backend=PlainAttentionBackend(512)).eval()
+    model = TalosGPT(cfg, attention_backend=PlainAttentionBackend(512)).eval()
 
     # Prefill slightly less than max so decoded positions stay in range.
     prefill_len = seq_len - 3

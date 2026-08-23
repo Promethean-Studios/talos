@@ -1,6 +1,6 @@
 # Phase 2 — Tokenizer (status)
 
-Owner of this file: Forge team (working hypothesis, not owner-ratified).
+Owner of this file: Talos team (working hypothesis, not owner-ratified).
 
 ## Status: COMPLETE (all deliverables in)
 

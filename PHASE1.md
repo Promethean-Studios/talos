@@ -1,4 +1,4 @@
-# Forge — Phase 1 MVP Summary
+# Talos — Phase 1 MVP Summary
 
 Status: **FULLY COMPLETE.** All Phase 1 modules implemented, `pytest` passes on
 CPU, the tiny config runs forward+backward end to end, and the long-context
@@ -10,7 +10,7 @@ Repository at `/home/team/shared/forge/`.
 
 | Path | Contents |
 |---|---|
-| `model/` | `config.py` (ModelConfig), `rms_norm.py`, `activations.py` (SwiGLU), `rotary.py` (RoPE+YaRN), `attention.py` (AttentionInterface, Plain + FlashAttention backends, chunked), `moe.py` (top-k routing + load-balance + MoE block), `ffn.py` (dense + shared FFNInterface), `block.py` (DecoderLayer, hybrid attention), `gpt.py` (ForgeGPT), `cache.py` (KV cache), `masking.py`, `utils.py` (seeds/logging) |
+| `model/` | `config.py` (ModelConfig), `rms_norm.py`, `activations.py` (SwiGLU), `rotary.py` (RoPE+YaRN), `attention.py` (AttentionInterface, Plain + FlashAttention backends, chunked), `moe.py` (top-k routing + load-balance + MoE block), `ffn.py` (dense + shared FFNInterface), `block.py` (DecoderLayer, hybrid attention), `gpt.py` (TalosGPT), `cache.py` (KV cache), `masking.py`, `utils.py` (seeds/logging) |
 | `configs/` | `presets.py` (6 configs), `compute.py` (params/memory/FLOPs helper + CLI) |
 | `tests/` | unit tests for every module + integration + long-context (see below) |
 | `docs/` | `architecture.md` — all design decisions + where hardware-specific code is abstracted |

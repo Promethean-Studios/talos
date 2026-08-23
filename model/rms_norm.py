@@ -1,6 +1,6 @@
 """Root-mean-square layer normalization (RMSNorm).
 
-RMSNorm pre-norm is used everywhere in Forge (attention pre-norm and the final
+RMSNorm pre-norm is used everywhere in Talos (attention pre-norm and the final
 head norm). Unlike LayerNorm it has no mean-centering or bias term — only a
 per-channel learnable gain, which makes it cheap and stable at scale.
 """

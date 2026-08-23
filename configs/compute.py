@@ -174,8 +174,8 @@ def summarize_all(presets: Optional[Dict[str, callable]] = None) -> str:
 def main(argv: Optional[list] = None) -> None:
     """CLI: print compute estimates for one or all preset configs."""
     parser = argparse.ArgumentParser(
-        prog="forge-configs",
-        description="Print parameter / memory / FLOP estimates for Forge configs.",
+        prog="talos-configs",
+        description="Print parameter / memory / FLOP estimates for Talos configs.",
     )
     parser.add_argument(
         "name",

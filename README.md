@@ -1,6 +1,6 @@
-# Forge
+# Talos
 
-**Forge** is an open-source, research-grade codebase for building and training a
+**Talos** is an open-source, research-grade codebase for building and training a
 modern decoder-only **mixture-of-experts (MoE)** foundation LLM — roughly
 **400B total / ~30B active parameters**, a **128K-token context window**, and
 full distributed-training + efficient-inference-ready infrastructure.
@@ -12,7 +12,7 @@ pseudocode.
 
 ## Highlights
 
-- **One architecture, six sizes.** The same `ForgeGPT` model builds the `tiny`
+- **One architecture, six sizes.** The same `TalosGPT` model builds the `tiny`
   dev model or the `~400B` MoE; only the numbers change.
 - **GQA attention** (`num_kv_heads < num_attention_heads`) with **RoPE**
   (optional **YaRN** long-context scaling).
@@ -31,7 +31,7 @@ pseudocode.
 
 ```
 model/          core model (RMSNorm, SwiGLU, RoPE/YaRN, attention backends,
-                MoE, decoder layer, ForgeGPT, KV cache, masking)
+                MoE, decoder layer, TalosGPT, KV cache, masking)
 configs/        ModelConfig + 6 presets (tiny…400B) + compute estimates
 training/       (Phase 2) distributed training
 data/           (Phase 3) data pipeline
@@ -60,11 +60,11 @@ python -m pytest
 ```
 
 ```python
-from model import ForgeGPT, ModelConfig
+from model import TalosGPT, ModelConfig
 from configs.presets import tiny_config
 
 cfg = tiny_config().derive()
-model = ForgeGPT(cfg)
+model = TalosGPT(cfg)
 logits, _ = model(torch.randint(0, 1024, (2, 32)))   # (2, 32, 1024)
 ```
 

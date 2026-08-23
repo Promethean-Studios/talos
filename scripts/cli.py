@@ -1,4 +1,4 @@
-"""CLI: build a tiny Forge model and run a forward + backward pass.
+"""CLI: build a tiny Talos model and run a forward + backward pass.
 
 Usage::
 
@@ -16,14 +16,14 @@ from typing import Optional
 
 import torch
 
-from model import ForgeGPT, ModelConfig
+from model import TalosGPT, ModelConfig
 from model.utils import get_logger, set_seed
 
 log = get_logger("cli")
 
 
 def make_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Run a tiny Forge model forward/backward.")
+    p = argparse.ArgumentParser(description="Run a tiny Talos model forward/backward.")
     p.add_argument("--steps", type=int, default=3, help="optimiser steps to run")
     p.add_argument("--seq", type=int, default=64, help="sequence length per step")
     p.add_argument("--batch", type=int, default=2, help="batch size")
@@ -62,7 +62,7 @@ def main(argv: Optional[list] = None) -> None:
     log.info("device=%s", device)
 
     cfg = tiny_config(args.moe)
-    model = ForgeGPT(cfg)
+    model = TalosGPT(cfg)
     model.to(device)
     log.info("built %s with %d params", type(model).__name__, model.num_parameters())
     if args.moe:

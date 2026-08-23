@@ -9,13 +9,13 @@ from typing import Optional
 import numpy as np
 import torch
 
-LOGGER_NAME = "forge"
+LOGGER_NAME = "talos"
 
 
 def get_logger(name: Optional[str] = None) -> logging.Logger:
-    """Return a child logger under the shared ``forge`` namespace.
+    """Return a child logger under the shared ``talos`` namespace.
 
-    A single handler is installed once on the root ``forge`` logger so that all
+    A single handler is installed once on the root ``talos`` logger so that all
     module loggers share the same console format without duplicating handlers.
     """
     logger = logging.getLogger(f"{LOGGER_NAME}.{name}" if name else LOGGER_NAME)

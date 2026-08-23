@@ -1,1 +1,1 @@
-"""Forge training module (Phase 2+). See PLAN.md for scope. Not yet implemented in Phase 1."""
+"""Talos training module (Phase 2+). See PLAN.md for scope. Not yet implemented in Phase 1."""
