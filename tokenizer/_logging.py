@@ -1,4 +1,4 @@
-"""Forge-style structured logging for the tokenizer (no torch dependency).
+"""Talos-style structured logging for the tokenizer (no torch dependency).
 
 The main :mod:`model.utils` logger imports torch, which Phase 2 explicitly
 does *not* want. This module provides a same-format logger using only the
@@ -11,11 +11,11 @@ import logging
 import os
 from typing import Optional
 
-LOGGER_NAME = "forge.tokenizer"
+LOGGER_NAME = "talos.tokenizer"
 
 
 def get_logger(name: Optional[str] = None) -> logging.Logger:
-    """Return a child logger under the shared ``forge.tokenizer`` namespace.
+    """Return a child logger under the shared ``talos.tokenizer`` namespace.
 
     Mirrors :func:`model.utils.get_logger`'s formatting but intentionally
     avoids importing torch.

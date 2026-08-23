@@ -1,6 +1,6 @@
-"""Forge model stack: config, layers, attention backends, MoE and the GPT model."""
+"""Talos model stack: config, layers, attention backends, MoE and the GPT model."""
 from model.config import ModelConfig
-from model.gpt import ForgeGPT
+from model.gpt import TalosGPT
 from model.cache import KVCache
 from model.rms_norm import RMSNorm
 from model.rotary import RotaryEmbedding, apply_rotary_pos_emb
@@ -17,7 +17,7 @@ from model.block import DecoderLayer
 
 __all__ = [
     "ModelConfig",
-    "ForgeGPT",
+    "TalosGPT",
     "KVCache",
     "RMSNorm",
     "RotaryEmbedding",

@@ -1,7 +1,7 @@
 """Pytest bootstrap: make the repo root importable as ``model`` / ``configs``.
 
 This lets ``pytest`` run from the repo root with only ``torch`` + ``pytest``
-installed, even when Forge hasn't been ``pip install -e``'d.
+installed, even when Talos hasn't been ``pip install -e``'d.
 """
 from __future__ import annotations
 

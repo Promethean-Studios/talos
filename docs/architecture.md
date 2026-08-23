@@ -1,4 +1,4 @@
-# Forge Architecture
+# Talos Architecture
 
 This document explains **every major design decision** in the Phase 1 MVP and
 honestly notes where a hardware-specific optimization is abstracted behind a
@@ -29,7 +29,7 @@ experts per token, cutting active compute by an order of magnitude.
   count as active — a cheap "always-on" dense path.
 - **Grouped experts** (`grouped_experts`) partition the router so selection is
   constrained within groups (DeepSeek-V3/Wiki-MoE style); the router emits a
-  per-group logit and Forge max-pools over groups.
+  per-group logit and Talos max-pools over groups.
 - The dispatch loop uses `index_add` over `index_select`ed tokens, which keeps
   the MoE **sparse** (each token only passes through its chosen experts) while
   remaining **autograd-compatible** so router and expert gradients both flow.
@@ -92,7 +92,7 @@ head norm.
 ## 7. Long context: hybrid sliding-window + periodic full attention
 
 Full quadratic attention at 128K would materialize a `131072 x 131072` attention
-matrix — infeasible. Forge uses a **hybrid** scheme (`attention_type="hybrid"`):
+matrix — infeasible. Talos uses a **hybrid** scheme (`attention_type="hybrid"`):
 
 - Most layers are **sliding-window attention** (`sliding_window_size`, e.g.
   16K): each query attends only the last `window` keys. Cost/memory drop from
@@ -171,7 +171,7 @@ is for, and the abstraction makes the swap a one-line config choice.
 `KVCache` (`model/cache.py`) is a pre-allocated buffer
 `(layers, batch, kv_heads, max_seq, head_dim)`. `update()` writes a new block
 and returns the whole cached prefix; `get_window()` returns the last `window`
-positions for sliding decode; `reset()` clears between sequences. `ForgeGPT`
+positions for sliding decode; `reset()` clears between sequences. `TalosGPT`
 uses it for prefill (all tokens at once) and for incremental one-token-at-a-time
 decode (position-aware RoPE + cache), with the prefill/decode equivalence
 verified by tests.

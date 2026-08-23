@@ -26,7 +26,7 @@ not characters or `\p{...}` script classes. The design gives:
   fast but bakes in script/whitespace assumptions. Byte-level BPE needs no such
   assumptions, so it is the only choice that trains cleanly on a *multilingual*
   corpus mixing Latin, CJK, Arabic, Devanagari, Cyrillic, code and math without
-  a hand-maintained script table. This matches the Forge plan's requirement for
+  a hand-maintained script table. This matches the Talos plan's requirement for
   "strong reasoning/coding/multilingual capability" from one code path.
 
 ## Vocabulary layout

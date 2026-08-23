@@ -13,7 +13,7 @@ import argparse
 
 import torch
 
-from model import ForgeGPT
+from model import TalosGPT
 from model.utils import get_logger, set_seed
 from configs.presets import tiny_config
 
@@ -29,7 +29,7 @@ def main() -> None:
 
     set_seed(args.seed)
     cfg = tiny_config().derive()
-    model = ForgeGPT(cfg).eval()
+    model = TalosGPT(cfg).eval()
 
     prompt = torch.randint(0, cfg.vocab_size, (1, args.prompt_len))
     with torch.no_grad():

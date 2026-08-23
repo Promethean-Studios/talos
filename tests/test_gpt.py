@@ -1,7 +1,7 @@
-"""Integration tests for the full ForgeGPT model (forward/backward, cache)."""
+"""Integration tests for the full TalosGPT model (forward/backward, cache)."""
 import torch
 
-from model import ForgeGPT, ModelConfig
+from model import TalosGPT, ModelConfig
 
 
 def dense_tiny(**overrides) -> ModelConfig:
@@ -27,7 +27,7 @@ def moe_tiny(**overrides) -> ModelConfig:
 
 def test_forward_shape_tiny_dense():
     torch.manual_seed(0)
-    model = ForgeGPT(dense_tiny())
+    model = TalosGPT(dense_tiny())
     x = torch.randint(0, 256, (2, 16))
     logits, cache = model(x)
     assert logits.shape == (2, 16, 256)
@@ -36,7 +36,7 @@ def test_forward_shape_tiny_dense():
 
 def test_forward_backward_tiny_dense():
     torch.manual_seed(0)
-    model = ForgeGPT(dense_tiny())
+    model = TalosGPT(dense_tiny())
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
     x = torch.randint(0, 256, (2, 32))
     logits, _ = model(x)
@@ -53,7 +53,7 @@ def test_forward_backward_tiny_dense():
 
 def test_forward_backward_tiny_moe():
     torch.manual_seed(0)
-    model = ForgeGPT(moe_tiny())
+    model = TalosGPT(moe_tiny())
     x = torch.randint(0, 256, (2, 32))
     logits, _ = model(x)
     loss = torch.nn.functional.cross_entropy(
@@ -68,7 +68,7 @@ def test_forward_backward_tiny_moe():
 
 def test_prefill_decode_match_dense():
     torch.manual_seed(0)
-    model = ForgeGPT(dense_tiny(max_seq_len=64)).eval()
+    model = TalosGPT(dense_tiny(max_seq_len=64)).eval()
     seq = 40
     ids = torch.randint(0, 256, (1, seq))
     with torch.no_grad():
@@ -92,7 +92,7 @@ def test_prefill_decode_match_sliding():
     torch.manual_seed(0)
     cfg = dense_tiny(max_seq_len=128, attention_type="hybrid",
                      sliding_window_size=8, periodic_full_every=4)
-    model = ForgeGPT(cfg).eval()
+    model = TalosGPT(cfg).eval()
     seq = 96
     ids = torch.randint(0, 256, (1, seq))
     with torch.no_grad():
@@ -111,7 +111,7 @@ def test_prefill_decode_match_sliding():
 
 
 def test_sequence_length_validation():
-    model = ForgeGPT(dense_tiny(max_seq_len=64))
+    model = TalosGPT(dense_tiny(max_seq_len=64))
     x = torch.randint(0, 256, (1, 65))
     try:
         model(x)
@@ -121,7 +121,7 @@ def test_sequence_length_validation():
 
 
 def test_param_count_reasonable():
-    model = ForgeGPT(dense_tiny())
+    model = TalosGPT(dense_tiny())
     # hidden=64: params should be in the ~200-400K range (analytic estimate).
     n = model.num_parameters()
     assert 100_000 < n < 500_000
@@ -129,7 +129,7 @@ def test_param_count_reasonable():
 
 def test_tied_embeddings():
     cfg = dense_tiny(tie_word_embeddings=True)
-    model = ForgeGPT(cfg)
+    model = TalosGPT(cfg)
     assert model.lm_head is None
     x = torch.randint(0, 256, (1, 8))
     logits, _ = model(x)

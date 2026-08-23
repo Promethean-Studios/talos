@@ -1,6 +1,6 @@
 """Attention backends behind a clean :class:`AttentionInterface`.
 
-Forge decouples *what* attention computes from *how* it is executed:
+Talos decouples *what* attention computes from *how* it is executed:
 
 * :class:`PlainAttentionBackend` — a fully functional, auto-differentiable
   implementation that runs on any CPU/GPU. It supports two execution modes:
@@ -9,7 +9,7 @@ Forge decouples *what* attention computes from *how* it is executed:
   for sliding window) instead of ``O(seq^2)``. This is what keeps 128K contexts
   feasible on the functional backend.
 * :class:`FlashAttentionBackend` — an optimized GPU kernel. Its import is
-  guarded so Forge runs fine without ``flash-attn`` installed; when the package
+  guarded so Talos runs fine without ``flash-attn`` installed; when the package
   is present it is used automatically, otherwise we fall back to plain.
 
 Both implement the same :class:`AttentionInterface`, so a config can swap them
@@ -26,7 +26,7 @@ import torch.nn.functional as F
 
 from model.masking import NEG_INF, causal_mask
 
-logger = logging.getLogger("forge.attention")
+logger = logging.getLogger("talos.attention")
 
 
 class AttentionInterface(ABC):

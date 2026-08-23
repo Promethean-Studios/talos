@@ -1,4 +1,4 @@
-"""Forge tokenizer (Phase 2): byte-level BPE tokenizer + training.
+"""Talos tokenizer (Phase 2): byte-level BPE tokenizer + training.
 
 A modern, research-grade byte-level BPE tokenizer (GPT-2/LLaMA-style) that can
 represent arbitrary Unicode losslessly, a configurable vocabulary size up to

@@ -1,7 +1,7 @@
 """Model presets and compute estimates.
 
 Configs are :class:`~model.config.ModelConfig` dataclasses (see
-``configs/presets.py``), the authoritative way to describe a Forge model. The
+``configs/presets.py``), the authoritative way to describe a Talos model. The
 ``compute`` module estimates parameters, weights memory and FLOPs from a config.
 """
 from configs.presets import (

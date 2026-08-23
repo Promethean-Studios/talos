@@ -1,4 +1,4 @@
-"""Train the tiny Forge model for a few steps (forward + backward + optimizer).
+"""Train the tiny Talos model for a few steps (forward + backward + optimizer).
 
 Usage::
 
@@ -10,7 +10,7 @@ import argparse
 
 import torch
 
-from model import ForgeGPT, ModelConfig
+from model import TalosGPT, ModelConfig
 from model.utils import get_logger, set_seed
 
 log = get_logger("examples.tiny_train")
@@ -44,7 +44,7 @@ def main() -> None:
 
     set_seed(args.seed)
     cfg = build_config(args.moe)
-    model = ForgeGPT(cfg)
+    model = TalosGPT(cfg)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
     loss_fn = torch.nn.CrossEntropyLoss()
 

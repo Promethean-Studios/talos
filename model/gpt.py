@@ -1,4 +1,4 @@
-"""The ForgeGPT model: a decoder-only MoE/gated transformer.
+"""The TalosGPT model: a decoder-only MoE/gated transformer.
 
 One code path builds a model from a :class:`ModelConfig` whether it is the tiny
 dev model or the ~400B MoE. The model supports both a plain training forward
@@ -20,7 +20,7 @@ from model.config import ModelConfig
 from model.rms_norm import RMSNorm
 
 
-class ForgeGPT(nn.Module):
+class TalosGPT(nn.Module):
     """Decoder-only transformer with GQA attention, RoPE, and dense-or-MoE FFN."""
 
     def __init__(self, config: ModelConfig, attention_backend: Optional[AttentionInterface] = None) -> None:
@@ -153,7 +153,7 @@ class ForgeGPT(nn.Module):
 
     def __repr__(self) -> str:
         return (
-            f"ForgeGPT(type={self.config.ffn_type}, layers={self.config.num_layers}, "
+            f"TalosGPT(type={self.config.ffn_type}, layers={self.config.num_layers}, "
             f"hidden={self.config.hidden_size}, heads={self.config.num_attention_heads}, "
             f"kv_heads={self.config.num_kv_heads}, params={self.num_parameters():,}, "
             f"backend={type(self.backend).__name__})"

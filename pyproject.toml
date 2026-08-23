@@ -3,13 +3,13 @@ requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "forge"
+name = "talos"
 version = "0.1.0"
-description = "Forge: an open-source research-grade foundation LLM (MoE, 128K context, distributed training + inference)."
+description = "Talos: an open-source research-grade foundation LLM (MoE, 128K context, distributed training + inference)."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
-authors = [{ name = "Forge Team" }]
+authors = [{ name = "Talos Team" }]
 keywords = ["llm", "transformer", "moe", "deep-learning", "pytorch", "ai"]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -32,8 +32,8 @@ dev = [
 ]
 
 [project.scripts]
-forge-tiny = "scripts.cli:main"
-forge-configs = "configs.compute:main"
+talos-tiny = "scripts.cli:main"
+talos-configs = "configs.compute:main"
 
 [tool.setuptools.packages.find]
 include = ["model*", "configs*", "utils*"]
