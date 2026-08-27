@@ -1,0 +1,49 @@
+{
+  "sources": [
+    {
+      "name": "web",
+      "weight": 0.45,
+      "reader": {"type": "jsonl", "path": "/data/raw/web.jsonl", "source": "web"}
+    },
+    {
+      "name": "code",
+      "weight": 0.30,
+      "reader": {"type": "jsonl", "path": "/data/raw/code.jsonl", "source": "code"}
+    },
+    {
+      "name": "math",
+      "weight": 0.15,
+      "reader": {"type": "jsonl", "path": "/data/raw/math.jsonl", "source": "math"}
+    },
+    {
+      "name": "multilingual",
+      "weight": 0.10,
+      "reader": {
+        "type": "jsonl",
+        "path": "/data/raw/multilingual.jsonl",
+        "source": "multilingual"
+      }
+    }
+  ],
+  "processors": [
+    {"type": "field_remap", "text_field": "text"},
+    {"type": "length", "min_chars": 200, "max_chars": 10000000},
+    {"type": "quality_heuristic"},
+    {
+      "type": "language",
+      "allow": ["en", "zh", "fr", "de", "es", "ja", "ko", "ru"],
+      "drop_unknown": false
+    },
+    {"type": "exact_dedup", "normalize": true},
+    {"type": "minhash_dedup"},
+    {
+      "type": "contamination",
+      "contaminated_texts": ["EXAMPLE-BENCHMARK-SENTINEL"],
+      "contaminated_ids": ["example-benchmark-doc-0000"],
+      "fuzzy_ngram": 8,
+      "action": "drop"
+    },
+    {"type": "token_count"}
+  ],
+  "num_epochs": 1
+}
