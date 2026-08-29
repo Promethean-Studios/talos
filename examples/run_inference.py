@@ -10,8 +10,16 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 
 import torch
+
+# Make the repo-root packages (`model`, `configs`) importable when this file is
+# run directly as a script (same pattern as examples/tiny_train.py).
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 from model import TalosGPT
 from model.utils import get_logger, set_seed

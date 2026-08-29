@@ -16,13 +16,25 @@ Usage::
 
     python examples/tiny_train.py --steps 200 --seq 64 --batch 4
     python examples/tiny_train.py --steps 200 --moe
+    python examples/tiny_train.py --device cuda --steps 300 --seq 64 --batch 8
 """
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 from typing import Sequence
 
 import torch
+
+# Make the repo-root packages (`model`, `configs`, `training`, `data`)
+# importable when this file is run directly as a script — e.g. in Colab:
+#   cd talos && python examples/tiny_train.py --steps 300 --seq 64 --batch 8
+# Python only puts the script's own directory (`examples/`) on ``sys.path``
+# for direct execution, so we add the repo root explicitly.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 from model import TalosGPT, ModelConfig
 from model.utils import get_logger, set_seed
@@ -46,6 +58,18 @@ def build_config(moe: bool) -> ModelConfig:
     ).derive()
 
 
+def choose_device(device: str | None) -> torch.device:
+    """Resolve the compute device: explicit ``--device`` wins, otherwise auto-detect.
+
+    Prefers a CUDA GPU when one is available (e.g. a Google Colab GPU runtime)
+    and transparently falls back to CPU otherwise, so the exact same command
+    works on a laptop, a Colab GPU, or a CPU-only box.
+    """
+    if device:
+        return torch.device(device)
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 def train(
     model: TalosGPT,
     corpus: torch.Tensor,
@@ -60,7 +84,9 @@ def train(
     vocab = model.config.vocab_size
     losses: list[float] = []
     for step in range(steps):
-        idx = torch.randint(0, n_seq, (batch,))
+        # Sample batch indices on the same device as the corpus so inputs stay
+        # on the accelerator when one is present — no host/device transfers.
+        idx = torch.randint(0, n_seq, (batch,), device=corpus.device)
         x = corpus[idx]
         logits, _ = model(x)
         loss = loss_fn(logits.reshape(-1, vocab), x.reshape(-1))
@@ -82,22 +108,31 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--moe", action="store_true")
+    ap.add_argument(
+        "--device", type=str, default=None,
+        help="compute device (e.g. 'cuda', 'cpu'). Defaults to auto-detect: "
+        "CUDA when available, else CPU. In Colab choose a GPU runtime and this "
+        "uses the GPU automatically.",
+    )
     args = ap.parse_args()
 
+    device = choose_device(args.device)
     set_seed(args.seed)
     cfg = build_config(args.moe)
-    model = TalosGPT(cfg)
-    corpus = build_recurrent_corpus(cfg.vocab_size, args.n_seq, args.seq, seed=args.seed)
+    model = TalosGPT(cfg).to(device)
+    corpus = build_recurrent_corpus(
+        cfg.vocab_size, args.n_seq, args.seq, seed=args.seed, device=device,
+    )
 
     log.info(
-        "built %s tiny model: %d params (moe=%s)", cfg.ffn_type,
-        model.num_parameters(), args.moe,
+        "built %s tiny model: %d params (moe=%s) on device=%s", cfg.ffn_type,
+        model.num_parameters(), args.moe, device,
     )
     losses = train(model, corpus, args.steps, args.batch, args.lr)
 
     init, final = losses[0], losses[-1]
     print(
-        f"OK: {cfg.ffn_type} tiny ({model.num_parameters()} params) "
+        f"OK: {cfg.ffn_type} tiny ({model.num_parameters()} params, device={device}) "
         f"loss {init:.4f} -> {final:.4f} over {len(losses)} steps "
         f"(peak drop {max(init - l for l in losses):.4f})"
     )
