@@ -73,7 +73,7 @@ def build_words(
 
     Returns ``(words, total_bytes)``.
     """
-    from tokenizer.pre_tokenize import resolve_pattern
+    from tokenizer.pre_tokenize import iter_words_with_gaps, resolve_pattern
 
     pattern = resolve_pattern(pre_tokenize)
     words: List[List[int]] = []
@@ -85,8 +85,11 @@ def build_words(
             for blk in _byte_blocks(data, block_bytes):
                 words.append(list(blk))
         else:
-            for wb in (m.group(0).encode("utf-8") for m in pattern.finditer(text)):
-                words.append(list(wb))
+            # iter_words_with_gaps keeps unmatched spans as their own words, so a
+            # pattern that does not cover the corpus never silently drops bytes.
+            for w in iter_words_with_gaps(text, pattern):
+                if w:
+                    words.append(list(w.encode("utf-8")))
     return words, total_bytes
 
 

@@ -12,6 +12,7 @@ config is the dev-sized model that runs on one consumer GPU.
 from __future__ import annotations
 
 from model.config import ModelConfig
+from tokenizer.vocab import TokenizerConfig
 
 
 def tiny_config() -> ModelConfig:
@@ -30,6 +31,25 @@ def tiny_config() -> ModelConfig:
         rope_theta=10000.0,
         layer_norm_eps=1e-5,
     )
+
+
+def tiny_tokenizer_config() -> TokenizerConfig:
+    """Tokenizer sized to the tiny prototype model.
+
+    The model↔tokenizer contract (``tokenizer/model_compat.py``) requires
+    ``tokenizer_vocab_size <= model_vocab_size``: the tokenizer's ids map 1:1
+    onto embedding rows and the model keeps the rest as padding. The tiny model
+    holds **1024** rows, while ``TokenizerConfig`` defaults to 32768 — a
+    tokenizer trained with the default overflows the tiny model (ids ≥ 1024
+    cannot be embedded; specials would sit at 32764+).
+
+    This config fixes ``vocab_size=1024``: 256 base byte tokens + 4 special
+    tokens (ids 1020..1023, LLaMA-style at the top) + **764 merge slots**
+    (``1024 - 256 - 4``). Training learns at most 764 merges, so every token id
+    stays inside the model. Byte-level encoding needs no merges to be lossless,
+    so English round-trips exactly even before/at any merge budget.
+    """
+    return TokenizerConfig(vocab_size=1024)
 
 
 def small_config() -> ModelConfig:

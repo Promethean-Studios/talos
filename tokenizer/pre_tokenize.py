@@ -112,12 +112,20 @@ _GPT2_ASCII = (
 
 
 def gpt2_pattern() -> str:
-    """The GPT-2 re-token pattern, ``re``-compatible (no ``\\p{...}``)."""
+    """The GPT-2 re-token pattern, ``re``-compatible (no ``\\p{...}``).
+
+    The letter-run alternative *must* place ``_GPT2_ASCII`` inside a character
+    class (``[...]``): its contents are class members (ranges such as
+    ``\\xaa-\\xff``), not a concatenation of literals. Without the brackets the
+    alternative degenerates to an effectively-unmatchable literal sequence, so
+    plain letters match no alternative at all and pre-tokenization silently
+    drops them (the "letters lost, punctuation kept" bug).
+    """
     return (
         r"'s|'t|'re|'ve|'m|'ll|'d"
-        r"| ?" + _GPT2_ASCII + "+"
+        r"| ?[" + _GPT2_ASCII + r"]+"
         r"| ?[0-9]+"
-        r"| ?[^\sA-Za-z0-9" + _GPT2_ASCII + "]+"
+        r"| ?[^\sA-Za-z0-9" + _GPT2_ASCII + r"]+"
         r"|\s+(?!\S)|\s+"
     )
 
@@ -125,9 +133,10 @@ def gpt2_pattern() -> str:
 PRESETS: dict = {
     "gpt2": gpt2_pattern(),
     # A minimal safety-net pattern: a letter/digit run optionally preceded by a
-    # space, symbol runs, whitespace runs. Equivalent to GPT-2 minus the giant
-    # Unicode letter table — purely an example of a user-supplied pattern.
-    "simple": r" ?[\p{L}\p{N}]+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
+    # space, symbol runs, whitespace runs. Written with stdlib-``re`` classes
+    # (``\w`` covers Unicode letters/digits under ``str`` patterns; ``\p{...}``
+    # would require the optional ``regex`` package and is NOT used here).
+    "simple": r" ?[^\W_]+| ?[^\s\w]+|\s+(?!\S)|\s+",
 }
 
 # Names of known presets vs. raw regex strings.
@@ -159,6 +168,35 @@ def has_unicode_classes(pattern: str) -> bool:
     return "\\p{" in pattern
 
 
+def iter_words_with_gaps(text: str, pattern: Optional[Pattern[str]]) -> List[str]:
+    """Split ``text`` into pattern-matched words, keeping unmatched spans.
+
+    A pre-tokenizer pattern that fails to cover part of the text must never
+    silently *drop* the unmatched characters — byte-level tokenization is
+    lossless by contract, and a dropped span would make
+    ``decode(encode(text)) != text`` (the "letters lost, punctuation kept"
+    class of bug). This splitter therefore yields every matched word **and**
+    any gap between matches as its own word (gap bytes simply get no merges,
+    which is exactly the semantics an incomplete pattern should have).
+
+    Zero-width matches are skipped. With ``pattern=None`` the whole text is a
+    single word (pre-tokenization disabled).
+    """
+    if pattern is None:
+        return [text] if text else []
+    words: List[str] = []
+    last = 0
+    for m in pattern.finditer(text):
+        if m.start() > last:
+            words.append(text[last : m.start()])
+        if m.end() > m.start():
+            words.append(m.group(0))
+        last = m.end()
+    if last < len(text):
+        words.append(text[last:])
+    return words
+
+
 def tokenize_bytes(text: bytes, pattern: Optional[Pattern[str]]) -> List[bytes]:
     """Split ``text`` bytes into a list of byte "words" using ``pattern``.
 
@@ -176,4 +214,8 @@ def tokenize_text(text: str, pattern: Optional[Pattern[str]]) -> List[bytes]:
     """Split a decoded ``text`` string into byte words (helper for tests)."""
     if pattern is None:
         return [text.encode("utf-8")]
-    return [m.group(0).encode("utf-8") for m in pattern.finditer(text)]
+    return [
+        w.encode("utf-8")
+        for w in iter_words_with_gaps(text, pattern)
+        if w
+    ]

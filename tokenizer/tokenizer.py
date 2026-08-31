@@ -22,7 +22,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from tokenizer._logging import get_logger
 from tokenizer.bpe import encode_bytes, ranks_from_merges
-from tokenizer.pre_tokenize import resolve_pattern
+from tokenizer.pre_tokenize import iter_words_with_gaps, resolve_pattern
 from tokenizer.vocab import BASE_VOCAB_SIZE, TokenizerConfig, Vocabulary
 
 log = get_logger("tokenizer")
@@ -114,12 +114,17 @@ class ByteLevelBPETokenizer:
         data = text.encode("utf-8")
         # Without a pre-tokenizer, the whole text is one byte sequence; with one,
         # each matched word is encoded independently (merges never cross words).
+        # Unmatched spans are kept as their own words (see iter_words_with_gaps):
+        # a pattern that does not cover the text must never silently drop bytes.
         if self._pre_pattern is None:
             byte_ids = list(data)
             return encode_bytes(byte_ids, self._ranks, self._merge_id_map)
         out: List[int] = []
-        for word_bytes in (m.group(0).encode("utf-8") for m in self._pre_pattern.finditer(text)):
-            out.extend(encode_bytes(list(word_bytes), self._ranks, self._merge_id_map))
+        for word in iter_words_with_gaps(text, self._pre_pattern):
+            if word:
+                out.extend(
+                    encode_bytes(list(word.encode("utf-8")), self._ranks, self._merge_id_map)
+                )
         return out
 
     def _encode_with_special(self, text: str) -> List[int]:
