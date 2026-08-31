@@ -20,6 +20,11 @@ from data.types import Record
 
 log = get_logger("writer")
 
+#: Hard cap on records buffered in memory regardless of ``shard_size`` (used
+#: in ``bytes`` mode, where a single huge ``shard_size`` would otherwise let
+#: the buffer grow without bound). 10K dicts of typical records is a few MB.
+MAX_BUFFER_RECORDS = 10_000
+
 
 class ShardedWriter:
     """Write records to sharded JSONL (and optionally Parquet) + manifest.
@@ -27,7 +32,10 @@ class ShardedWriter:
     Args:
         output_dir: directory to write shards + ``manifest.json`` into.
         shard_size: max *records* per shard if ``size_by=="records"`` (default)
-            or max *bytes* if ``size_by=="bytes"``.
+            or max *bytes* if ``size_by=="bytes"``. The default (10_000) keeps
+            the in-memory buffer bounded to ~10K records so RAM stays flat no
+            matter how large the stream is — memory must not scale with the
+            corpus.
         format: ``"jsonl"`` (default) or ``"parquet"`` (requires pyarrow).
         prefix: files are named ``{prefix}-{index:04d}.jsonl``.
         write_manifest: whether to (re)write ``manifest.json`` on close.
@@ -36,7 +44,7 @@ class ShardedWriter:
     def __init__(
         self,
         output_dir: str,
-        shard_size: int = 100_000,
+        shard_size: int = 10_000,
         size_by: str = "records",
         format: str = "jsonl",
         prefix: str = "shard",
@@ -63,7 +71,12 @@ class ShardedWriter:
 
     # -- public API ---------------------------------------------------------
     def write(self, record: Record) -> None:
-        """Append one record to the current shard buffer."""
+        """Append one record to the current shard buffer.
+
+        Flushes eagerly — as soon as the shard-size limit is crossed *or* the
+        in-memory buffer reaches :data:`MAX_BUFFER_RECORDS` — so peak RAM is
+        bounded no matter how the writer is configured.
+        """
         if self._closed:
             raise RuntimeError("writer already closed")
         self._current_records.append(record)
@@ -78,7 +91,7 @@ class ShardedWriter:
             if self.size_by == "records"
             else self._current_bytes
         )
-        if limit >= self.shard_size:
+        if limit >= self.shard_size or len(self._current_records) >= MAX_BUFFER_RECORDS:
             self._flush()
 
     def close(self) -> List[Dict[str, Any]]:

@@ -44,12 +44,27 @@ class ExactDedupFilter(Processor):
     ``normalize`` collapses case/whitespace before hashing so near-identical
     variants (different spacing) are treated as duplicates. Use ``keep_first``
     to control whether the first or last occurrence survives (first is default).
+
+    ``max_seen`` bounds memory: the seen-digest set grows with unique documents
+    (~64 hex chars each), so on unbounded corpora pass e.g. ``max_seen=1_000_000``.
+    Once the cap is reached the filter keeps checking against what it has seen
+    but stops adding new digests (logged once) — memory becomes O(max_seen)
+    and the behaviour stays fully deterministic.
     """
 
-    def __init__(self, normalize: bool = True, keep_first: bool = True) -> None:
+    def __init__(
+        self,
+        normalize: bool = True,
+        keep_first: bool = True,
+        max_seen: Optional[int] = None,
+    ) -> None:
+        if max_seen is not None and max_seen <= 0:
+            raise ValueError("max_seen must be positive when given")
         self.normalize = normalize
         self.keep_first = keep_first
+        self.max_seen = max_seen
         self._seen: Set[str] = set()
+        self._capped_warned = False
 
     @property
     def name(self) -> str:
@@ -61,6 +76,15 @@ class ExactDedupFilter(Processor):
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
         if digest in self._seen:
             return None
+        if self.max_seen is not None and len(self._seen) >= self.max_seen:
+            if not self._capped_warned:
+                log.warning(
+                    "exact_dedup reached max_seen=%d; new unique docs are kept "
+                    "without being remembered (memory bounded)",
+                    self.max_seen,
+                )
+                self._capped_warned = True
+            return record
         self._seen.add(digest)
         return record
 
@@ -113,6 +137,11 @@ class MinHashNearDupFilter(Processor):
     but fewer exact detections; ``threshold`` is surfaced as documentation /
     tuning guidance and the band geometry should be chosen so that documents
     above the desired similarity share at least one band key.
+
+    ``max_seen_bands`` bounds memory: the band-key set grows with every unique
+    document (``bands`` keys each). Once the cap is reached the filter keeps
+    matching against stored keys but stops adding new ones (logged once) —
+    memory becomes O(max_seen_bands) and behaviour stays deterministic.
     """
 
     def __init__(
@@ -123,18 +152,23 @@ class MinHashNearDupFilter(Processor):
         ngram: int = DEFAULT_NGRAM,
         threshold: float = DEFAULT_THRESHOLD,
         seed: int = 0,
+        max_seen_bands: Optional[int] = None,
     ) -> None:
         if bands * rows_per_band != permutations:
             raise ValueError("bands * rows_per_band must equal permutations")
         if not 0.0 < threshold <= 1.0:
             raise ValueError("threshold must be in (0, 1]")
+        if max_seen_bands is not None and max_seen_bands <= 0:
+            raise ValueError("max_seen_bands must be positive when given")
         self.permutations = permutations
         self.bands = bands
         self.rows_per_band = rows_per_band
         self.ngram = ngram
         self.threshold = threshold
         self.seed = seed
+        self.max_seen_bands = max_seen_bands
         self._seen_bands: Set[Tuple[int, str]] = set()
+        self._capped_warned = False
 
     @property
     def name(self) -> str:
@@ -151,5 +185,17 @@ class MinHashNearDupFilter(Processor):
             key = (b, hashlib.sha256(repr(chunk).encode()).hexdigest())
             if key in self._seen_bands:
                 return None
+            if (
+                self.max_seen_bands is not None
+                and len(self._seen_bands) >= self.max_seen_bands
+            ):
+                if not self._capped_warned:
+                    log.warning(
+                        "minhash_near_dedup reached max_seen_bands=%d; new band "
+                        "keys are no longer stored (memory bounded)",
+                        self.max_seen_bands,
+                    )
+                    self._capped_warned = True
+                return record
             self._seen_bands.add(key)
         return record

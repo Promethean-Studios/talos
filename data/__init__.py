@@ -59,12 +59,33 @@ __all__ = [
     "Record",
     "RegexFilter",
     "ShardedWriter",
+    "StreamingTokenizedDataset",
     "TextReader",
     "TokenCounter",
     "URLBlacklistFilter",
     "WeightedMixer",
+    "iter_documents",
+    "iter_token_arrays",
     "make_language_identifier",
     "minhash_signature",
     "processor_from_config",
     "reader_from_config",
+    "resolve_shard_paths",
 ]
+
+
+def __getattr__(name):
+    # Lazy exports: data.tokenized pulls in numpy (and torch via its torch
+    # wrapper), and the pipeline package must stay importable — and light —
+    # without them. Peak-RAM work depends on `import data` never dragging
+    # torch into the process.
+    if name in (
+        "StreamingTokenizedDataset",
+        "iter_documents",
+        "iter_token_arrays",
+        "resolve_shard_paths",
+    ):
+        from data import tokenized
+
+        return getattr(tokenized, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

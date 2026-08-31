@@ -62,22 +62,35 @@ def _fetch_hf(spec: DatasetSpec, out_dir: str, max_docs: Optional[int]) -> None:
     log.info("prepared %d docs for %s", written, spec.name)
 
 
+def _iter_url_lines(url: str) -> Iterator[str]:
+    """Stream decoded lines from a (possibly gzipped) URL.
+
+    Memory is O(line): the response is wrapped in :class:`gzip.GzipFile` and
+    iterated lazily instead of ``resp.read() -> gzip.decompress -> decode ->
+    splitlines()``, which held ~3 full copies of the whole file in RAM at once.
+    """
+    import gzip  # pylint: disable=import-outside-toplevel
+    import urllib.request  # pylint: disable=import-outside-toplevel
+
+    with urllib.request.urlopen(url) as resp:
+        if url.endswith(".gz"):
+            with gzip.GzipFile(fileobj=resp) as gz:
+                for raw in gz:
+                    yield raw.decode("utf-8", errors="replace")
+        else:
+            for raw in resp:
+                yield raw.decode("utf-8", errors="replace")
+
+
 def _fetch_urls(spec: DatasetSpec, out_dir: str, max_docs: Optional[int]) -> None:
     """Fetch plain-URL sources (e.g. gzipped JSONL) into shards."""
-    import urllib.request  # pylint: disable=import-outside-toplevel
-    import gzip  # pylint: disable=import-outside-toplevel
-
     writer = ShardedWriter(
         os.path.join(out_dir, spec.name), shard_size=10_000, prefix="shard"
     )
     written = 0
     with writer:
         for url in spec.urls:
-            with urllib.request.urlopen(url) as resp:
-                data = resp.read()
-            if url.endswith(".gz"):
-                data = gzip.decompress(data)
-            for line in data.decode("utf-8", errors="replace").splitlines():
+            for line in _iter_url_lines(url):
                 if not line.strip():
                     continue
                 obj = json.loads(line)
