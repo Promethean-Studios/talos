@@ -13,6 +13,12 @@ from data.langid import (
     make_language_identifier,
 )
 from data.mixer import WeightedMixer
+from data.tokenized import (
+    StreamingTokenizedDataset,
+    iter_documents,
+    iter_token_arrays,
+    resolve_shard_paths,
+)
 from data.processors import (
     BlacklistRegexFilter,
     CodeFenceFilter,
@@ -59,12 +65,16 @@ __all__ = [
     "Record",
     "RegexFilter",
     "ShardedWriter",
+    "StreamingTokenizedDataset",
     "TextReader",
     "TokenCounter",
     "URLBlacklistFilter",
     "WeightedMixer",
+    "iter_documents",
+    "iter_token_arrays",
     "make_language_identifier",
     "minhash_signature",
     "processor_from_config",
     "reader_from_config",
+    "resolve_shard_paths",
 ]

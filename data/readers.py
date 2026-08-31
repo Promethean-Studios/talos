@@ -152,14 +152,29 @@ class TextReader(DatasetReader):
 
     def _iter_records(self) -> Iterator[Record]:
         for path in self.paths:
-            with open(path, "r", encoding="utf-8") as fh:
-                content = fh.read()
             if self.split_paragraphs:
-                for para in content.split("\n\n"):
-                    para = para.strip()
-                    if para:
-                        yield {"text": para, "url": path}
+                # Streaming paragraph mode: buffer only the *current* paragraph
+                # and yield it as soon as its terminating blank line is seen.
+                # Never fh.read() + split("\n\n") + strip() the whole file —
+                # that materialised 3 full copies plus a list of every
+                # paragraph at once (the classic multi-GB OOM on large .txt).
+                buf: List[str] = []
+                with open(path, "r", encoding="utf-8") as fh:
+                    for line in fh:
+                        if not line.strip():
+                            if buf:
+                                yield {"text": "".join(buf), "url": path}
+                                buf.clear()
+                        else:
+                            buf.append(line)
+                if buf:
+                    yield {"text": "".join(buf), "url": path}
             else:
+                # One record per file (documented semantics): the text is
+                # inherently O(file), so read once and strip once — no split
+                # list, no extra full copies.
+                with open(path, "r", encoding="utf-8") as fh:
+                    content = fh.read()
                 yield {"text": content.strip(), "url": path}
 
 
@@ -179,39 +194,55 @@ class ParquetReader(DatasetReader):
         source: str = "parquet",
         text_column: str = "text",
         columns: Optional[List[str]] = None,
+        batch_size: int = 10_000,
     ) -> None:
         pa = _import_pyarrow()
         self._pa = pa
         if not os.path.isfile(path):
             raise FileNotFoundError(f"parquet input not found: {path}")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if columns is not None and text_column not in columns:
+            raise ValueError(
+                f"text column {text_column!r} must be included in columns"
+            )
         self.path = path
         self.source = source
         self.text_column = text_column
         self.columns = columns
-        self._table = pa.parquet.read_table(path, columns=columns)
-        if text_column not in self._table.column_names:
-            raise ValueError(
-                f"text column {text_column!r} not in {self._table.column_names}"
-            )
+        self.batch_size = batch_size
+        # Open the file metadata only and stream record batches; never
+        # read_table() the whole file into RAM (multi-GB parquet would OOM).
+        self._pf = pa.parquet.ParquetFile(path)
+        schema_names = list(self._pf.schema_arrow.names)
+        if text_column not in schema_names:
+            raise ValueError(f"text column {text_column!r} not in {schema_names}")
 
     def _iter_records(self) -> Iterator[Record]:
-        table = self._table
-        names = table.column_names
-        for row in zip(*[table.column(n).to_pylist() for n in names]):
-            d = dict(zip(names, row))
-            text = d.get(self.text_column)
-            if not isinstance(text, str):
-                continue
-            meta = {k: v for k, v in d.items() if k != self.text_column}
-            meta["text"] = text
-            meta["source"] = meta.get("source", self.source)
-            yield meta
+        names: Optional[List[str]] = None
+        for batch in self._pf.iter_batches(
+            batch_size=self.batch_size, columns=self.columns
+        ):
+            if names is None:
+                names = list(batch.schema.names)
+            # One batch at a time: columnar -> python lists bounded by
+            # batch_size rows, then discarded before the next batch.
+            cols = [batch.column(i).to_pylist() for i in range(batch.num_columns)]
+            for row in zip(*cols):
+                d = dict(zip(names, row))
+                text = d.get(self.text_column)
+                if not isinstance(text, str):
+                    continue
+                meta = {k: v for k, v in d.items() if k != self.text_column}
+                meta["text"] = text
+                meta["source"] = meta.get("source", self.source)
+                yield meta
 
     def num_records(self) -> Optional[int]:
-        return self._table.num_rows
+        return self._pf.metadata.num_rows
 
     def close(self) -> None:
-        self._table = None
+        self._pf = None
 
 
 class HuggingFaceReader(DatasetReader):
@@ -220,6 +251,11 @@ class HuggingFaceReader(DatasetReader):
     ``dataset`` is an HF dataset id or a loaded ``Dataset``/``IterableDataset``.
     Uses ``datasets`` if a string id is given (needs network for remote ids);
     callers training offline can pass an already-loaded ``Dataset`` object.
+
+    ``streaming=True`` (default) loads string ids via ``load_dataset(...,
+    streaming=True)`` so rows are fetched lazily instead of downloading and
+    materialising the entire split in RAM/scratch disk first. Pass
+    ``streaming=False`` to opt out (e.g. when shuffling requires full material).
     """
 
     def __init__(
@@ -228,10 +264,13 @@ class HuggingFaceReader(DatasetReader):
         split: str = "train",
         source: Optional[str] = None,
         text_field: str = "text",
+        streaming: bool = True,
     ) -> None:
         self._ds = _require_datasets()
         if isinstance(dataset, str):
-            self._data = self._ds.load_dataset(dataset, split=split)
+            self._data = self._ds.load_dataset(
+                dataset, split=split, streaming=streaming
+            )
         else:
             self._data = dataset
         self.source = source or getattr(self._data, "info", None) and getattr(

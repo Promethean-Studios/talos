@@ -64,7 +64,7 @@ def run_pipeline(
     )
     output = config.get("output", {})
     out_dir = output.get("dir", out_dir)
-    shard_size = output.get("shard_size", 100_000)
+    shard_size = output.get("shard_size", 10_000)
     size_by = output.get("size_by", "records")
     fmt = output.get("format", "jsonl")
 

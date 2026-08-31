@@ -39,6 +39,9 @@ if _REPO_ROOT not in sys.path:
 from model import TalosGPT, ModelConfig
 from model.utils import get_logger, set_seed
 from configs.presets import tiny_config
+from data.tokenized import StreamingTokenizedDataset
+from tokenizer.tokenizer import ByteLevelBPETokenizer
+from tokenizer.vocab import TokenizerConfig
 from training.synthetic import build_recurrent_corpus
 
 log = get_logger("examples.tiny_train")
@@ -99,6 +102,47 @@ def train(
     return losses
 
 
+def train_stream(
+    model: TalosGPT,
+    dataset: StreamingTokenizedDataset,
+    steps: int,
+    lr: float,
+    device: torch.device,
+) -> list[float]:
+    """Train on *streamed* token batches (real data; never materializes the corpus).
+
+    ``dataset`` yields ``(batch, seq_len)`` int32 token blocks; memory is
+    O(batch) regardless of corpus size, so this path trains directly on
+    sharded JSONL that is far larger than RAM.
+    """
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    loss_fn = torch.nn.CrossEntropyLoss()
+    vocab = model.config.vocab_size
+    losses: list[float] = []
+    batches = iter(dataset)
+    for step in range(steps):
+        try:
+            batch = next(batches)
+        except StopIteration:
+            batches = iter(dataset)  # next epoch over the stream
+            try:
+                batch = next(batches)
+            except StopIteration:
+                log.warning("data stream exhausted after %d steps", step)
+                break
+        x = batch.to(device).long()
+        # Causal-LM objective: position t predicts token t+1.
+        logits, _ = model(x[:, :-1])
+        loss = loss_fn(logits.reshape(-1, vocab), x[:, 1:].reshape(-1))
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        losses.append(float(loss.detach()))
+        if step % 25 == 0:
+            log.info("step %4d loss=%.4f", step, losses[-1])
+    return losses
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--steps", type=int, default=200)
@@ -108,6 +152,22 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--moe", action="store_true")
+    ap.add_argument(
+        "--data", type=str, default=None,
+        help="train on real data instead of the synthetic corpus: path to a "
+        "pipeline manifest.json, a shard directory, or a .jsonl file "
+        "(streamed document-by-document via data.tokenized — O(batch) RAM)",
+    )
+    ap.add_argument(
+        "--tokenizer", type=str, default=None,
+        help="tokenizer JSON saved by ByteLevelBPETokenizer.save; default is a "
+        "byte-fallback tokenizer with the model's vocab size",
+    )
+    ap.add_argument(
+        "--data-mode", choices=("pack", "padded"), default="pack",
+        help="packed contiguous blocks (default) or one-padded-doc-per-row",
+    )
+    ap.add_argument("--data-limit-docs", type=int, default=None, help="cap docs per epoch")
     ap.add_argument(
         "--device", type=str, default=None,
         help="compute device (e.g. 'cuda', 'cpu'). Defaults to auto-detect: "
@@ -120,20 +180,43 @@ def main() -> None:
     set_seed(args.seed)
     cfg = build_config(args.moe)
     model = TalosGPT(cfg).to(device)
-    corpus = build_recurrent_corpus(
-        cfg.vocab_size, args.n_seq, args.seq, seed=args.seed, device=device,
-    )
 
-    log.info(
-        "built %s tiny model: %d params (moe=%s) on device=%s", cfg.ffn_type,
-        model.num_parameters(), args.moe, device,
-    )
-    losses = train(model, corpus, args.steps, args.batch, args.lr)
+    if args.data:
+        tokenizer = (
+            ByteLevelBPETokenizer.from_file(args.tokenizer)
+            if args.tokenizer
+            else ByteLevelBPETokenizer(TokenizerConfig(vocab_size=cfg.vocab_size))
+        )
+        dataset = StreamingTokenizedDataset(
+            args.data,
+            tokenizer,
+            seq_len=args.seq,
+            batch_size=args.batch,
+            mode=args.data_mode,
+            eos=True,
+            limit_docs=args.data_limit_docs,
+        )
+        log.info(
+            "built %s tiny model: %d params (moe=%s) on device=%s; streaming data from %s",
+            cfg.ffn_type, model.num_parameters(), args.moe, device, args.data,
+        )
+        losses = train_stream(model, dataset, args.steps, args.lr, device)
+        source = f"streamed {args.data}"
+    else:
+        log.info(
+            "built %s tiny model: %d params (moe=%s) on device=%s",
+            cfg.ffn_type, model.num_parameters(), args.moe, device,
+        )
+        corpus = build_recurrent_corpus(
+            cfg.vocab_size, args.n_seq, args.seq, seed=args.seed, device=device,
+        )
+        losses = list(train(model, corpus, args.steps, args.batch, args.lr))
+        source = "synthetic recurrent corpus"
 
     init, final = losses[0], losses[-1]
     print(
-        f"OK: {cfg.ffn_type} tiny ({model.num_parameters()} params, device={device}) "
-        f"loss {init:.4f} -> {final:.4f} over {len(losses)} steps "
+        f"OK: {cfg.ffn_type} tiny ({model.num_parameters()} params, device={device}, "
+        f"data={source}) loss {init:.4f} -> {final:.4f} over {len(losses)} steps "
         f"(peak drop {max(init - l for l in losses):.4f})"
     )
 
