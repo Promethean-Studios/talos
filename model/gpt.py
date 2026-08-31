@@ -96,7 +96,11 @@ class TalosGPT(nn.Module):
             position_ids = torch.arange(start, start + seq, device=input_ids.device)
             position_ids = position_ids.unsqueeze(0).expand(batch, -1)
         if use_cache and cache is None:
-            cache = self.new_cache(batch, input_ids.device, input_ids.dtype)
+            # The cache stores projected K/V activations, so its dtype must be
+            # the model's compute dtype — NOT input_ids' dtype (long token ids).
+            cache = self.new_cache(
+                batch, input_ids.device, self.embed_tokens.weight.dtype
+            )
 
         hidden = self.embed_tokens(input_ids) * self.embed_scale
 
