@@ -163,12 +163,12 @@ class TextReader(DatasetReader):
                     for line in fh:
                         if not line.strip():
                             if buf:
-                                yield {"text": "".join(buf), "url": path}
+                                yield {"text": "".join(buf).strip(), "url": path}
                                 buf.clear()
                         else:
                             buf.append(line)
                 if buf:
-                    yield {"text": "".join(buf), "url": path}
+                    yield {"text": "".join(buf).strip(), "url": path}
             else:
                 # One record per file (documented semantics): the text is
                 # inherently O(file), so read once and strip once — no split

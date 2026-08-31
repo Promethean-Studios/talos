@@ -173,18 +173,29 @@ def test_iter_token_arrays_pack_mode_shapes_and_content(tokenizer, tmp_path):
     shard_dir = _make_shards(tmp_path, docs)
     paths = resolve_shard_paths(shard_dir)
     eos = tokenizer.eos_id
-    batches = list(iter_token_arrays(paths, tokenizer, seq_len=4, batch_size=2,
+    stream: list = []
+    for d in docs:
+        stream.extend(tokenizer.encode(d, eos=True))
+    assert stream == [97, 98, eos, 99, 100, eos, 101, 102,
+                      eos, 103, 104, eos, 105, 106, eos]
+
+    # batch_size=3: the 3 full blocks exactly fill one batch. drop_last=True
+    # drops the trailing partial *block* (3 leftover tokens) and any partial
+    # *batch*; with 3 blocks + batch 3, flat is exactly stream[:12].
+    batches = list(iter_token_arrays(paths, tokenizer, seq_len=4, batch_size=3,
                                      mode="pack", eos=True, drop_last=True))
     flat = [int(t) for b in batches for row in b for t in row]
-    # 15 tokens -> 3 full blocks of 4 = 12 tokens kept, 3 dropped by drop_last
-    assert flat == [97, 98, eos, 99] + [100, eos, 101, 102] + [103, eos, 104, 105]
-    assert all(b.dtype == np.int32 and b.shape == (2, 4) for b in batches)
+    assert flat == stream[:12]
+    assert flat[:4] == [97, 98, eos, 99]  # first block, concrete
+    assert all(b.dtype == np.int32 and b.shape == (3, 4) for b in batches)
 
-    full = list(iter_token_arrays(paths, tokenizer, seq_len=4, batch_size=2,
+    full = list(iter_token_arrays(paths, tokenizer, seq_len=4, batch_size=3,
                                   mode="pack", eos=True, drop_last=False))
     all_tokens = [int(t) for b in full for row in b for t in row]
-    assert all_tokens == flat + [97, 98, eos, tokenizer.pad_id]  # padded final block
+    # Nothing lost: final 3-token block padded to seq_len with pad_id.
+    assert all_tokens == stream + [tokenizer.pad_id]
     assert full[-1].shape == (1, 4)  # short final batch kept
+    assert all(b.dtype == np.int32 for b in full)
 
 
 def test_iter_token_arrays_padded_mode(tokenizer, tmp_path):
@@ -221,13 +232,19 @@ def test_iter_token_arrays_matches_materialized_total(tokenizer, tmp_path):
     materialized = sum(
         len(tokenizer.encode(d, eos=True)) for d in iter_documents(paths)
     )
-    streamed = sum(
+    # drop_last=True: only the trailing partial block / partial batch are lost
+    streamed_drop_last = sum(
         int(b.size)
         for b in iter_token_arrays(paths, tokenizer, seq_len=8, batch_size=4,
                                    mode="pack", eos=True, drop_last=True)
     )
-    assert streamed <= materialized  # drop_last drops the trailing partial block
-    assert materialized - streamed < 8  # ...and only that
+    assert 0 <= materialized - streamed_drop_last < 8 * 4
+    # drop_last=False: every real token is accounted for (final block padded)
+    batches_all = list(iter_token_arrays(paths, tokenizer, seq_len=8, batch_size=4,
+                                         mode="pack", eos=True, drop_last=False))
+    streamed_all = sum(int(b.size) for b in batches_all)
+    n_pad = sum(int((b == tokenizer.pad_id).sum()) for b in batches_all)
+    assert streamed_all - n_pad == materialized
 
 
 def test_streaming_dataset_yields_torch_batches(tokenizer, tmp_path):
