@@ -33,8 +33,16 @@ import os
 from typing import Iterator, List, Optional, Sequence
 
 import numpy as np
-import torch
-from torch.utils.data import IterableDataset, get_worker_info
+
+try:  # torch is only needed by the IterableDataset wrapper below; the
+    # numpy-level generators (the memory-critical path) run without it.
+    import torch
+    from torch.utils.data import IterableDataset as _IterableDataset
+    from torch.utils.data import get_worker_info as _get_worker_info
+except ImportError:  # pragma: no cover - torch is a core repo dep, but the
+    torch = None  # numpy generators must still work in slim environments
+    _IterableDataset = object  # type: ignore[assignment, misc]
+    _get_worker_info = None
 
 from data._logging import get_logger
 
@@ -241,7 +249,7 @@ def _iter_padded(
         yield np.stack(pending)
 
 
-class StreamingTokenizedDataset(IterableDataset):
+class StreamingTokenizedDataset(_IterableDataset):
     """A ``torch`` ``IterableDataset`` of ready-made token batches.
 
     Yields ``torch.Tensor`` batches of shape ``(batch, seq_len)`` and dtype
@@ -273,8 +281,10 @@ class StreamingTokenizedDataset(IterableDataset):
         drop_last: bool = True,
         text_field: str = "text",
         limit_docs: Optional[int] = None,
-        dtype: torch.dtype = torch.int32,
+        dtype: Optional["torch.dtype"] = None,
     ) -> None:
+        if torch is None:  # pragma: no cover - guarded import
+            raise ImportError("torch is required for StreamingTokenizedDataset")
         super().__init__()
         if isinstance(data_path, (str, os.PathLike)):
             paths = resolve_shard_paths(str(data_path))
@@ -292,12 +302,12 @@ class StreamingTokenizedDataset(IterableDataset):
         self.drop_last = drop_last
         self.text_field = text_field
         self.limit_docs = limit_docs
-        self.dtype = dtype
+        self.dtype = dtype if dtype is not None else torch.int32
 
-    def __iter__(self) -> Iterator[torch.Tensor]:
+    def __iter__(self) -> Iterator["torch.Tensor"]:
         # With DataLoader workers, split shard files across workers so each
         # yields disjoint batches (document-level sharding).
-        worker = get_worker_info()
+        worker = _get_worker_info() if _get_worker_info is not None else None
         paths = self.paths
         if worker is not None and worker.num_workers > 1:
             paths = [

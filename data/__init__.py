@@ -13,12 +13,6 @@ from data.langid import (
     make_language_identifier,
 )
 from data.mixer import WeightedMixer
-from data.tokenized import (
-    StreamingTokenizedDataset,
-    iter_documents,
-    iter_token_arrays,
-    resolve_shard_paths,
-)
 from data.processors import (
     BlacklistRegexFilter,
     CodeFenceFilter,
@@ -78,3 +72,20 @@ __all__ = [
     "reader_from_config",
     "resolve_shard_paths",
 ]
+
+
+def __getattr__(name):
+    # Lazy exports: data.tokenized pulls in numpy (and torch via its torch
+    # wrapper), and the pipeline package must stay importable — and light —
+    # without them. Peak-RAM work depends on `import data` never dragging
+    # torch into the process.
+    if name in (
+        "StreamingTokenizedDataset",
+        "iter_documents",
+        "iter_token_arrays",
+        "resolve_shard_paths",
+    ):
+        from data import tokenized
+
+        return getattr(tokenized, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
