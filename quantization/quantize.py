@@ -342,15 +342,26 @@ def payload_bytes(model: torch.nn.Module) -> Dict[str, Any]:
     i.e. exactly what ``torch.save(model.state_dict())`` would write): fp32
     weights are 4 B/param, bf16 2 B, int8 payloads 1 B plus fp32 scales — the
     honest storage footprint of each precision.
+
+    ``params`` is the model's *logical* parameter-element count: every
+    state-dict element that represents a weight. Quantization-scale
+    bookkeeping (``*.weight_scale`` buffers) adds bytes but represents no
+    weights, so it is excluded — on an int8 model the int8 payloads plus the
+    surviving fp32 parameters (norm gains, biases) reproduce the original
+    parameter count, and ``bytes_per_param`` stays a true per-weight figure
+    (~1 B/param) instead of dividing by the handful of ``nn.Parameter``s that
+    survive when the weights become buffers.
     """
     per_dtype: Dict[str, int] = {}
     total = 0
-    for tensor in model.state_dict().values():
+    params = 0
+    for name, tensor in model.state_dict().items():
         b = tensor.numel() * _BYTES_PER_DTYPE[tensor.dtype]
         key = str(tensor.dtype).replace("torch.", "")
         per_dtype[key] = per_dtype.get(key, 0) + b
         total += b
-    params = sum(t.numel() for t in model.parameters())
+        if not name.endswith("weight_scale"):
+            params += tensor.numel()
     return {
         "total_bytes": total,
         "total_mb": round(total / (1024.0 * 1024.0), 4),

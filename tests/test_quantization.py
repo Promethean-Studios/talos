@@ -25,6 +25,7 @@ if _ROOT not in sys.path:
 from model import TalosGPT  # noqa: E402
 from model.utils import set_seed  # noqa: E402
 from quantization import (  # noqa: E402
+    QuantizedEmbedding,
     QuantizedLinear,
     dequantize_int8,
     payload_bytes,
@@ -170,11 +171,13 @@ class TestQuantizeModelInt8:
 
     def test_skip_leaves_module_fp32(self) -> None:
         model = _tiny_trained(steps=2)
-        quantized, report = quantize_model_(model, precision="int8", skip=("lm_head",))
+        # quantize_model_ mutates in place and returns only the report; the
+        # (model, report) tuple comes from the non-mutating quantize_model.
+        report = quantize_model_(model, precision="int8", skip=("lm_head",))
         assert isinstance(model.lm_head, torch.nn.Linear)
         assert len(report.replaced) == 15
         # In-place variant mutated the caller's model.
-        assert isinstance(model.embed_tokens, type(quantized.embed_tokens))
+        assert isinstance(model.embed_tokens, QuantizedEmbedding)
 
     def test_in_place_and_nonmutating_agree(self) -> None:
         model = _tiny_trained(steps=2)
