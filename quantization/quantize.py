@@ -162,6 +162,17 @@ class QuantizedLinear(nn.Module):
     def dequantize_weight(self) -> torch.Tensor:
         return dequantize_int8(self.weight_int8, self.weight_scale, torch.float32)
 
+    @property
+    def weight(self) -> torch.Tensor:
+        """Dequantized fp32 weight, recomputed on access.
+
+        Compatibility shim so code that inspects ``module.weight`` keeps working
+        on a quantized module (e.g. ``TalosGPT`` picks the KV-cache dtype from
+        ``embed_tokens.weight.dtype``). The *resident* payload stays int8; this
+        materializes a temporary fp32 copy each time it is called.
+        """
+        return self.dequantize_weight()
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         weight = self.dequantize_weight().to(x.dtype)
         return F.linear(x, weight, self.bias)
@@ -194,6 +205,11 @@ class QuantizedEmbedding(nn.Module):
 
     def dequantize_weight(self) -> torch.Tensor:
         return dequantize_int8(self.weight_int8, self.weight_scale, torch.float32)
+
+    @property
+    def weight(self) -> torch.Tensor:
+        """Dequantized fp32 table, recomputed on access (see QuantizedLinear.weight)."""
+        return self.dequantize_weight()
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         return F.embedding(input_ids, self.dequantize_weight())
@@ -277,6 +293,7 @@ def quantize_model_(
         model.to(torch.bfloat16)
         report = QuantizationReport(precision="bf16", granularity=None)
         report.params_quantized = sum(p.numel() for p in model.parameters())
+        model.quantization_report = report  # type: ignore[attr-defined]
         return report
     if precision != "int8":
         raise ValueError(f"precision must be one of {PRECISIONS}, got {precision!r}")
@@ -296,7 +313,8 @@ def quantize_model_(
 
     results = _replace_children(model, skip, factory)
     report = QuantizationReport(precision="int8", granularity=granularity)
-    for new, info in results:
+    # _replace_children returns the collected info dicts (one per replacement).
+    for info in results:
         report.replaced.append(info)
         report.params_quantized += info["params"]
     model.quantization_report = report  # type: ignore[attr-defined]
