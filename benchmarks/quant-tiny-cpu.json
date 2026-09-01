@@ -1,0 +1,716 @@
+{
+  "name": "talos-tiny-quant",
+  "schema_version": 1,
+  "preset": "tiny",
+  "device": "cpu",
+  "seed": 0,
+  "env": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.90GHz",
+    "torch": "2.13.0+cpu",
+    "threads": 2,
+    "commit": "21a2a970ae6e1200fa9c5526e8b5aaf918f411ac",
+    "branch": "quant/prototype-quantization"
+  },
+  "train": {
+    "steps": 100,
+    "batch": 4,
+    "seq_len": 64,
+    "lr": 0.001,
+    "loss_initial": 6.9411,
+    "loss_final_batch": 3.2361,
+    "train_tokens": 25200,
+    "train_seconds": 0.891,
+    "train_tokens_per_sec": 28296.7
+  },
+  "config": {
+    "prompt_lengths": [
+      8,
+      16,
+      32
+    ],
+    "generation_prompt_len": 16,
+    "decode_tokens": 16,
+    "warmup": 2,
+    "prefill_repeats": 5,
+    "skip": [],
+    "eval_corpus_held_out": true
+  },
+  "precisions": {
+    "fp32": {
+      "name": "fp32",
+      "payload": {
+        "total_bytes": 1017088,
+        "total_mb": 0.97,
+        "per_dtype_bytes": {
+          "float32": 1017088
+        },
+        "params": 254272,
+        "bytes_per_param": 4.0
+      },
+      "eval_loss": 7.2545,
+      "logit_similarity": {
+        "8": {
+          "max_abs_diff": 0.0,
+          "mean_abs_diff": 0.0,
+          "cosine_mean": 1.0,
+          "cosine_min": 1.0,
+          "greedy_agreement": 1.0,
+          "greedy_mismatches": 0,
+          "num_positions": 8
+        },
+        "16": {
+          "max_abs_diff": 0.0,
+          "mean_abs_diff": 0.0,
+          "cosine_mean": 1.0,
+          "cosine_min": 1.0,
+          "greedy_agreement": 1.0,
+          "greedy_mismatches": 0,
+          "num_positions": 16
+        },
+        "32": {
+          "max_abs_diff": 0.0,
+          "mean_abs_diff": 0.0,
+          "cosine_mean": 1.0,
+          "cosine_min": 1.0,
+          "greedy_agreement": 1.0,
+          "greedy_mismatches": 0,
+          "num_positions": 32
+        }
+      },
+      "generation": {
+        "reference": [
+          290,
+          123,
+          498,
+          621,
+          191,
+          812,
+          512,
+          300,
+          812,
+          512,
+          300,
+          812,
+          512,
+          300,
+          812,
+          512
+        ],
+        "quantized": [
+          290,
+          123,
+          498,
+          621,
+          191,
+          812,
+          512,
+          300,
+          812,
+          512,
+          300,
+          812,
+          512,
+          300,
+          812,
+          512
+        ],
+        "num_tokens": 16,
+        "agreement": 1.0,
+        "first_divergence_step": 16,
+        "identical": true
+      },
+      "throughput": {
+        "prefill_ms_mean": 1.735,
+        "prefill_tokens_per_sec": 18442.2,
+        "decode_ms_mean": 0.98,
+        "decode_tokens_per_sec": 1020.8
+      }
+    },
+    "bf16": {
+      "name": "bf16",
+      "payload": {
+        "total_bytes": 508544,
+        "total_mb": 0.485,
+        "per_dtype_bytes": {
+          "bfloat16": 508544
+        },
+        "params": 254272,
+        "bytes_per_param": 2.0
+      },
+      "eval_loss": 7.2541,
+      "logit_similarity": {
+        "8": {
+          "max_abs_diff": 0.0157,
+          "mean_abs_diff": 0.002819,
+          "cosine_mean": 0.999994,
+          "cosine_min": 0.999985,
+          "greedy_agreement": 1.0,
+          "greedy_mismatches": 0,
+          "num_positions": 8
+        },
+        "16": {
+          "max_abs_diff": 0.016609,
+          "mean_abs_diff": 0.00271,
+          "cosine_mean": 0.999991,
+          "cosine_min": 0.999973,
+          "greedy_agreement": 1.0,
+          "greedy_mismatches": 0,
+          "num_positions": 16
+        },
+        "32": {
+          "max_abs_diff": 0.018899,
+          "mean_abs_diff": 0.002913,
+          "cosine_mean": 0.999994,
+          "cosine_min": 0.999984,
+          "greedy_agreement": 0.96875,
+          "greedy_mismatches": 1,
+          "num_positions": 32
+        }
+      },
+      "generation": {
+        "reference": [
+          290,
+          123,
+          498,
+          621,
+          191,
+          812,
+          512,
+          300,
+          812,
+          512,
+          300,
+          812,
+          512,
+          300,
+          812,
+          512
+        ],
+        "quantized": [
+          290,
+          123,
+          498,
+          621,
+          191,
+          812,
+          512,
+          300,
+          812,
+          512,
+          300,
+          812,
+          512,
+          300,
+          812,
+          512
+        ],
+        "num_tokens": 16,
+        "agreement": 1.0,
+        "first_divergence_step": 16,
+        "identical": true
+      },
+      "throughput": {
+        "prefill_ms_mean": 2.547,
+        "prefill_tokens_per_sec": 12565.7,
+        "decode_ms_mean": 1.061,
+        "decode_tokens_per_sec": 942.3
+      },
+      "report": {
+        "precision": "bf16",
+        "granularity": null,
+        "num_modules_replaced": 0,
+        "params_quantized": 254272,
+        "modules": []
+      }
+    },
+    "int8_per_channel": {
+      "name": "int8_per_channel",
+      "payload": {
+        "total_bytes": 269568,
+        "total_mb": 0.2571,
+        "per_dtype_bytes": {
+          "int8": 253952,
+          "float32": 15616
+        },
+        "params": 320,
+        "bytes_per_param": 842.4
+      },
+      "eval_loss": 7.2543,
+      "logit_similarity": {
+        "8": {
+          "max_abs_diff": 0.022284,
+          "mean_abs_diff": 0.003391,
+          "cosine_mean": 0.99999,
+          "cosine_min": 0.999981,
+          "greedy_agreement": 1.0,
+          "greedy_mismatches": 0,
+          "num_positions": 8
+        },
+        "16": {
+          "max_abs_diff": 0.019523,
+          "mean_abs_diff": 0.003387,
+          "cosine_mean": 0.999984,
+          "cosine_min": 0.999944,
+          "greedy_agreement": 0.9375,
+          "greedy_mismatches": 1,
+          "num_positions": 16
+        },
+        "32": {
+          "max_abs_diff": 0.023467,
+          "mean_abs_diff": 0.003465,
+          "cosine_mean": 0.999991,
+          "cosine_min": 0.999944,
+          "greedy_agreement": 0.96875,
+          "greedy_mismatches": 1,
+          "num_positions": 32
+        }
+      },
+      "generation": {
+        "reference": [
+          290,
+          123,
+          498,
+          621,
+          191,
+          812,
+          512,
+          300,
+          812,
+          512,
+          300,
+          812,
+          512,
+          300,
+          812,
+          512
+        ],
+        "quantized": [
+          290,
+          123,
+          498,
+          621,
+          191,
+          812,
+          512,
+          300,
+          812,
+          512,
+          300,
+          812,
+          512,
+          300,
+          812,
+          512
+        ],
+        "num_tokens": 16,
+        "agreement": 1.0,
+        "first_divergence_step": 16,
+        "identical": true
+      },
+      "throughput": {
+        "prefill_ms_mean": 1.99,
+        "prefill_tokens_per_sec": 16082.4,
+        "decode_ms_mean": 1.24,
+        "decode_tokens_per_sec": 806.2
+      },
+      "report": {
+        "precision": "int8",
+        "granularity": "per_channel",
+        "num_modules_replaced": 16,
+        "params_quantized": 253952,
+        "modules": [
+          {
+            "name": "embed_tokens",
+            "kind": "Embedding",
+            "shape": [
+              1024,
+              64
+            ]
+          },
+          {
+            "name": "lm_head",
+            "kind": "Linear",
+            "shape": [
+              1024,
+              64
+            ]
+          },
+          {
+            "name": "layers.0.attention.q_proj",
+            "kind": "Linear",
+            "shape": [
+              64,
+              64
+            ]
+          },
+          {
+            "name": "layers.0.attention.k_proj",
+            "kind": "Linear",
+            "shape": [
+              32,
+              64
+            ]
+          },
+          {
+            "name": "layers.0.attention.v_proj",
+            "kind": "Linear",
+            "shape": [
+              32,
+              64
+            ]
+          },
+          {
+            "name": "layers.0.attention.o_proj",
+            "kind": "Linear",
+            "shape": [
+              64,
+              64
+            ]
+          },
+          {
+            "name": "layers.0.ffn.swiglu.gate_proj",
+            "kind": "Linear",
+            "shape": [
+              256,
+              64
+            ]
+          },
+          {
+            "name": "layers.0.ffn.swiglu.up_proj",
+            "kind": "Linear",
+            "shape": [
+              256,
+              64
+            ]
+          },
+          {
+            "name": "layers.0.ffn.swiglu.down_proj",
+            "kind": "Linear",
+            "shape": [
+              64,
+              256
+            ]
+          },
+          {
+            "name": "layers.1.attention.q_proj",
+            "kind": "Linear",
+            "shape": [
+              64,
+              64
+            ]
+          },
+          {
+            "name": "layers.1.attention.k_proj",
+            "kind": "Linear",
+            "shape": [
+              32,
+              64
+            ]
+          },
+          {
+            "name": "layers.1.attention.v_proj",
+            "kind": "Linear",
+            "shape": [
+              32,
+              64
+            ]
+          },
+          {
+            "name": "layers.1.attention.o_proj",
+            "kind": "Linear",
+            "shape": [
+              64,
+              64
+            ]
+          },
+          {
+            "name": "layers.1.ffn.swiglu.gate_proj",
+            "kind": "Linear",
+            "shape": [
+              256,
+              64
+            ]
+          },
+          {
+            "name": "layers.1.ffn.swiglu.up_proj",
+            "kind": "Linear",
+            "shape": [
+              256,
+              64
+            ]
+          },
+          {
+            "name": "layers.1.ffn.swiglu.down_proj",
+            "kind": "Linear",
+            "shape": [
+              64,
+              256
+            ]
+          }
+        ]
+      }
+    },
+    "int8_per_tensor": {
+      "name": "int8_per_tensor",
+      "payload": {
+        "total_bytes": 255296,
+        "total_mb": 0.2435,
+        "per_dtype_bytes": {
+          "int8": 253952,
+          "float32": 1344
+        },
+        "params": 320,
+        "bytes_per_param": 797.8
+      },
+      "eval_loss": 7.2544,
+      "logit_similarity": {
+        "8": {
+          "max_abs_diff": 0.022814,
+          "mean_abs_diff": 0.004439,
+          "cosine_mean": 0.99998,
+          "cosine_min": 0.999959,
+          "greedy_agreement": 1.0,
+          "greedy_mismatches": 0,
+          "num_positions": 8
+        },
+        "16": {
+          "max_abs_diff": 0.027606,
+          "mean_abs_diff": 0.005723,
+          "cosine_mean": 0.999948,
+          "cosine_min": 0.999734,
+          "greedy_agreement": 1.0,
+          "greedy_mismatches": 0,
+          "num_positions": 16
+        },
+        "32": {
+          "max_abs_diff": 0.033346,
+          "mean_abs_diff": 0.005831,
+          "cosine_mean": 0.999977,
+          "cosine_min": 0.999898,
+          "greedy_agreement": 1.0,
+          "greedy_mismatches": 0,
+          "num_positions": 32
+        }
+      },
+      "generation": {
+        "reference": [
+          290,
+          123,
+          498,
+          621,
+          191,
+          812,
+          512,
+          300,
+          812,
+          512,
+          300,
+          812,
+          512,
+          300,
+          812,
+          512
+        ],
+        "quantized": [
+          290,
+          123,
+          498,
+          621,
+          191,
+          812,
+          512,
+          300,
+          812,
+          512,
+          300,
+          812,
+          512,
+          300,
+          812,
+          512
+        ],
+        "num_tokens": 16,
+        "agreement": 1.0,
+        "first_divergence_step": 16,
+        "identical": true
+      },
+      "throughput": {
+        "prefill_ms_mean": 1.965,
+        "prefill_tokens_per_sec": 16285.6,
+        "decode_ms_mean": 1.229,
+        "decode_tokens_per_sec": 813.6
+      },
+      "report": {
+        "precision": "int8",
+        "granularity": "per_tensor",
+        "num_modules_replaced": 16,
+        "params_quantized": 253952,
+        "modules": [
+          {
+            "name": "embed_tokens",
+            "kind": "Embedding",
+            "shape": [
+              1024,
+              64
+            ]
+          },
+          {
+            "name": "lm_head",
+            "kind": "Linear",
+            "shape": [
+              1024,
+              64
+            ]
+          },
+          {
+            "name": "layers.0.attention.q_proj",
+            "kind": "Linear",
+            "shape": [
+              64,
+              64
+            ]
+          },
+          {
+            "name": "layers.0.attention.k_proj",
+            "kind": "Linear",
+            "shape": [
+              32,
+              64
+            ]
+          },
+          {
+            "name": "layers.0.attention.v_proj",
+            "kind": "Linear",
+            "shape": [
+              32,
+              64
+            ]
+          },
+          {
+            "name": "layers.0.attention.o_proj",
+            "kind": "Linear",
+            "shape": [
+              64,
+              64
+            ]
+          },
+          {
+            "name": "layers.0.ffn.swiglu.gate_proj",
+            "kind": "Linear",
+            "shape": [
+              256,
+              64
+            ]
+          },
+          {
+            "name": "layers.0.ffn.swiglu.up_proj",
+            "kind": "Linear",
+            "shape": [
+              256,
+              64
+            ]
+          },
+          {
+            "name": "layers.0.ffn.swiglu.down_proj",
+            "kind": "Linear",
+            "shape": [
+              64,
+              256
+            ]
+          },
+          {
+            "name": "layers.1.attention.q_proj",
+            "kind": "Linear",
+            "shape": [
+              64,
+              64
+            ]
+          },
+          {
+            "name": "layers.1.attention.k_proj",
+            "kind": "Linear",
+            "shape": [
+              32,
+              64
+            ]
+          },
+          {
+            "name": "layers.1.attention.v_proj",
+            "kind": "Linear",
+            "shape": [
+              32,
+              64
+            ]
+          },
+          {
+            "name": "layers.1.attention.o_proj",
+            "kind": "Linear",
+            "shape": [
+              64,
+              64
+            ]
+          },
+          {
+            "name": "layers.1.ffn.swiglu.gate_proj",
+            "kind": "Linear",
+            "shape": [
+              256,
+              64
+            ]
+          },
+          {
+            "name": "layers.1.ffn.swiglu.up_proj",
+            "kind": "Linear",
+            "shape": [
+              256,
+              64
+            ]
+          },
+          {
+            "name": "layers.1.ffn.swiglu.down_proj",
+            "kind": "Linear",
+            "shape": [
+              64,
+              256
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "bottom_line": {
+    "fp32": {
+      "greedy_generation_identical": true,
+      "greedy_agreement_min": 1.0,
+      "cosine_mean_min": 1.0,
+      "eval_loss_delta": 0.0,
+      "size_mb": 0.97,
+      "compression_vs_fp32": 1.0
+    },
+    "bf16": {
+      "greedy_generation_identical": true,
+      "greedy_agreement_min": 0.96875,
+      "cosine_mean_min": 0.999991,
+      "eval_loss_delta": -0.0004,
+      "size_mb": 0.485,
+      "compression_vs_fp32": 2.0
+    },
+    "int8_per_channel": {
+      "greedy_generation_identical": true,
+      "greedy_agreement_min": 0.9375,
+      "cosine_mean_min": 0.999984,
+      "eval_loss_delta": -0.0002,
+      "size_mb": 0.2571,
+      "compression_vs_fp32": 3.77
+    },
+    "int8_per_tensor": {
+      "greedy_generation_identical": true,
+      "greedy_agreement_min": 1.0,
+      "cosine_mean_min": 0.999948,
+      "eval_loss_delta": -0.0001,
+      "size_mb": 0.2435,
+      "compression_vs_fp32": 3.98
+    }
+  },
+  "peak_rss_mb": 321.6
+}
