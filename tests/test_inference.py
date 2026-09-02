@@ -139,3 +139,24 @@ def test_greedy_decode_reproduces_recurrent_corpus() -> None:
     report = prefill_decode_max_abs_diff(model, row.unsqueeze(0))
     assert report.max_abs_diff < LOGIT_ATOL, f"trained prefill/decode mismatch: {report}"
     assert report.argmax_match
+
+
+def test_prefill_accepts_optional_empty_cache() -> None:
+    """Design §6.4: ``prefill`` takes an optional pre-built empty cache.
+
+    Passing a caller-created cache must (a) use *that* object (the returned
+    cache is the same instance), (b) produce logits identical to the default
+    path, and (c) leave the default path (``cache=None``) unchanged.
+    """
+    model = _tiny_model(seed=0)
+    set_seed(1)
+    prompt = torch.randint(
+        0, model.config.vocab_size, (1, 12), generator=torch.Generator().manual_seed(3)
+    )
+    with torch.no_grad():
+        logits_default, cache_default = prefill(model, prompt)  # unchanged default
+        provided = model.new_cache(1, prompt.device, next(model.parameters()).dtype)
+        logits_passed, cache_returned = prefill(model, prompt, cache=provided)
+    assert cache_returned is provided  # the caller's cache object is reused
+    assert cache_returned.length == prompt.shape[1]
+    assert float((logits_default - logits_passed).abs().max()) <= LOGIT_ATOL
