@@ -18,6 +18,7 @@ import torch
 
 from model import TalosGPT, ModelConfig
 from model.utils import get_logger, set_seed
+from promethean import loader
 
 log = get_logger("cli")
 
@@ -56,6 +57,7 @@ def tiny_config(moe: bool) -> ModelConfig:
 
 
 def main(argv: Optional[list] = None) -> None:
+    loader.show("talos")
     args = make_args()
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
