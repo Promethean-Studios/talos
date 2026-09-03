@@ -22,6 +22,7 @@ from typing import Dict, Optional
 
 from model.config import ModelConfig
 from model.utils import human_bytes, human_count
+from promethean import loader
 
 
 @dataclass
@@ -173,6 +174,7 @@ def summarize_all(presets: Optional[Dict[str, callable]] = None) -> str:
 
 def main(argv: Optional[list] = None) -> None:
     """CLI: print compute estimates for one or all preset configs."""
+    loader.show("talos")
     parser = argparse.ArgumentParser(
         prog="talos-configs",
         description="Print parameter / memory / FLOP estimates for Talos configs.",
