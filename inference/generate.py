@@ -9,7 +9,7 @@ verify and benchmark.
 """
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -28,12 +28,19 @@ __all__ = [
 def prefill(
     model: TalosGPT,
     prompt: torch.Tensor,
+    cache: Optional[KVCache] = None,
 ) -> Tuple[torch.Tensor, KVCache]:
     """Run the whole prompt through the model in one pass, caching K/V.
 
     Args:
         model: A ``TalosGPT`` (should be in ``eval()`` mode for inference).
         prompt: ``(batch, prompt_len)`` token ids.
+        cache: Optional cache object implementing the KV-cache protocol
+            (``length`` / ``last_len()`` / ``update(layer, key, value,
+            start_pos)``). Pass a fresh/empty cache to reuse the canonical
+            prefill path with an alternative cache implementation (e.g. the
+            DDM experiment's disk-tiered cache); when ``None`` (the default)
+            a new :class:`~model.cache.KVCache` is created, exactly as before.
 
     Returns:
         ``(logits, cache)`` where ``logits`` is ``(batch, prompt_len, vocab)``
@@ -41,9 +48,10 @@ def prefill(
         prompt_len``). ``logits[:, t]`` is the distribution over the token at
         position ``t + 1``.
     """
-    cache = model.new_cache(
-        prompt.shape[0], prompt.device, next(model.parameters()).dtype
-    )
+    if cache is None:
+        cache = model.new_cache(
+            prompt.shape[0], prompt.device, next(model.parameters()).dtype
+        )
     logits, cache = model(prompt, use_cache=True, cache=cache)
     return logits, cache
 
