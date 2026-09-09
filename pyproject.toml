@@ -36,7 +36,10 @@ talos-tiny = "scripts.cli:main"
 talos-configs = "configs.compute:main"
 
 [tool.setuptools.packages.find]
-include = ["model*", "configs*", "utils*"]
+include = ["model*", "configs*", "utils*", "promethean*"]
+
+[tool.setuptools.package-data]
+promethean = ["art/*.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
