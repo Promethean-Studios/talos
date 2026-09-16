@@ -32,6 +32,7 @@ from scripts.train_oasst1 import (
 from tokenizer.tokenizer import ByteLevelBPETokenizer
 from tools.make_synthetic_oasst1 import generate
 from training.synthetic import build_recurrent_corpus
+from evaluation.harness import run_eval
 
 # Loss must drop by at least this many nats from its step-0 value. The tiny
 # model overfits the fixed corpus from ~log(1024) (~6.9) to well under 1, so a
@@ -234,3 +235,120 @@ def test_tiny_compat_guard_rejects_config_drift() -> None:
             assert "254,272" in str(exc) and "1024" in str(exc)
         else:
             raise AssertionError("config drift was not rejected by the compat guard")
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint evaluation harness (reproducibility cycle)
+# e2e pattern of PR #17: small JSONL -> short train -> checkpoint -> eval.
+# ---------------------------------------------------------------------------
+def _short_trained_run(tmp_path, n_docs: int = 20, steps: int = 3) -> tuple:
+    """Shared fixture: deterministic split -> BPE -> 254,272-param train ->
+    checkpoint; returns (row, val_path, train_path)."""
+    src = tmp_path / "src.jsonl"
+    _write_synthetic_jsonl(str(src), n_docs=n_docs, seed=0)
+    split = split_jsonl(str(src), str(tmp_path / "data"), ratio=0.9, seed=0)
+    tok_path = str(tmp_path / "tokenizer.json")
+    tokenizer = train_tokenizer_for_run(split.train_path, tok_path)
+    model = build_tiny_model()
+    from data.tokenized import StreamingTokenizedDataset
+
+    train_ds = StreamingTokenizedDataset(
+        split.train_path, tokenizer, seq_len=32, batch_size=2, mode="pack", eos=True
+    )
+    val_ds = StreamingTokenizedDataset(
+        split.val_path, tokenizer, seq_len=32, batch_size=2, mode="pack", eos=True
+    )
+    history = train_epochs(
+        model, train_ds, val_ds,
+        out_dir=str(tmp_path),
+        tokenizer_path=tok_path,
+        lr=3e-3,
+        epochs=1,
+        device=torch.device("cpu"),
+        seed=0,
+        max_steps_per_epoch=steps,
+    )
+    return history.row(1), split.val_path, split.train_path
+
+
+def test_eval_checkpoint_full_metrics_short_run(tmp_path) -> None:
+    row, val_path, train_path = _short_trained_run(tmp_path)
+
+    result = run_eval(
+        row.checkpoint,
+        data=val_path,
+        train_data=train_path,
+        seq_len=32,
+        batch_size=2,
+        seed=0,
+    )
+    # Parameter count must match the recorded (and canonical 254,272) count.
+    assert result.params == EXPECTED_TINY_PARAMS == 254_272
+    assert result.vocab_size == 1024
+    # Perplexity = exp(natural-log loss): finite and positive.
+    assert torch.isfinite(torch.tensor(result.val_loss))
+    assert result.val_perplexity > 0.0 and torch.isfinite(
+        torch.tensor(result.val_perplexity)
+    )
+    # Next-token argmax accuracy is a rate in [0, 1].
+    assert 0.0 <= result.val_accuracy <= 1.0
+    # Recomputed val loss (same batch layout as training) matches the loss the
+    # checkpoint recorded at save time.
+    assert result.checkpoint_val_loss == pytest.approx(row.val_loss)
+    assert result.val_loss == pytest.approx(row.val_loss)
+    # Train loss reported when a train split is supplied.
+    assert result.train_loss is not None and torch.isfinite(
+        torch.tensor(result.train_loss)
+    )
+    # Tokens processed, throughput and wall time are positive and sensible.
+    assert result.tokens_processed > 0
+    assert result.throughput_tok_per_s > 0.0
+    assert result.eval_wall_s >= 0.0
+    # Peak RSS is labelled as the process metric it is (ru_maxrss, MiB).
+    assert result.peak_rss_mb > 0.0
+    # Metrics file written next to the checkpoint, loadable + comparable.
+    assert result.metrics_path == str(tmp_path / "eval-metrics.json")
+    with open(result.metrics_path, "r", encoding="utf-8") as fh:
+        saved = json.load(fh)
+    assert saved["format"] == "talos-oasst1-eval-metrics-v1"
+    assert saved["val_loss"] == result.val_loss
+    assert saved["val_perplexity"] == result.val_perplexity
+    assert saved["val_accuracy"] == result.val_accuracy
+
+
+def test_eval_checkpoint_is_deterministic(tmp_path) -> None:
+    """Two eval runs on the same checkpoint + split are bit-identical."""
+    row, val_path, _ = _short_trained_run(tmp_path)
+    kwargs = dict(checkpoint_path=row.checkpoint, data=val_path,
+                  seq_len=32, batch_size=2, seed=0)
+    a = run_eval(**kwargs)
+    b = run_eval(**kwargs)
+    # Substantive numbers must be IDENTICAL (wall time / peak RSS are machine
+    # metrics and are excluded by design).
+    for field in ("val_loss", "val_perplexity", "val_accuracy",
+                  "tokens_processed", "params", "checkpoint_val_loss",
+                  "train_loss", "tokenizer_vocab_size"):
+        assert getattr(a, field) == getattr(b, field), (
+            f"eval field {field} not deterministic: {getattr(a, field)} vs "
+            f"{getattr(b, field)}"
+        )
+
+
+def test_eval_checkpoint_default_val_split(tmp_path) -> None:
+    """No --data: the checkpoint's own val split is found and used."""
+    row, val_path, _ = _short_trained_run(tmp_path)
+    result = run_eval(row.checkpoint, seq_len=32, batch_size=2, seed=0)
+    assert os.path.abspath(result.data) == os.path.abspath(val_path)
+    assert result.val_loss == pytest.approx(row.val_loss)
+
+
+def test_eval_checkpoint_nparams_mismatch_fails(tmp_path) -> None:
+    """A checkpoint whose recorded n_params disagrees fails loudly."""
+    row, val_path, _ = _short_trained_run(tmp_path)
+    ckpt = load_checkpoint(row.checkpoint)
+    ckpt["n_params"] = 999
+    tampered = str(tmp_path / "tampered.pt")
+    torch.save(ckpt, tampered)
+    with pytest.raises(ValueError) as exc:
+        run_eval(tampered, data=val_path, seq_len=32, batch_size=2, seed=0)
+    assert "n_params" in str(exc.value) and "999" in str(exc.value)
