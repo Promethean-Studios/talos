@@ -3,13 +3,18 @@
 Training flow:
 
 1. Read text documents from a configurable corpus (plain text or JSONL; any
-   legal corpus the user points at — see :mod:`tokenizer.corpus`).
+   legal corpus the user points at — see :mod:`tokenizer.corpus`). Documents
+   are streamed from disk; ``max_docs`` / ``max_chars`` bound consumption.
 2. (Optional) pre-tokenize into words with a regex (off by default = pure
-   byte-level). Each word becomes a list of byte ids.
-3. Learn BPE merges incrementally (:func:`tokenizer.bpe.train_bpe`) up to the
-   configured vocab size. Because merges are streamed/refined incrementally and
-   the algorithm touches only affected words per round, it supports 100K+
-   merges.
+   byte-level). Each word becomes a list of byte ids — but instead of keeping
+   a list per document, the words are collapsed **in one pass** into a
+   unique-word frequency table (:func:`build_word_frequency_table`), so memory
+   tracks the unique vocabulary, not the raw document count.
+3. Learn BPE merges incrementally (:func:`tokenizer.bpe.train_bpe`) up to
+   ``num_merges`` (default: the configured vocab-derived merge budget). Each
+   round touches only the unique words containing the chosen pair and updates
+   pair counts with the word's multiplicity, so 1,800-document corpora train
+   comfortably on a few-hundred-MB budget.
 4. Optionally persist intermediate checkpoints every ``checkpoint_every``
    merges so a large run can be resumed with ``--resume``.
 
@@ -23,7 +28,7 @@ import json
 import os
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Callable, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from tokenizer._logging import get_logger
 from tokenizer.bpe import train_bpe, Pair
@@ -58,6 +63,49 @@ class TrainResult:
         return report
 
 
+def build_word_frequency_table(
+    texts: Iterable[str],
+    pre_tokenize: Optional[str] = None,
+    block_bytes: int = 512 * 1024,
+) -> Tuple[List[List[int]], List[int], int]:
+    """Stream documents into a unique-word frequency table in ONE pass.
+
+    ``texts`` is consumed lazily (generator-friendly): each document is
+    utf-8-encoded and split into bounded byte blocks (pure byte-level mode) or
+    regex words (pre-tokenized mode, unmatched spans kept as their own words so
+    bytes are never silently dropped). Words are stored **once** and counted by
+    multiplicity, so the returned structure is proportional to the number of
+    *unique* words — not the raw corpus size. This is the memory fix for
+    thousands-of-documents corpora.
+
+    Returns ``(unique_words, counts, total_bytes)``.
+    """
+    from tokenizer.pre_tokenize import iter_words_with_gaps, resolve_pattern
+
+    pattern = resolve_pattern(pre_tokenize)
+    freqs: Dict[tuple, int] = {}
+    total_bytes = 0
+    for text in texts:
+        data = text.encode("utf-8")
+        total_bytes += len(data)
+        if pattern is None:
+            for blk in _byte_blocks(data, block_bytes):
+                freqs[tuple(blk)] = freqs.get(tuple(blk), 0) + 1
+        else:
+            # iter_words_with_gaps keeps unmatched spans as their own words, so a
+            # pattern that does not cover the corpus never silently drops bytes.
+            for w in iter_words_with_gaps(text, pattern):
+                if w:
+                    key = tuple(w.encode("utf-8"))
+                    freqs[key] = freqs.get(key, 0) + 1
+    words: List[List[int]] = []
+    counts: List[int] = []
+    for key, c in freqs.items():
+        words.append(list(key))
+        counts.append(c)
+    return words, counts, total_bytes
+
+
 def build_words(
     texts: Iterable[str],
     pre_tokenize: Optional[str] = None,
@@ -65,32 +113,19 @@ def build_words(
 ) -> Tuple[List[List[int]], int]:
     """Convert documents into byte-id words for BPE training.
 
-    With ``pre_tokenize=None`` (pure byte-level), each document is split into
-    bounded byte blocks (on newline boundaries) so memory stays bounded while
-    bytes may merge across whitespace inside a block. With a regex pattern, each
-    matched word is a separate byte-id list (GPT-2/LLaMA style), which is cheaper
-    but constrains merges to within words.
+    Compatibility wrapper around :func:`build_word_frequency_table` that expands
+    the frequency table back into one entry per occurrence (i.e. the legacy
+    behaviour). Prefer the frequency-table path directly when memory matters.
 
     Returns ``(words, total_bytes)``.
     """
-    from tokenizer.pre_tokenize import iter_words_with_gaps, resolve_pattern
-
-    pattern = resolve_pattern(pre_tokenize)
-    words: List[List[int]] = []
-    total_bytes = 0
-    for text in texts:
-        data = text.encode("utf-8")
-        total_bytes += len(data)
-        if pattern is None:
-            for blk in _byte_blocks(data, block_bytes):
-                words.append(list(blk))
-        else:
-            # iter_words_with_gaps keeps unmatched spans as their own words, so a
-            # pattern that does not cover the corpus never silently drops bytes.
-            for w in iter_words_with_gaps(text, pattern):
-                if w:
-                    words.append(list(w.encode("utf-8")))
-    return words, total_bytes
+    words, counts, total_bytes = build_word_frequency_table(
+        texts, pre_tokenize, block_bytes
+    )
+    expanded: List[List[int]] = []
+    for w, c in zip(words, counts):
+        expanded.extend(list(w) for _ in range(c))
+    return expanded, total_bytes
 
 
 def _byte_blocks(data: bytes, block_bytes: int) -> List[bytes]:
@@ -141,6 +176,9 @@ def train_tokenizer(
     texts: Iterable[str],
     config: TokenizerConfig,
     minfreq: int = 2,
+    num_merges: Optional[int] = None,
+    max_docs: Optional[int] = None,
+    max_chars: Optional[int] = None,
     resume_merges: Optional[Sequence[Pair]] = None,
     checkpoint_every: Optional[int] = None,
     checkpoint_dir: Optional[str] = None,
@@ -149,21 +187,41 @@ def train_tokenizer(
 ) -> TrainResult:
     """Learn merges for ``config`` from ``texts`` and return a trained tokenizer.
 
-    ``resume_merges`` seeds the merge list (already-learned merges from a
-    previous run/checkpoint); training continues to ``config.max_merges()``.
-    Every ``checkpoint_every`` merges a JSON checkpoint holding the current
-    partial merge list is written to ``checkpoint_dir`` so a run can be resumed.
+    Args:
+        texts: iterable of document strings (consumed once, lazily).
+        config: vocabulary configuration (vocab size, special tokens, ...).
+        minfreq: stop merging once the most frequent pair occurs < ``minfreq``.
+        num_merges: exact number of merges to learn; defaults to the
+            vocab-derived budget ``config.max_merges()``. Must not exceed it.
+        max_docs: stop reading after this many documents.
+        max_chars: stop reading after this many characters in total.
+        resume_merges: already-learned merges (from a checkpoint) to continue on
+            top of; training continues to ``num_merges`` in total.
+        checkpoint_every / checkpoint_dir / checkpoint_name: periodic JSON
+            checkpoint persistence for resumability.
+        report: optional ``(done, total)`` progress callback.
+
+    The corpus is consumed **once** into a unique-word frequency table (see
+    :func:`build_word_frequency_table`), which is what keeps memory bounded on
+    thousands-of-documents corpora.
     """
     t0 = time.perf_counter()
-    words, total_bytes = build_words(texts, config.pre_tokenize)
+    _validate_train_args(minfreq, num_merges, max_docs, max_chars,
+                         len(resume_merges) if resume_merges else 0, config)
+    if max_docs is not None or max_chars is not None:
+        texts = _limit_texts(texts, max_docs, max_chars)
+    words, counts, total_bytes = build_word_frequency_table(
+        texts, config.pre_tokenize
+    )
     resume = list(resume_merges) if resume_merges else []
-    target = config.max_merges()
-    num_new = max(0, target - len(resume))
+    target = config.max_merges() if num_merges is None else num_merges
+    num_new = target - len(resume)
     log.info(
-        "training: %d words, %d bytes, %d merges already present, %d to learn "
+        "training: %d unique words (from %d occurrences), %d bytes, "
+        "%d merges already present, %d to learn "
         "(vocab_size=%d, special=%d)",
-        len(words), total_bytes, len(resume), num_new,
-        config.vocab_size, len(config.special_tokens),
+        len(words), sum(counts) if counts else 0, total_bytes,
+        len(resume), num_new, config.vocab_size, len(config.special_tokens),
     )
 
     checkpoint_dir_abs = None
@@ -183,7 +241,7 @@ def train_tokenizer(
     if num_new > 0:
         words = preapply_merges(words, resume)
         new_merges = train_bpe(
-            words, num_new, minfreq=minfreq,
+            words, num_new, minfreq=minfreq, word_counts=counts,
             report_every=checkpoint_every,
             report=_checkpoint,
         )
@@ -200,11 +258,63 @@ def train_tokenizer(
     return TrainResult(
         tokenizer=tokenizer,
         merges=merges,
-        num_words=len(words),
+        num_words=sum(counts),
         num_bytes=total_bytes,
         requested_vocab_size=config.vocab_size,
         elapsed_s=elapsed,
     )
+
+
+def _validate_train_args(
+    minfreq: int,
+    num_merges: Optional[int],
+    max_docs: Optional[int],
+    max_chars: Optional[int],
+    resume_count: int,
+    config: TokenizerConfig,
+) -> None:
+    """Reject nonsensical training arguments with clear errors.
+
+    Called once per :func:`train_tokenizer` invocation before any corpus work,
+    so a bad flag fails fast instead of after streaming the whole corpus.
+    """
+    if minfreq < 1:
+        raise ValueError(f"minfreq must be >= 1, got {minfreq}")
+    if num_merges is not None:
+        if num_merges < 0:
+            raise ValueError(f"num_merges must be >= 0, got {num_merges}")
+        if num_merges > config.max_merges():
+            raise ValueError(
+                f"num_merges={num_merges} exceeds vocab budget "
+                f"{config.max_merges()} (vocab_size={config.vocab_size}, "
+                f"special={len(config.special_tokens)})"
+            )
+        if num_merges < resume_count:
+            raise ValueError(
+                f"num_merges={num_merges} < {resume_count} already-learned merges"
+            )
+    if max_docs is not None and max_docs < 1:
+        raise ValueError(f"max_docs must be >= 1, got {max_docs}")
+    if max_chars is not None and max_chars < 1:
+        raise ValueError(f"max_chars must be >= 1, got {max_chars}")
+
+
+def _limit_texts(
+    texts: Iterable[str],
+    max_docs: Optional[int],
+    max_chars: Optional[int],
+) -> Iterable[str]:
+    """Bounded view of ``texts`` honouring document and character budgets."""
+    count = 0
+    chars = 0
+    for doc in texts:
+        if max_docs is not None and count >= max_docs:
+            return
+        if max_chars is not None and chars >= max_chars:
+            return
+        yield doc
+        count += 1
+        chars += len(doc)
 
 
 def load_merges_from_checkpoint(path: str) -> Tuple[List[Pair], TokenizerConfig]:
@@ -275,6 +385,11 @@ def make_arg_parser() -> argparse.ArgumentParser:
                    help="directory for checkpoints")
     p.add_argument("--max-docs", type=int, default=None,
                    help="stop after this many documents")
+    p.add_argument("--max-chars", type=int, default=None,
+                   help="stop after this many characters in total")
+    p.add_argument("--num-merges", type=int, default=None,
+                   help="exact number of merges to learn "
+                        "(default: vocab_size-derived budget)")
     p.add_argument("--report", action="store_true",
                    help="print a vocab-size report after training")
     return p
@@ -308,6 +423,9 @@ def main(argv: Optional[list] = None) -> None:
         texts,
         config,
         minfreq=args.minfreq,
+        num_merges=args.num_merges,
+        max_docs=args.max_docs,
+        max_chars=args.max_chars,
         resume_merges=resume_merges,
         checkpoint_every=args.checkpoint_every,
         checkpoint_dir=args.checkpoint_dir,
