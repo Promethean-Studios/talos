@@ -14,8 +14,11 @@ recognising special-token strings inside the input instead.
 """
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import re
+import tempfile
 import unicodedata  # noqa: F401  (kept for documented byte/char invariants)
 from dataclasses import asdict
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -240,8 +243,21 @@ class ByteLevelBPETokenizer:
             "config": asdict(self.config),
             "merges": [list(p) for p in self._vocab.merges],
         }
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False, indent=2)
+        # Atomic write: dump to a temp file in the same directory, then
+        # os.replace() so a crash/interrupt mid-save can never leave a
+        # truncated or otherwise corrupted file at ``path``.
+        dirname = os.path.dirname(os.path.abspath(path))
+        fd, tmp = tempfile.mkstemp(
+            prefix=os.path.basename(path) + ".", suffix=".tmp", dir=dirname
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
         log.info("saved tokenizer (vocab=%d, merges=%d) to %s", self.vocab_size, self.merge_count, path)
 
     @classmethod
