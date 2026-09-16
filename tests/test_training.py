@@ -29,6 +29,7 @@ from scripts.train_oasst1 import (
     train_epochs,
     train_tokenizer_for_run,
 )
+from scripts.generate import generate_from_checkpoint
 from tokenizer.tokenizer import ByteLevelBPETokenizer
 from tools.make_synthetic_oasst1 import generate
 from training.synthetic import build_recurrent_corpus
@@ -352,3 +353,141 @@ def test_eval_checkpoint_nparams_mismatch_fails(tmp_path) -> None:
     with pytest.raises(ValueError) as exc:
         run_eval(tampered, data=val_path, seq_len=32, batch_size=2, seed=0)
     assert "n_params" in str(exc.value) and "999" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# Generation smoke + negative tests (reproducibility cycle, owner ask):
+# checkpoint -> consistency checks -> greedy KV-cache decode. Reuses the same
+# e2e pattern as the eval tests: 20-doc run, a few steps, checkpoint, generate.
+# ---------------------------------------------------------------------------
+PROMPT = "How do I bake a cake?"
+GENERATED_LEN = 20
+
+
+def test_generate_from_checkpoint_smoke(tmp_path) -> None:
+    """Train a tiny run, load the checkpoint, generate; the full contract holds."""
+    row, _, _ = _short_trained_run(tmp_path, steps=3)
+    result = generate_from_checkpoint(
+        row.checkpoint, PROMPT, max_new_tokens=GENERATED_LEN
+    )
+
+    # No exception; the continuation has exactly the requested number of tokens.
+    assert len(result.token_ids) == GENERATED_LEN
+    assert result.max_new_tokens == GENERATED_LEN
+    # Every generated id is a valid model-vocab id (in-bounds for the embedding).
+    assert all(0 <= t < result.vocab_size for t in result.token_ids)
+    assert result.params == EXPECTED_TINY_PARAMS == 254_272
+    assert result.vocab_size == 1024
+    # tokenizer/model compat: tokenizer vocab never exceeds model vocab.
+    assert result.tokenizer_vocab_size <= result.vocab_size
+    assert result.vocab_padding == result.vocab_size - result.tokenizer_vocab_size
+    # Generations are non-trivial: 20 ids decode to non-empty text.
+    assert result.text
+    # Prompt echo integrity: byte-level BPE round-trips the prompt exactly, and
+    # the echoed full text starts with the original prompt bytes.
+    tokenizer = ByteLevelBPETokenizer.from_file(
+        os.path.join(os.path.dirname(row.checkpoint), "tokenizer.json")
+    )
+    assert tokenizer.decode(tokenizer.encode(PROMPT)) == PROMPT
+    assert result.full_text.startswith(PROMPT)
+    assert result.prompt_tokens == len(tokenizer.encode(PROMPT))
+    assert result.prompt_truncated is False
+    # Report fields are populated and sane.
+    assert result.mode == "greedy" and result.seed is None
+    assert result.wall_s >= 0.0 and result.device
+    assert result.checkpoint_step == 3
+
+
+def test_generate_from_checkpoint_is_deterministic(tmp_path) -> None:
+    """Strongest smoke signal: same checkpoint, greedy -> identical ids + text."""
+    row, _, _ = _short_trained_run(tmp_path, steps=3)
+    a = generate_from_checkpoint(row.checkpoint, PROMPT, max_new_tokens=GENERATED_LEN)
+    b = generate_from_checkpoint(row.checkpoint, PROMPT, max_new_tokens=GENERATED_LEN)
+    assert a.token_ids == b.token_ids
+    assert a.text == b.text
+    assert a.full_text == b.full_text
+    assert a.prompt_tokens == b.prompt_tokens
+
+
+def test_generate_argument_errors_are_clear() -> None:
+    """Bad arguments fail loudly (no checkpoint needed): never a silent default."""
+    with pytest.raises(ValueError) as exc:
+        generate_from_checkpoint("nope.pt", "", max_new_tokens=8)
+    assert "empty" in str(exc.value).lower()
+    with pytest.raises(ValueError) as exc:
+        generate_from_checkpoint("nope.pt", "hi", max_new_tokens=0)
+    assert "max_new_tokens" in str(exc.value)
+    with pytest.raises(ValueError) as exc:
+        generate_from_checkpoint("nope.pt", "hi", max_new_tokens=8,
+                                 temperature=0.8)  # no --seed
+    assert "--seed" in str(exc.value)
+    with pytest.raises(ValueError) as exc:
+        generate_from_checkpoint("nope.pt", "hi", max_new_tokens=8,
+                                 temperature=0.0, seed=0)
+    assert "temperature" in str(exc.value)
+
+
+def test_generate_rejects_tampered_model_config(tmp_path) -> None:
+    """A checkpoint whose recorded model_config was tampered (vocab) is rejected
+    BEFORE any token is generated: the rebuilt model's params no longer match
+    the recorded n_params."""
+    row, _, _ = _short_trained_run(tmp_path, steps=3)
+    ckpt = load_checkpoint(row.checkpoint)
+    cfg = dict(ckpt["model_config"])
+    cfg["vocab_size"] = 2048  # tamper: rebuilt model != recorded artifact
+    ckpt["model_config"] = cfg
+    tampered = str(tmp_path / "tampered-config.pt")
+    torch.save(ckpt, tampered)
+    with pytest.raises(ValueError) as exc:
+        generate_from_checkpoint(tampered, PROMPT, max_new_tokens=8)
+    msg = str(exc.value)
+    # The rebuilt model (vocab 2048) no longer matches the recorded n_params
+    # (254,272): the loader rejects with the clean guard error, BEFORE any
+    # weight-copying shape error could surface.
+    assert "n_params mismatch" in msg and "254,272" in msg
+    assert "385,344" in msg  # == params of the tampered rebuild
+
+
+def test_generate_rejects_recorded_vocab_mismatch(tmp_path) -> None:
+    """A checkpoint whose recorded vocab_size disagrees with its own rebuilt
+    model_config is rejected loudly (recorded values must match the rebuild)."""
+    row, _, _ = _short_trained_run(tmp_path, steps=3)
+    ckpt = load_checkpoint(row.checkpoint)
+    ckpt["vocab_size"] = 2048  # tamper the recorded value (config still 1024)
+    tampered = str(tmp_path / "tampered-vocab.pt")
+    torch.save(ckpt, tampered)
+    with pytest.raises(ValueError) as exc:
+        generate_from_checkpoint(tampered, PROMPT, max_new_tokens=8)
+    msg = str(exc.value)
+    assert "vocab_size mismatch" in msg and "2048" in msg
+
+
+def test_generate_rejects_tokenizer_vocab_overflow(tmp_path) -> None:
+    """A sidecar tokenizer whose vocab exceeds the model vocab is rejected:
+    ids would be unembeddable (the tokenizer/model_compat.py contract)."""
+    row, _, _ = _short_trained_run(tmp_path, steps=3)
+    out_dir = os.path.dirname(row.checkpoint)
+    tok_path = os.path.join(out_dir, "tokenizer.json")
+    with open(tok_path, "r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+    # Inflate the realized vocab (base bytes + specials + merges) past the
+    # model's 1024 rows while keeping the file loadable: raise the config
+    # budget and add extra distinct special tokens (vs. the realized vocab of
+    # a 20-doc corpus — up to 981 — 50 extras guarantee overflow).
+    payload["config"]["vocab_size"] = 4096
+    payload["config"]["extra_special_tokens"] = [
+        f"<|x{i}|>" for i in range(50)
+    ]
+    overflow_tok = os.path.join(out_dir, "tokenizer-overflow.json")
+    with open(overflow_tok, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh)
+    assert ByteLevelBPETokenizer.from_file(overflow_tok).vocab_size > 1024
+
+    ckpt = load_checkpoint(row.checkpoint)
+    ckpt["tokenizer_path"] = overflow_tok
+    tampered = str(tmp_path / "tampered-tokenizer.pt")
+    torch.save(ckpt, tampered)
+    with pytest.raises(ValueError) as exc:
+        generate_from_checkpoint(tampered, PROMPT, max_new_tokens=8)
+    msg = str(exc.value)
+    assert "tokenizer vocab" in msg and "1024" in msg

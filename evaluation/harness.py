@@ -171,8 +171,10 @@ def load_checkpoint_artifacts(
         )
     cfg = ModelConfig(**ckpt["model_config"]).derive()
     model = TalosGPT(cfg)
-    model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
+    # Validate the recorded config/params/vocab BEFORE touching the weights:
+    # a tampered config must fail with the clean guard error, not a shape
+    # mismatch from load_state_dict.
     recorded = int(ckpt["n_params"])
     actual = model.num_parameters()
     if actual != recorded:
@@ -188,6 +190,15 @@ def load_checkpoint_artifacts(
             f"params, expected exactly {EXPECTED_TINY_PARAMS:,} "
             f"(vocab {EXPECTED_TINY_VOCAB})"
         )
+    recorded_vocab = ckpt.get("vocab_size")
+    if recorded_vocab is not None and int(recorded_vocab) != cfg.vocab_size:
+        raise ValueError(
+            f"checkpoint vocab_size mismatch: artifact records {recorded_vocab} "
+            f"but rebuilding the checkpoint's model_config yields "
+            f"{cfg.vocab_size} vocab rows in {checkpoint_path} — the recorded "
+            f"config and the recorded vocab_size disagree"
+        )
+    model.load_state_dict(ckpt["model_state_dict"])
     tok_path = ckpt.get("tokenizer_path")
     if not tok_path or not os.path.isfile(tok_path):
         raise FileNotFoundError(
