@@ -1,4 +1,6 @@
-# Talos
+<img width="432" height="124" alt="Screenshot 2026-09-17 4 30 09 PM" src="https://github.com/user-attachments/assets/b4cbb3f5-875f-419d-a74f-1eb073459a78" />
+
+# 
 
 **Talos** is an experimental language-model project by **Promethean Studios**, focused on building and testing small, efficient transformer architectures before scaling toward larger models.
 
