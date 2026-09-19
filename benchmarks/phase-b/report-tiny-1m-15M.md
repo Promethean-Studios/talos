@@ -65,18 +65,20 @@ untouched (265 passed / 2 skipped on main).
 |---|---:|---:|
 | Parameters | 254,272 | 1,000,320 (3.93×) |
 | Steps / tokens | 7,680 / 15,482,880 | 7,680 / 15,482,880 |
-| Train loss (final, step 7,680) | **1.7937** | __TBD__ |
-| Validation loss (final, step 7,680) | **__TBD__** | __TBD__ |
-| Tokens per sec (train phase, mean of epoch walls) | **48.3K** | __TBD__ |
-| Training time | 320.8 s train phase · 427.3 s run total¹ | __TBD__ |
-| Peak memory (CPU peak RSS — no GPU on this box) | 441.5 MiB train · 254.0 MiB eval | __TBD__ MiB train · __TBD__ eval |
-| Checkpoint size (final `step-7680.pt`) | __TBD__ B | __TBD__ B |
-| Eval throughput (val 102,816 tok) | 142,400 tok/s | __TBD__ |
-| Val perplexity / next-token accuracy | 6.8724 / 0.4428 | __TBD__ / __TBD__ |
-| Decode latency (greedy KV-cache, clean CLI) | __TBD__ ms/token | __TBD__ ms/token |
+| Train loss (final, step 7,680) | **1.7937** | **1.7345** |
+| Validation loss (final, step 7,680) | **1.9275** | **1.8697** |
+| Tokens per sec (train phase, Σ of epoch walls) | **48.2K** | **14.5K** |
+| Training time | 321.2 s train phase · 427.3 s run total¹ | 1,065.2 s train phase · 1,172.0 s run total¹ |
+| Peak memory (CPU peak RSS — no GPU on this box) | 441.5 MiB train · 254.0 MiB eval | 546.0 MiB train · 269.2 MiB eval |
+| Checkpoint size (final `step-7680.pt`) | 1,026,842 B | 4,014,737 B |
+| Eval throughput (val-only, batch 32; 102,816 tok) | 142,400 tok/s | 43,479 tok/s |
+| Val perplexity / next-token accuracy | 6.8724 / 0.4428 | 6.4867 / 0.4583 |
+| Decode latency (greedy KV-cache, clean CLI) | 1.1 ms/token | 1.6 ms/token |
 
 ¹ `wall_s` in `metrics.json` includes the ~106 s train-split BPE + 16 val evals + 17 checkpoints
-(same for both runs). Train phase = tokens / Σ(epoch walls).
+(same for both runs). Train phase = tokens / Σ(epoch walls), both from the committed
+`metrics-*-15m.json`. tiny_1m eval RSS is the val-only `scripts/eval_checkpoint` process
+(269.2 MiB; the task-mandated `--train-data` eval measured 270.0 MiB over train+val streams).
 
 Per-480-step detail (train / val), tiny:
 
@@ -99,21 +101,49 @@ Per-480-step detail (train / val), tiny:
 | 15 | 7200 | 1.8052 | 1.9485 | 20.1 s |
 | 16 | 7680 | 1.7937 | **1.9275** | 19.9 s |
 
-tiny_1m per-480-step detail: __TBD__ (from `metrics-tiny-1m-15m.json`).
+tiny_1m per-480-step detail (from `metrics-tiny-1m-15m.json`):
+
+| epoch | step | train | val | epoch wall |
+|---|---:|---:|---:|---:|
+| 1 | 480 | 3.0015 | 2.8738 | 48.9 s |
+| 2 | 960 | 2.6044 | 2.6533 | 57.9 s |
+| 3 | 1440 | 2.4625 | 2.5503 | 67.1 s |
+| 4 | 1920 | 2.3544 | 2.4459 | 66.5 s |
+| 5 | 2400 | 2.2528 | 2.3432 | 67.4 s |
+| 6 | 2880 | 2.1776 | 2.2586 | 67.5 s |
+| 7 | 3360 | 2.1328 | 2.2018 | 68.4 s |
+| 8 | 3840 | 2.0601 | 2.1806 | 68.4 s |
+| 9 | 4320 | 2.0129 | 2.0833 | 67.9 s |
+| 10 | 4800 | 1.9637 | 2.0484 | 67.6 s |
+| 11 | 5280 | 1.9216 | 2.0050 | 67.4 s |
+| 12 | 5760 | 1.8844 | 1.9628 | 75.1 s |
+| 13 | 6240 | 1.8467 | 1.9391 | 70.2 s |
+| 14 | 6720 | 1.8054 | 1.9148 | 69.2 s |
+| 15 | 7200 | 1.7765 | 1.8957 | 67.1 s |
+| 16 | 7680 | 1.7345 | **1.8697** | 68.6 s |
 
 ## 6. Three-way loss view (the question this run answers)
 
 | config | tokens | tiny train / val | tiny_1m train / val | notes |
 |---|---:|---|---:|---|
 | 3-epoch local A/B (Phase B, PR #22) | 2,908,332 | 2.1610 / 2.3704 | 2.1826 / 2.3950 | tiny wins (1M underfits); batch 4 |
-| **15.5M local A/B (this run)** | 15,482,880 | **1.7937 / 1.9275** | __TBD__ / __TBD__ | batch 32; **__TBD__** |
+| **15.5M local A/B (this run)** | 15,482,880 | **1.7937 / 1.9275** | **1.7345 / 1.8697** | batch 32; **tiny_1m overtakes — Δ val −0.058 (−3.0%)** |
 | published T4 (owner reference — anchor for tiny only) | 15,482,880 | **1.7859 / 1.9177** | — | T4 GPU, unknown data order / eval protocol |
 
 Gain from the larger budget (3-epoch → 15.5M tokens), same local pipeline:
-tiny val 2.3704 → 1.9275 (**−18.7%**, Δ −0.443); tiny_1m __TBD__ → __TBD__ (Δ −__TBD__).
+tiny val 2.3704 → 1.9275 (**−18.7%**, Δ −0.443); tiny_1m 2.3950 → **1.8697** (**−21.9%**, Δ −0.525).
+The 1M model converts the extra ~5.3× budget into a *larger* validation gain
+(Δ−0.525 vs Δ−0.443), flipping the ordering from the 3-epoch result.
 
-**Answer to the A/B question (does 1M overtake 254K with enough tokens?): __TBD__** — detailed in
-§10.
+**Answer to the A/B question (does 1M overtake 254K with enough tokens?): YES — at this
+15.5M-token budget local `tiny_1m` overtakes local `tiny`** (final val 1.8697 < 1.9275;
+train 1.7345 < 1.7937; acc 0.4583 > 0.4428). The cross-over is visible in the per-epoch
+curves: tiny_1m's val first dips below tiny's final 1.9275 at **epoch 14 / step 6,720
+(~13.5M tokens, val 1.9148)**, and the gap widens to −0.058 by step 7,680. Cost of the win:
+3.3× training wall (1,065.2 s vs 321.2 s train phase; 14.5K vs 48.2K tok/s) and ~4× checkpoint
+size. Both curves were still decreasing at step 7,680 (last-epoch val deltas: tiny −0.021,
+tiny_1m −0.026), so this is a single-budget measured crossover, not a plateau — see §10 for
+scope and honest caveats.
 
 **CPU-vs-T4 caveat on the anchor row:** the published row ran on a T4 GPU with an unreported
 data order and eval protocol; our CPU row is batch-32 with the stated seed-0 split and per-480-step
@@ -126,14 +156,31 @@ comparison.
 - **tiny**: val loss **1.9275096343604716 == recorded 1.9275096343604716** (bit-exact) · ppl
   6.8724 · acc 0.4428 · 142,400 tok/s · peak RSS 254.0 MiB — canonical guard OK
   (254,272 / vocab 1024).
-- **tiny_1m**: __TBD__
+- **tiny_1m**: val loss **1.8697498154128187 == recorded 1.8697498154128187** (bit-exact) · ppl
+  6.4867 · acc 0.458294 · val-only throughput 43,479 tok/s (batch 32) · peak RSS 269.2 MiB
+  (270.0 MiB with `--train-data`) — canonical guard OK (1,000,320 / vocab 1024). With
+  `--train-data` the eval also reports a single deterministic train-stream pass (batch 32,
+  drop_last, seed 0): train loss **1.8148** — *not* directly comparable to the loop's recorded
+  epoch-16 mean 1.7345 (that number is the mean of per-batch losses measured as the weights
+  update within the epoch, with training's shuffled batch order; the A/B table uses
+  recorded-vs-recorded for both models, which is the consistent comparison; see §10).
 
 ## 8. Generation
 
 All 5 prompts × 3 checkpoints (local tiny, local tiny_1m, **published HF baseline**) in
 `generation_samples-15m.md`: greedy, deterministic, 32 tokens, **fresh CLI process per row**
-(clean per-process timing — avoids the Phase-B in-process driver inflation). Decode ms/token from
-the CLI's own wall-token accounting. __TBD__ (tiny_1m + published rows after training completes).
+(clean per-process timing — avoids the Phase-B in-process driver inflation). Decode ms/token
+from the CLI's own wall-token accounting (mean of the 5 prompts):
+
+| checkpoint | mean ms/token |
+|---|---:|
+| local tiny 254,272 (7,680 steps) | 1.1 |
+| local tiny_1m 1,000,320 (7,680 steps) | 1.6 |
+| published HF T4 tiny 254,272 | 1.1 |
+
+Output quality is babble everywhere (expected at this scale — vocabulary echoing, no coherent
+continuation), with the same flavor across local tiny, local tiny_1m and the published baseline;
+no correctness claims are made from generation.
 
 ## 9. Environment & provenance
 
@@ -153,4 +200,27 @@ the CLI's own wall-token accounting. __TBD__ (tiny_1m + published rows after tra
   the same lr — visible as higher epoch-1 losses at batch 32, e.g. tiny 3.0169 vs 2.6297);
   all comparisons in this report are same-batch-size, so the A/B is clean; the 3-epoch rows exist
   for the budget-scaling view, not as same-dynamics comparators.
-- __TBD__
+- **Why the verdict is "yes, with scope":** the crossover measurement is one budget point on one
+  2,000-doc dataset, batch 32, lr 3e-3, seed 0. Both models' val curves were still falling at
+  step 7,680 (tiny −0.021 vs tiny_1m −0.026 over the last epoch), so the observed margin
+  (−0.058) is a lower bound on the divergence at *this* budget, not an asymptotic statement.
+  A second budget point (e.g. 2× tokens) would be needed to confirm the trend and find where
+  the 1M model's advantage plateaus — that is the lead/owner's call.
+- **Bit-exactness protocol detail:** `scripts/eval_checkpoint` must run with the training batch
+  size (--batch 32) to reproduce the recorded val loss bit-for-bit; the CLI default (batch 4)
+  yields 1.869749820755532 — identical to 8 decimal places but not bit-exact. (Same for tiny:
+  the reported eval used batch 32.)
+- **Eval throughput cells are val-only at batch 32** (tiny 142,400 tok/s; tiny_1m 43,479 tok/s
+  — a dedicated val-only run of the same CLI; 3.3× slower for 3.93× params, in line with
+  compute scaling). The committed `eval-tiny-1m-15m.json` includes the task-mandated
+  `--train-data` pass (aggregate 45,795 tok/s over train+val).
+- **Eval train-loss convention:** the `--train-data` pass reports a single deterministic
+  train-stream loss with final weights (1.8148). The training loop's recorded final-epoch mean
+  (1.7345) is the mean of per-batch losses as weights update within the epoch (training-order
+  shuffled batches), so the two numbers measure different things; for the owner's table both
+  models use the recorded train-loss convention.
+- **Memory:** tiny_1m peaked at 546.0 MiB RSS during training and 269.2 MiB eval — comfortably
+  under the ~1.5 GB CPU gate; batch 32 was never a memory risk for either model at this scale.
+- **Determinism:** both runs are seed-0 deterministic; re-running the identical command
+  reproduces identical metrics (checked for tiny in the draft; checkpoints + logs retained in
+  `/tmp/phaseb-15m/`).

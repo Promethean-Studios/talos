@@ -132,10 +132,21 @@ per model) to test whether `tiny_1m` overtakes `tiny` given ~5.3× more tokens t
   recorded (1.9275096343604716), ppl 6.8724, acc 0.4428, 142,400 tok/s. **CPU-vs-T4 anchor:
   published T4 row is train 1.7859 / val 1.9177 — CPU lands within +0.008 train / +0.010 val at
   the identical step shape** (T4 ran an unrecorded data order / eval protocol; see report §6).
-- **tiny_1m (1,000,320):** same shape — results landing in this run's report
-  (`benchmarks/phase-b/report-tiny-1m-15M.md` + `metrics-tiny-1m-15m.json` / `eval-tiny-1m-15m.json`).
-- **A/B question** (does 1M overtake 254K with enough tokens): answered in the report §6/§10 —
-  see the three-way loss view (3-epoch local A/B vs 15.5M local A/B vs published T4 reference).
+- **tiny_1m (1,000,320):** same shape — train 3.0015→**1.7345**; val 2.8738→**1.8697** (16
+  per-480-step measurements; val strictly decreased every epoch). Wall 1,172.0 s run total
+  (train phase 1,065.2 s → **14,535 tok/s**), peak RSS **546.0 MiB** train / **269.2 MiB** eval,
+  checkpoint 4,014,737 B. Eval: val loss **bit-exact** vs recorded (1.8697498154128187), ppl
+  6.4867, acc 0.4583, val-only throughput 43,479 tok/s; `--train-data` pass reports train loss
+  1.8148 under the eval protocol (see report §7/§10 for why it differs from the loop's recorded
+  epoch mean). Canonical 1,000,320 guard enforced.
+- **A/B question** (does 1M overtake 254K with enough tokens?): **YES at 15.5M tokens** — local
+  tiny_1m final val **1.8697 < tiny's 1.9275** (Δ −0.058, −3.0%) and train 1.7345 < 1.7937,
+  acc 0.4583 > 0.4428. Cross-over at epoch 14 / step 6,720 (~13.5M tokens). At the 3-epoch
+  budget 1M lost (2.3950 vs 2.3704); with ~5.3× more tokens it converts the budget into a
+  *larger* val gain (Δ −0.525 vs tiny's −0.443) and overtakes. Cost: 3.3× training wall
+  (1,065.2 s vs 321.2 s train phase), 14.5K vs 48.2K tok/s. Single-budget point; both curves
+  still falling at step 7,680 — see the three-way view in
+  `benchmarks/phase-b/report-tiny-1m-15M.md` §6.
 ## 3. Not-yet-run scales (placeholders)
 
 The ~1M / ~10M / ~100M rows are the scaling ladder; only the ~1M row has been
