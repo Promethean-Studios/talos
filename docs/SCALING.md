@@ -14,12 +14,14 @@ below are either backed by merged-PR artifacts or marked *not yet run*.
   decoder-only base LLM with a 128K-token context window** (see
   `docs/architecture.md` and `configs/presets.py`). That is a **future
   research target, not a demonstrated result**.
-- **No model larger than 254,272 parameters has ever been trained in this
-  repository.** The codebase contains untrained *configs* for larger sizes
-  (`small` 35.7M, `medium` 285M, `large` 1.64B, `100b`, `400b` — verifiable via
-  `python -m configs.compute --summary`), but a config is an estimate, not a
-  result. Configs become results only when a training run is executed,
-  checkpointed, and evaluated through the harness.
+- **No model larger than 254,272 parameters had been trained in this
+  repository until Phase B (2026-09-19), when the `tiny_1m` preset was trained
+  end-to-end on a real OASST1 subset — see the ~1M row in §2 and
+  `benchmarks/report-tiny-1m.md`.** The codebase contains untrained *configs*
+  for larger sizes (`small` 35.7M, `medium` 285M, `large` 1.64B, `100b`,
+  `400b` — verifiable via `python -m configs.compute --summary`), but a config
+  is an estimate, not a result. Configs become results only when a training
+  run is executed, checkpointed, and evaluated through the harness.
 - This document claims nothing beyond measured or clearly-labeled-estimated
   numbers. The progression table below is the authoritative scoreboard.
 
@@ -31,14 +33,18 @@ run* (placeholder — planned, no results).
 | Scale (dense) | Parameters | Train loss* | Val loss* | Throughput | Peak memory | Convergence notes | Status |
 |---|---:|---:|---:|---:|---:|---|---|
 | 254K (`tiny`) | 254,272 | **0.2521** (final, epoch 3) | **0.2473** (final, epoch 3) | **~12.5K tok/s** train · **~73–77K tok/s** eval · **~1.1 ms/token** decode | **~314 MiB** train · **~231 MiB** eval (peak RSS) | Loss strictly decreased on train *and* val across all 3 epochs; deterministic under seed 0; eval recompute bit-exact vs. recorded val loss. Output text is incoherent babble (expected at this scale). | ✅ PRs #17–#19 |
-| ~1M | *not yet run* | — | — | — | — | — | ⬜ |
+| ~1M (`tiny_1m`) | 1,000,320 | **2.1826** (final, epoch 3) | **2.3950** (final, epoch 3) | **~9.2K tok/s** train phase (6,884 tok/s whole-run) · **31.2K tok/s** eval · **2.0 ms/token** decode | **378.2 MiB** train · **237.8 MiB** eval (peak RSS) | Real OASST1 2,000-doc subset (1,800/200, seed 0, BPE 764 merges, seq 64, batch 4, lr 3e-3, 3 epochs = 11,541 steps). Train+val loss strictly decreased across all 3 epochs; eval recompute bit-exact vs recorded; canonical 1,000,320 guard enforced. **Honest A/B at this budget: final val 2.3950 vs tiny's 2.3704 on the identical data/steps — the 1M model did NOT beat 254K here** (underfits; see `benchmarks/phase-b/report-tiny-1m.md`). | ✅ Phase B, PR #22 |
 | ~10M | *not yet run* | — | — | — | — | — | ⬜ |
 | ~100M | *not yet run* | — | — | — | — | — | ⬜ |
 
-\* Natural-log mean cross-entropy (nats), measured on the fixed synthetic-OASST
-JSONL corpus (400 docs, 360/40 train/val split, BPE vocab 1024, seq 64, batch 4,
-lr 3e-3, AdamW). Loss values are only comparable across runs that share this
-corpus/configuration — they are **not** comparable to public benchmarks.
+\* Natural-log mean cross-entropy (nats). **Row 254K** was measured on the fixed
+synthetic-OASST JSONL corpus (400 docs, 360/40 train/val split, BPE vocab 1024,
+seq 64, batch 4, lr 3e-3, AdamW). **Row ~1M (Phase B)** was measured on a real
+OASST1 2,000-doc subset (rows 0–1999 of `OpenAssistant/oasst1` train split,
+1,800/200 seed-0 split, BPE vocab 1024 = 764 merges, seq 64, batch 4, lr 3e-3,
+3 epochs). Losses are comparable only across runs sharing corpus/config; the
+two rows are **not** cross-comparable — the 254K-vs-1M A/B on the *same*
+corpus lives in `benchmarks/phase-b/report-tiny-1m.md`.
 
 ### 2.1 The 254K row — the real measured run
 
@@ -86,9 +92,35 @@ training → checkpoint → eval → generation is exercised and regression-test
 (255 passed / 2 skipped), with committed artifacts in `benchmarks/` (baseline,
 quantization, DDM, and the consolidated `benchmarks/report-tiny.md`).
 
+### 2.1b The ~1M row — the real measured run (Phase B, 2026-09-19)
+
+Full detail: `benchmarks/phase-b/report-tiny-1m.md` (committed with this PR,
+including the owner's comparison table). Summary (CPU: Intel Xeon @ 2.90 GHz,
+2 cores, torch 2.13.0+cpu, **no GPU**):
+
+- **Data:** 2,000-doc real OASST1 subset (rows 0–1999, provenance recorded) →
+  fixed-seed 1,800/200 split → train-split-only BPE, **764 merges / vocab 1024**
+  (~105 s; byte-identical to the owner's published tokenizer).
+- **Training:** 3 epochs × 3,847 steps = **11,541 steps**, 2,908,332 tokens,
+  lr 3e-3, batch 4, seq 64. Train 2.6426→2.3516→**2.1826**; val
+  2.6759→2.5017→**2.3950**. Wall 422.5 s (train phase 317.5 s), peak RSS
+  **378.2 MiB**, checkpoint **4,014,773 B**.
+- **Eval:** val loss **bit-exact** vs recorded (2.3949950500474033), ppl
+  10.9681, acc 0.3309, 31,220 tok/s, peak RSS 237.8 MiB; canonical 1,000,320
+  guard enforced.
+- **A/B verdict (identical data/tokenizer/steps):** tiny final val 2.3704 vs
+  tiny_1m 2.3950 — **no val-loss improvement from 4× params at this budget**
+  (1M model underfits; 2.8× slower per step). Reported honestly; no
+  superiority claim.
+- **Generation:** 5 prompts × {local tiny, local tiny_1m, published HF T4
+  baseline} greedy; decode 1.3 / 2.0 / 1.1 ms/token; all guards pass; output
+  is babble everywhere (expected at this scale).
+
 ## 3. Not-yet-run scales (placeholders)
 
-The ~1M / ~10M / ~100M rows are **planned, not executed**. When each scale is
+The ~1M / ~10M / ~100M rows are the scaling ladder; only the ~1M row has been
+run so far (Phase B, 2026-09-19 — real OASST1 data; see §2.1b below). The
+~10M / ~100M rows are **planned, not executed**. When each scale is
 run, it must fill the table with the **same metric conventions** (§5) so rows
 are comparable. Per-scale expectations below are **honest engineering
 estimates, not results** — they exist only to scope the run.
@@ -120,11 +152,12 @@ be published alongside (available in the per-epoch checkpoints already).
   row persist at ~4× parameters on the same corpus, and a first curve point
   for scaling documentation.
 
-#### Config: `tiny_1m` (implemented, training run pending)
+#### Config: `tiny_1m` (implemented; Phase B training run complete — see §2.1b)
 
-The ~1M scaling step is **defined and merged-ready, but no training run exists
-yet** (that is Phase B). This block documents only the config; the progression
-table row above remains `*not yet run*` until a real run fills it.
+The ~1M scaling step is **defined and has one complete training run** (Phase B,
+2026-09-19, real OASST1 2,000-doc subset). This block documents the config;
+the measured numbers live in the §2 progression table and in
+`benchmarks/report-tiny-1m.md`.
 
 **Architecture — `tiny` scaled up, no redesign.** `tiny_1m`
 (`configs/presets.py`, canonical registry `configs/canonical.py`) keeps every
@@ -249,9 +282,12 @@ python -m pytest -q
 
 ## 6. Known limitations (be explicit)
 
-- All measurements to date are **single-machine CPU**; no GPU and no
-  multi-node numbers exist anywhere in this repo.
-- The corpus is **synthetic**; real-data runs are planned but not yet measured.
+- All measurements to date are **single-machine CPU or the owner's published
+  single-GPU (T4) reference**; no multi-node numbers exist anywhere in this
+  repo.
+- The original 254K benchmark row uses a **synthetic** corpus; the ~1M Phase B
+  row uses a **real OASST1 2,000-doc subset** (corpus differs per row — see
+  each row's own data section; rows are not cross-comparable).
 - **No long-context** data or runs exist; the 128K-context target is
   architecture-only (implemented + unit-tested) until a training run at that
   context length exists.

@@ -1,0 +1,41 @@
+{
+  "source_dataset": "OpenAssistant/oasst1",
+  "split": "train",
+  "config": "default",
+  "total_split_rows": 84437,
+  "reused_docs": {
+    "file": "/tmp/oasst1_real.jsonl",
+    "count": 1800,
+    "row_offsets": [
+      0,
+      1799
+    ],
+    "verified": "first/last row text matches rows API at offsets 0 and 1799",
+    "sha256": "8a29212c41ae3b58b55bada2777f09e43645243b5303f273aa4130e869b7b3de"
+  },
+  "fetched_docs": {
+    "row_offsets": [
+      1800,
+      1999
+    ],
+    "fetched_ranges": [
+      [
+        1800,
+        1899
+      ],
+      [
+        1900,
+        1999
+      ]
+    ],
+    "count": 200,
+    "api_endpoint": "https://datasets-server.huggingface.co/rows?dataset=OpenAssistant/oasst1&config=default&split=train&offset=1800&length=200 (chunked at 100 rows/request)"
+  },
+  "corpus": {
+    "path": "/tmp/phaseb/oasst1_2000.jsonl",
+    "count": 2000,
+    "bytes": 1137265,
+    "sha256": "e75b10aa44bb5e1654f90f512cb9ca626f884c7a5c9fb514bf6b9b72db69a69a",
+    "format": "jsonl, one record per line: {\"text\": ...}"
+  }
+}

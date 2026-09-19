@@ -1,0 +1,47 @@
+{
+  "format": "talos-oasst1-training-metrics-v1",
+  "params": 1000320,
+  "vocab_size": 1024,
+  "tokenizer_vocab_size": 1024,
+  "tokenizer_merges": 764,
+  "train_docs": 1800,
+  "val_docs": 200,
+  "split_seed": 0,
+  "epochs": [
+    {
+      "epoch": 1,
+      "steps": 3847,
+      "global_step": 3847,
+      "train_loss": 2.642594346325832,
+      "val_loss": 2.67586142928512,
+      "checkpoint": "/tmp/phaseb/run_tiny_1m/step-3847.pt",
+      "wall_s": 104.02212537299783
+    },
+    {
+      "epoch": 2,
+      "steps": 3847,
+      "global_step": 7694,
+      "train_loss": 2.351599962177728,
+      "val_loss": 2.5016826762612867,
+      "checkpoint": "/tmp/phaseb/run_tiny_1m/step-7694.pt",
+      "wall_s": 106.22557164599857
+    },
+    {
+      "epoch": 3,
+      "steps": 3847,
+      "global_step": 11541,
+      "train_loss": 2.182563123515218,
+      "val_loss": 2.3949950500474033,
+      "checkpoint": "/tmp/phaseb/run_tiny_1m/step-11541.pt",
+      "wall_s": 107.22090959300112
+    }
+  ],
+  "final_train_loss": 2.182563123515218,
+  "final_val_loss": 2.3949950500474033,
+  "tokens_processed": 2908332,
+  "wall_s": 422.451,
+  "peak_rss_mb": 378.2,
+  "device": "cpu",
+  "checkpoint": "/tmp/phaseb/run_tiny_1m/step-11541.pt",
+  "tokenizer_path": "/tmp/phaseb/run_tiny_1m/tokenizer.json"
+}
