@@ -52,6 +52,52 @@ def tiny_tokenizer_config() -> TokenizerConfig:
     return TokenizerConfig(vocab_size=1024)
 
 
+def tiny_1m_config() -> ModelConfig:
+    """The ~1M scaling step: ``tiny`` scaled up on the exact same architecture.
+
+    Same architectural ratios as ``tiny`` — 2:1 GQA (8/4 heads), head_dim 16,
+    dense FFN at 4× hidden (512/128), full attention, un-tied embeddings, no
+    biases — with the model size ~3.93× tiny's. ``vocab_size`` and
+    ``max_seq_len`` are **unchanged** (1024 / 512) so the existing vocab-1024
+    tokenizer (``tiny_tokenizer_config``) is used unchanged and the tokenizer↔
+    model compat contract is untouched. The exact parameter count, verified
+    programmatically, is **1,000,320** (see docs/SCALING.md §3.1 for the full
+    arithmetic).
+
+    Depth is 3 layers rather than the 4 suggested during design: keeping the
+    tiny FFN ratio at exactly 4× hidden, 4 layers would land at 1,246,336
+    params (~25% over the 1.1M ceiling), while 3 layers at the same ratios
+    lands at 1,000,320 — squarely in the 0.9–1.1M target. This preserves every
+    ratio of the 254K model instead of re-tuning the FFN width, so the ~4×
+    parameter scaling comes purely from hidden 64→128 and layers 2→3.
+    """
+    return ModelConfig(
+        vocab_size=1024,
+        hidden_size=128,
+        num_layers=3,
+        num_attention_heads=8,
+        num_kv_heads=4,
+        head_dim=16,
+        ffn_type="dense",
+        intermediate_size=512,
+        max_seq_len=512,
+        attention_type="full",
+        rope_theta=10000.0,
+        layer_norm_eps=1e-5,
+    )
+
+
+def tiny_1m_tokenizer_config() -> TokenizerConfig:
+    """Tokenizer for ``tiny_1m``: identical to ``tiny``'s.
+
+    ``tiny_1m`` keeps ``vocab_size=1024`` unchanged (see
+    :func:`tiny_1m_config`), so the existing vocab-1024 tokenizer contract is
+    reused verbatim — no new tokenizer, no retrained merges, same byte-level
+    BPE budget (256 base bytes + 4 specials + up to 764 merges).
+    """
+    return tiny_tokenizer_config()
+
+
 def small_config() -> ModelConfig:
     """Small research model (single-GPU / small-cluster fit)."""
     return ModelConfig(
@@ -178,6 +224,7 @@ def scale_400b_config() -> ModelConfig:
 
 ALL_PRESETS = {
     "tiny": tiny_config,
+    "tiny_1m": tiny_1m_config,
     "small": small_config,
     "medium": medium_config,
     "large": large_config,

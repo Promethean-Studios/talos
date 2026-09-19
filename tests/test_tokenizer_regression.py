@@ -281,8 +281,11 @@ def test_tiny_model_generation_tokens_decode_losslessly(tiny_gpt2_tokenizer) -> 
 
     from model import TalosGPT
 
-    model = TalosGPT(tiny_config().derive())
+    # Seed *before* construction: the model's random init must not depend on
+    # the global RNG state accumulated by earlier tests in the suite (the
+    # old ordering passed only because of where this test happened to run).
     torch.manual_seed(0)
+    model = TalosGPT(tiny_config().derive())
     prompt = torch.tensor(
         [[tiny_gpt2_tokenizer.bos_id] + tiny_gpt2_tokenizer.encode("Hi")],
         dtype=torch.long,

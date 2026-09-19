@@ -107,9 +107,10 @@ be published alongside (available in the per-epoch checkpoints already).
 
 ### ~1M parameters (estimated hardware)
 
-- **Rough config** (to be defined precisely): dense, vocab ~2048, hidden ~256,
-  4–6 layers — a scaled-up `tiny` on the same code path (`configs/`), with a
-  `model_vocab_size >= tokenizer_vocab_size` tokenizer (e.g. 2048).
+- **Rough config** (now precisely defined as the `tiny_1m` preset — see
+  "Config: `tiny_1m`" below): dense, the `tiny` architecture scaled up on the
+  same code path (`configs/`), keeping `vocab_size=1024` and `max_seq_len=512`
+  unchanged.
 - **Honest estimate:** fits on a single modern CPU (a few hundred MiB–1 GiB
   RSS) or trivially on any GPU. Expect training wall-times of minutes to ~1 h
   on the same 400-doc / 3-epoch workload, CPU throughput plausibly in the same
@@ -118,6 +119,64 @@ be published alongside (available in the per-epoch checkpoints already).
 - **Purpose:** first check that the loss/perplexity improvements of the 254K
   row persist at ~4× parameters on the same corpus, and a first curve point
   for scaling documentation.
+
+#### Config: `tiny_1m` (implemented, training run pending)
+
+The ~1M scaling step is **defined and merged-ready, but no training run exists
+yet** (that is Phase B). This block documents only the config; the progression
+table row above remains `*not yet run*` until a real run fills it.
+
+**Architecture — `tiny` scaled up, no redesign.** `tiny_1m`
+(`configs/presets.py`, canonical registry `configs/canonical.py`) keeps every
+architectural ratio of the 254K `tiny` preset and changes only the model-size
+numbers:
+
+| knob | `tiny` (254K) | `tiny_1m` (~1M) | rationale |
+|---|---:|---:|---|
+| `hidden_size` | 64 | 128 | 2× width |
+| `num_layers` | 2 | 3 | 1.5× depth |
+| `num_attention_heads` | 4 | 8 | scaled with hidden (2:1 GQA kept) |
+| `num_kv_heads` | 2 | 4 | 2:1 GQA ratio unchanged |
+| `head_dim` | 16 | 16 | unchanged |
+| `intermediate_size` | 256 | 512 | FFN stays at exactly 4× hidden |
+| `ffn_type` | dense | dense | unchanged |
+| `vocab_size` | 1024 | 1024 | unchanged (tokenizer contract intact) |
+| `max_seq_len` | 512 | 512 | unchanged |
+| `attention_type` / RoPE | full / theta 1e4 | full / theta 1e4 | unchanged |
+| `tie_word_embeddings` | False | False | un-tied, unchanged |
+| biases | none | none | unchanged |
+
+**Exact parameter count: 1,000,320** (verified programmatically —
+`TalosGPT(tiny_1m_config().derive()).num_parameters() == 1_000_320`, asserted
+by `tests/test_tiny_1m.py` and enforced by the canonical registry
+`configs/canonical.py`).
+
+**Parameter arithmetic** (dense, un-tied embeddings, no biases — the same
+formula as `ModelConfig.param_count_breakdown`):
+
+- embedding = `V · H = 1024 · 128 = 131,072`
+- lm_head (un-tied) = `V · H = 131,072`
+- per-layer attention = `H·(Hq·d) + H·(Hkv·d) + H·(Hkv·d) + (Hq·d)·H`
+  = `128·128 + 128·64 + 128·64 + 128·128` = `16,384 + 8,192 + 8,192 + 16,384`
+  = **49,152**
+- per-layer norms = `2 · H = 256`
+- per-layer FFN = `3 · H · I = 3 · 128 · 512` = **196,608**
+- per layer total = `49,152 + 256 + 196,608` = `246,016`; × 3 layers = `738,048`
+- final norm = `H = 128`
+- **total = `131,072 + 131,072 + 738,048 + 128` = 1,000,320**
+
+**Design notes vs the 254K comparison.** Total parameters scale ~3.93×
+(1,000,320 / 254,272 ≈ 3.93), landing in the 0.9–1.1M target. Depth is 3
+layers rather than the 4 first sketched during design: keeping the tiny FFN
+ratio at exactly 4× hidden, 4 layers would give 1,246,336 params (~25% over
+the 1.1M ceiling), while 3 layers at the *same* ratios give 1,000,320. This
+preserves every architectural ratio of the 254K model (2:1 GQA, head_dim 16,
+FFN 4× hidden, full attention, un-tied embeddings, no biases) instead of
+re-tuning the FFN width, so the parameter scaling is attributable purely to
+`hidden 64→128` and `layers 2→3` — the cleanest apples-to-apples scaling
+comparison. `vocab_size` and `max_seq_len` are unchanged, so the existing
+vocab-1024 tokenizer (`tiny_tokenizer_config`) is used verbatim with no
+retraining, and the `tokenizer_vocab ≤ model_vocab` contract is untouched.
 
 ### ~10M parameters (estimated hardware)
 

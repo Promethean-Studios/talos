@@ -12,8 +12,9 @@ The generation-time consistency guarantee (any mismatch fails loudly with a
 
 * the artifact format is ``talos-training-checkpoint-v1``;
 * the checkpoint's recorded ``model_config`` rebuilds a model whose parameter
-  count equals the recorded ``n_params`` (and the canonical 254,272 for the
-  tiny prototype);
+  count equals the recorded ``n_params`` (and, for the canonical presets, the
+  per-preset canonical count — 254,272 for ``tiny``, 1,000,320 for ``tiny_1m``
+  — enforced by the registry in ``configs/canonical.py``);
 * the recorded ``vocab_size`` equals the rebuilt config's ``vocab_size``;
 * the sidecar ``tokenizer.json`` exists and ``tokenizer_vocab_size <=
   model_vocab_size`` — the ``tokenizer/model_compat.py`` contract, so every
@@ -159,9 +160,9 @@ def generate_from_checkpoint(
 
     # ---- consistency checks BEFORE any generation --------------------------
     # The loader rebuilds the model from the checkpoint's own model_config,
-    # asserts the recorded n_params (and the canonical 254,272 for tiny),
-    # asserts the recorded vocab_size matches the rebuilt config, and enforces
-    # tokenizer_vocab_size <= model_vocab_size — see
+    # asserts the recorded n_params (and the per-preset canonical count for
+    # tiny / tiny_1m), asserts the recorded vocab_size matches the rebuilt
+    # config, and enforces tokenizer_vocab_size <= model_vocab_size — see
     # evaluation.harness.load_checkpoint_artifacts. Any mismatch raises here.
     ckpt, model, tokenizer = load_checkpoint_artifacts(ckpt_path)
     # Make the tokenizer/model compat contract explicit on this path (raises

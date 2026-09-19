@@ -59,7 +59,8 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from configs.presets import tiny_config, tiny_tokenizer_config  # noqa: E402
+from configs.canonical import CANONICAL_PRESETS  # noqa: E402
+from configs.presets import ALL_PRESETS, tiny_tokenizer_config  # noqa: E402
 from data.tokenized import StreamingTokenizedDataset  # noqa: E402
 from model import TalosGPT  # noqa: E402
 from model.utils import get_logger, set_seed  # noqa: E402
@@ -203,8 +204,38 @@ def train_tokenizer_for_run(
 
 
 # ---------------------------------------------------------------------------
-# Step 3 — canonical tiny model with a hard param-count guard
+# Step 3 — canonical preset model with a hard param-count guard
 # ---------------------------------------------------------------------------
+def check_preset_compat(preset: str, cfg, n_params: int) -> None:
+    """Fail fast if the model is not a registered canonical preset.
+
+    Guards the hard requirement for whichever preset is being trained: its
+    exact canonical parameter count at its exact canonical vocab size (from
+    :data:`configs.canonical.CANONICAL_PRESETS`). Any drift in
+    ``configs/presets`` is caught here *before* training starts. ``tiny`` is
+    enforced at exactly 254,272 params / vocab 1024; ``tiny_1m`` at exactly
+    1,000,320 params / vocab 1024.
+    """
+    expected, expected_vocab = CANONICAL_PRESETS[preset]
+    problems: List[str] = []
+    if cfg.vocab_size != expected_vocab:
+        problems.append(
+            f"vocab_size={cfg.vocab_size} (expected {expected_vocab})"
+        )
+    if n_params != expected:
+        problems.append(
+            f"param count={n_params:,} (expected exactly {expected:,})"
+        )
+    if problems:
+        raise ValueError(
+            f"{preset} preset config drift detected — refusing to train: "
+            + "; ".join(problems)
+            + f". The canonical {preset} preset is exactly {expected:,} params "
+            f"at vocab_size {expected_vocab} (configs/presets.{preset}_config). "
+            "Fix the preset before training — do not 'fix' this guard."
+        )
+
+
 def check_tiny_compat(cfg, n_params: int) -> None:
     """Fail fast if the model is not the owner-fixed canonical tiny preset.
 
@@ -212,32 +243,20 @@ def check_tiny_compat(cfg, n_params: int) -> None:
     (hidden 64, 2 layers, 4 heads, 2 KV heads, dense FFN, seq 512). Any drift
     in ``configs/presets.tiny_config`` is caught here *before* training starts.
     """
-    problems: List[str] = []
-    if cfg.vocab_size != EXPECTED_TINY_VOCAB:
-        problems.append(
-            f"vocab_size={cfg.vocab_size} (expected {EXPECTED_TINY_VOCAB})"
-        )
-    if n_params != EXPECTED_TINY_PARAMS:
-        problems.append(
-            f"param count={n_params:,} (expected exactly {EXPECTED_TINY_PARAMS:,})"
-        )
-    if problems:
-        raise ValueError(
-            "tiny preset config drift detected — refusing to train: "
-            + "; ".join(problems)
-            + ". The owner-fixed prototype is exactly 254,272 params at "
-            "vocab_size 1024 (configs/presets.tiny_config: hidden 64, 2 layers, "
-            "4 heads, 2 KV heads, dense FFN, seq 512). Fix the preset before "
-            "training — do not 'fix' this guard."
-        )
+    check_preset_compat("tiny", cfg, n_params)
+
+
+def build_preset_model(preset: str) -> TalosGPT:
+    """Build a canonical preset model and assert its exact-param contract."""
+    cfg = ALL_PRESETS[preset]().derive()
+    model = TalosGPT(cfg)
+    check_preset_compat(preset, cfg, model.num_parameters())
+    return model
 
 
 def build_tiny_model() -> TalosGPT:
     """Build the canonical tiny model and assert the 254,272-param contract."""
-    cfg = tiny_config().derive()
-    model = TalosGPT(cfg)
-    check_tiny_compat(cfg, model.num_parameters())
-    return model
+    return build_preset_model("tiny")
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +442,8 @@ def make_arg_parser() -> argparse.ArgumentParser:
                    help="OASST1-shaped JSONL corpus (any path; real or synthetic)")
     p.add_argument("--out-dir", required=True, help="run directory (split, tokenizer, checkpoints, metrics)")
     p.add_argument("--seed", type=int, default=0, help="fixed seed for split + training (default 0)")
+    p.add_argument("--preset", default="tiny",
+                   help=f"canonical preset to train ({', '.join(sorted(CANONICAL_PRESETS))}; default tiny)")
     # split
     p.add_argument("--split-ratio", type=float, default=0.9, help="train fraction (default 0.9)")
     p.add_argument("--split-max-docs", type=int, default=None,
@@ -460,14 +481,22 @@ def train_run(args: argparse.Namespace) -> dict:
     out_dir = args.out_dir
     os.makedirs(os.path.join(out_dir, "data"), exist_ok=True)
 
-    # ---- canonical tiny config, printed before anything else -------------
-    cfg = tiny_config().derive()
+    # ---- canonical preset config, printed before anything else ------------
+    preset = args.preset
+    if preset not in CANONICAL_PRESETS:
+        raise ValueError(
+            f"unknown --preset {preset!r}: choose from "
+            f"{', '.join(sorted(CANONICAL_PRESETS))}"
+        )
+    exp_params, exp_vocab = CANONICAL_PRESETS[preset]
+    cfg = ALL_PRESETS[preset]().derive()
     print("=" * 72)
     print("Talos OASST1-style training run")
-    print(f"  model preset  : tiny (dense) — vocab={cfg.vocab_size} hidden={cfg.hidden_size} "
-          f"layers={cfg.num_layers} heads={cfg.num_attention_heads} kv={cfg.num_kv_heads} "
+    print(f"  model preset  : {preset} ({cfg.ffn_type}) — vocab={cfg.vocab_size} "
+          f"hidden={cfg.hidden_size} layers={cfg.num_layers} "
+          f"heads={cfg.num_attention_heads} kv={cfg.num_kv_heads} "
           f"ffn={cfg.ffn_type} seq={cfg.max_seq_len}")
-    print(f"  expected      : EXACTLY {EXPECTED_TINY_PARAMS:,} params, vocab_size {EXPECTED_TINY_VOCAB}")
+    print(f"  expected      : EXACTLY {exp_params:,} params, vocab_size {exp_vocab}")
     print(f"  data          : {args.data}")
     print(f"  seed          : {args.seed} | split ratio {args.split_ratio} | "
           f"epochs {args.epochs} | seq {args.seq} | batch {args.batch} | lr {args.lr} | device {device}")
@@ -495,8 +524,8 @@ def train_run(args: argparse.Namespace) -> dict:
         max_chars=args.bpe_max_chars,
     )
 
-    # ---- 3) canonical tiny model + hard param-count guard (fail fast) ----
-    model = build_tiny_model().to(device)
+    # ---- 3) canonical preset model + hard param-count guard (fail fast) ---
+    model = build_preset_model(preset).to(device)
     n_params = model.num_parameters()
     print(f"  model: {n_params:,} params (vocab {model.config.vocab_size}) — config guard OK")
 
