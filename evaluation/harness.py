@@ -50,15 +50,11 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from configs.canonical import CANONICAL_PRESETS, resolve_preset  # noqa: E402
 from data.tokenized import StreamingTokenizedDataset  # noqa: E402
 from model import ModelConfig, TalosGPT  # noqa: E402
 from model.utils import set_seed  # noqa: E402
-from scripts.train_oasst1 import (  # noqa: E402
-    CHECKPOINT_FORMAT,
-    EXPECTED_TINY_PARAMS,
-    EXPECTED_TINY_VOCAB,
-    load_checkpoint,
-)
+from scripts.train_oasst1 import CHECKPOINT_FORMAT, load_checkpoint  # noqa: E402
 from tokenizer.tokenizer import ByteLevelBPETokenizer  # noqa: E402
 
 EVAL_METRICS_FORMAT = "talos-oasst1-eval-metrics-v1"
@@ -182,13 +178,18 @@ def load_checkpoint_artifacts(
             f"checkpoint n_params mismatch: artifact records {recorded:,} "
             f"but rebuilding the checkpoint's model_config yields {actual:,} "
             f"params in {checkpoint_path} — the artifact is corrupt or the "
-            f"tiny preset drifted"
+            f"preset drifted"
         )
-    if actual != EXPECTED_TINY_PARAMS:
+    # Enforce the *per-preset* canonical count: the checkpoint's rebuilt config
+    # must correspond to a registered canonical preset and match that preset's
+    # exact parameter count (and vocab). This covers both ``tiny`` (254,272)
+    # and ``tiny_1m`` (1,000,320) with the same code path.
+    preset = resolve_preset(cfg)
+    expected, expected_vocab = CANONICAL_PRESETS[preset]
+    if actual != expected:
         raise ValueError(
-            f"checkpoint is not the canonical tiny prototype: {actual:,} "
-            f"params, expected exactly {EXPECTED_TINY_PARAMS:,} "
-            f"(vocab {EXPECTED_TINY_VOCAB})"
+            f"checkpoint is not the canonical {preset} prototype: {actual:,} "
+            f"params, expected exactly {expected:,} (vocab {expected_vocab})"
         )
     recorded_vocab = ckpt.get("vocab_size")
     if recorded_vocab is not None and int(recorded_vocab) != cfg.vocab_size:
