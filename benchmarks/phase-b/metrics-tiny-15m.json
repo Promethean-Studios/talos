@@ -1,0 +1,164 @@
+{
+  "format": "talos-oasst1-training-metrics-v1",
+  "params": 254272,
+  "vocab_size": 1024,
+  "tokenizer_vocab_size": 1024,
+  "tokenizer_merges": 764,
+  "train_docs": 1800,
+  "val_docs": 200,
+  "split_seed": 0,
+  "epochs": [
+    {
+      "epoch": 1,
+      "steps": 480,
+      "global_step": 480,
+      "train_loss": 3.0168983275691668,
+      "val_loss": 2.854439622325167,
+      "checkpoint": "/tmp/phaseb-15m/run_tiny/step-480.pt",
+      "wall_s": 20.202599565003766
+    },
+    {
+      "epoch": 2,
+      "steps": 480,
+      "global_step": 960,
+      "train_loss": 2.604004539300998,
+      "val_loss": 2.7782304931792594,
+      "checkpoint": "/tmp/phaseb-15m/run_tiny/step-960.pt",
+      "wall_s": 19.95016059399495
+    },
+    {
+      "epoch": 3,
+      "steps": 480,
+      "global_step": 1440,
+      "train_loss": 2.4360948455830416,
+      "val_loss": 2.621775632182126,
+      "checkpoint": "/tmp/phaseb-15m/run_tiny/step-1440.pt",
+      "wall_s": 19.720411968999542
+    },
+    {
+      "epoch": 4,
+      "steps": 480,
+      "global_step": 1920,
+      "train_loss": 2.3244514010846613,
+      "val_loss": 2.4632018297363434,
+      "checkpoint": "/tmp/phaseb-15m/run_tiny/step-1920.pt",
+      "wall_s": 19.895645951000915
+    },
+    {
+      "epoch": 5,
+      "steps": 480,
+      "global_step": 2400,
+      "train_loss": 2.2410953526695567,
+      "val_loss": 2.328145582506006,
+      "checkpoint": "/tmp/phaseb-15m/run_tiny/step-2400.pt",
+      "wall_s": 19.81288889500138
+    },
+    {
+      "epoch": 6,
+      "steps": 480,
+      "global_step": 2880,
+      "train_loss": 2.166235862672329,
+      "val_loss": 2.2360386069304026,
+      "checkpoint": "/tmp/phaseb-15m/run_tiny/step-2880.pt",
+      "wall_s": 20.103046476004238
+    },
+    {
+      "epoch": 7,
+      "steps": 480,
+      "global_step": 3360,
+      "train_loss": 2.099252756188313,
+      "val_loss": 2.1692059680453126,
+      "checkpoint": "/tmp/phaseb-15m/run_tiny/step-3360.pt",
+      "wall_s": 20.09139079000306
+    },
+    {
+      "epoch": 8,
+      "steps": 480,
+      "global_step": 3840,
+      "train_loss": 2.0425039663910867,
+      "val_loss": 2.127778108788546,
+      "checkpoint": "/tmp/phaseb-15m/run_tiny/step-3840.pt",
+      "wall_s": 19.90496081600577
+    },
+    {
+      "epoch": 9,
+      "steps": 480,
+      "global_step": 4320,
+      "train_loss": 1.9938753644625347,
+      "val_loss": 2.07085973156081,
+      "checkpoint": "/tmp/phaseb-15m/run_tiny/step-4320.pt",
+      "wall_s": 20.13326846700511
+    },
+    {
+      "epoch": 10,
+      "steps": 480,
+      "global_step": 4800,
+      "train_loss": 1.9519562197228273,
+      "val_loss": 2.03555146118506,
+      "checkpoint": "/tmp/phaseb-15m/run_tiny/step-4800.pt",
+      "wall_s": 20.117473826001515
+    },
+    {
+      "epoch": 11,
+      "steps": 480,
+      "global_step": 5280,
+      "train_loss": 1.9140761241316795,
+      "val_loss": 2.00882348856969,
+      "checkpoint": "/tmp/phaseb-15m/run_tiny/step-5280.pt",
+      "wall_s": 20.209933325997554
+    },
+    {
+      "epoch": 12,
+      "steps": 480,
+      "global_step": 5760,
+      "train_loss": 1.8814150179425875,
+      "val_loss": 1.9949959981415526,
+      "checkpoint": "/tmp/phaseb-15m/run_tiny/step-5760.pt",
+      "wall_s": 20.44220266499906
+    },
+    {
+      "epoch": 13,
+      "steps": 480,
+      "global_step": 6240,
+      "train_loss": 1.8535099071760972,
+      "val_loss": 1.9656103058763652,
+      "checkpoint": "/tmp/phaseb-15m/run_tiny/step-6240.pt",
+      "wall_s": 20.351224878999346
+    },
+    {
+      "epoch": 14,
+      "steps": 480,
+      "global_step": 6720,
+      "train_loss": 1.827751121421655,
+      "val_loss": 1.9620485658998843,
+      "checkpoint": "/tmp/phaseb-15m/run_tiny/step-6720.pt",
+      "wall_s": 20.25720849099889
+    },
+    {
+      "epoch": 15,
+      "steps": 480,
+      "global_step": 7200,
+      "train_loss": 1.80521784350276,
+      "val_loss": 1.9484782641897904,
+      "checkpoint": "/tmp/phaseb-15m/run_tiny/step-7200.pt",
+      "wall_s": 20.118601358000888
+    },
+    {
+      "epoch": 16,
+      "steps": 480,
+      "global_step": 7680,
+      "train_loss": 1.7936611033976078,
+      "val_loss": 1.9275096343604716,
+      "checkpoint": "/tmp/phaseb-15m/run_tiny/step-7680.pt",
+      "wall_s": 19.92618960300024
+    }
+  ],
+  "final_train_loss": 1.7936611033976078,
+  "final_val_loss": 1.9275096343604716,
+  "tokens_processed": 15482880,
+  "wall_s": 427.332,
+  "peak_rss_mb": 441.5,
+  "device": "cpu",
+  "checkpoint": "/tmp/phaseb-15m/run_tiny/step-7680.pt",
+  "tokenizer_path": "/tmp/phaseb-15m/run_tiny/tokenizer.json"
+}

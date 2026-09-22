@@ -1,0 +1,20 @@
+{
+  "format": "talos-phaseb15m-probe-batch32-v1",
+  "purpose": "memory gate for the 15.5M-token A/B: tiny_1m at batch_size 32, full 480-step corpus pass, train_oasst1-equivalent loop",
+  "preset": "tiny_1m",
+  "params": 1000320,
+  "seq_len": 64,
+  "batch_size": 32,
+  "steps": 480,
+  "tokens": 967680,
+  "wall_s": 49.35,
+  "throughput_tok_per_s": 19607,
+  "mean_train_loss": 3.0015,
+  "peak_rss_mb": 504.3,
+  "val_batches_at_batch32": 51,
+  "steps_per_epoch_at_batch32": 480,
+  "gate": "peak RSS must stay well under ~1500 MiB",
+  "gate_verdict": "PASS - 504.3 MiB",
+  "device": "cpu",
+  "seed": 0
+}
