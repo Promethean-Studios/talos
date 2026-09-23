@@ -214,7 +214,8 @@ def check_preset_compat(preset: str, cfg, n_params: int) -> None:
     :data:`configs.canonical.CANONICAL_PRESETS`). Any drift in
     ``configs/presets`` is caught here *before* training starts. ``tiny`` is
     enforced at exactly 254,272 params / vocab 1024; ``tiny_1m`` at exactly
-    1,000,320 params / vocab 1024.
+    1,000,320 params / vocab 1024; ``tiny_10m`` at exactly 9,952,320 params /
+    vocab 1024.
     """
     expected, expected_vocab = CANONICAL_PRESETS[preset]
     problems: List[str] = []

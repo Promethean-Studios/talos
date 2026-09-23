@@ -6,11 +6,13 @@ the training guard and the test suite) resolve the expected count from a
 rebuilt :class:`~model.config.ModelConfig`'s shape, so *every* canonical preset
 is enforced against its exact count by the **same** code path.
 
-Today that is two presets:
+Today that is three presets:
 
-* ``tiny``    -> exactly  254,272 params (vocab 1024)  — the original prototype;
-* ``tiny_1m`` -> exactly 1,000,320 params (vocab 1024) — the ~1M scaling step
-  (same architecture, scaled up; see docs/SCALING.md §3.1).
+* ``tiny``     -> exactly   254,272 params (vocab 1024) — the original prototype;
+* ``tiny_1m``  -> exactly 1,000,320 params (vocab 1024) — the ~1M scaling step
+  (same architecture, scaled up; see docs/SCALING.md §3.1);
+* ``tiny_10m`` -> exactly 9,952,320 params (vocab 1024) — the ~10M scaling step
+  (same architecture, scaled up in width; see docs/SCALING.md §3).
 
 The registry deliberately does **not** include the ``small``/``medium``/``large``
 and MoE configs: those are design artifacts with *estimated* counts
@@ -29,6 +31,7 @@ from model.config import ModelConfig
 CANONICAL_PRESETS: dict[str, Tuple[int, int]] = {
     "tiny": (254_272, 1024),
     "tiny_1m": (1_000_320, 1024),
+    "tiny_10m": (9_952_320, 1024),
 }
 
 

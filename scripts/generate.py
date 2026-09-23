@@ -13,8 +13,9 @@ The generation-time consistency guarantee (any mismatch fails loudly with a
 * the artifact format is ``talos-training-checkpoint-v1``;
 * the checkpoint's recorded ``model_config`` rebuilds a model whose parameter
   count equals the recorded ``n_params`` (and, for the canonical presets, the
-  per-preset canonical count — 254,272 for ``tiny``, 1,000,320 for ``tiny_1m``
-  — enforced by the registry in ``configs/canonical.py``);
+  per-preset canonical count — 254,272 for ``tiny``, 1,000,320 for ``tiny_1m``,
+  9,952,320 for ``tiny_10m`` — enforced by the registry in
+  ``configs/canonical.py``);
 * the recorded ``vocab_size`` equals the rebuilt config's ``vocab_size``;
 * the sidecar ``tokenizer.json`` exists and ``tokenizer_vocab_size <=
   model_vocab_size`` — the ``tokenizer/model_compat.py`` contract, so every

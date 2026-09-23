@@ -243,18 +243,71 @@ vocab-1024 tokenizer (`tiny_tokenizer_config`) is used verbatim with no
 retraining, and the `tokenizer_vocab ≤ model_vocab` contract is untouched.
 
 ### ~10M parameters (estimated hardware)
-
-- **Rough config:** dense, vocab ~4096, hidden ~512, 8 layers (small-cluster
-  fit, per `configs/presets.py` design).
+- **Rough config** (now precisely defined as the `tiny_10m` preset — see
+  "Config: `tiny_10m`" below): dense, the `tiny_1m` architecture *widened* on
+  the same code path (`configs/`), keeping `vocab_size=1024` and
+  `max_seq_len=512` unchanged.
 - **Honest estimate:** comfortably fits one mid-range GPU (8–16 GiB) or a
-  many-core CPU; expect multi-GiB RSS and training times on the order of tens
-  of minutes to a few hours for a 400-doc synthetic corpus. A larger corpus
-  (real OASST1 subset, no network pulls at build time) would make this the
-  first *meaningful* quality datapoint — still a toy by LLM standards.
-- **Purpose:** first scale where tokenizer richness (vocab > 1024) and
-  context length (seq 256–512) become non-trivial; first checkpoint large
-  enough that quantization (already shown viable at tiny scale) matters for
-  storage.
+  many-core CPU. fp32 weights are ~40 MiB and AdamW optimizer state ~80 MiB,
+  so main memory is dominated by activations (vanishingly small at
+  batch 32 × seq 64; a few GiB at batch 32 × seq 512 on a T4). Training times
+  on the order of tens of minutes to a few hours for a 2,000-doc OASST1
+  subset on a T4 — the first *meaningful* quality datapoint beyond 1M params.
+- **Purpose:** the next point on the scaling ladder — re-check whether the
+  1M-vs-254K advantage persists at ~10× parameters on the same corpus and
+  step shape, before any MoE-shaped work.
+
+#### Config: `tiny_10m` (implemented; validation complete, training pending)
+The ~10M scaling step is **defined, registered as a canonical preset, and
+validated end-to-end** (construction, forward/backward, checkpoint round-trip,
+generation, full test suite); a real OASST1 training run is the pending next
+experiment. This block documents the config; measured numbers will live in the
+§2 progression table once the run completes.
+
+**Architecture — `tiny_1m` widened, no redesign.** `tiny_10m`
+(`configs/presets.py`, canonical registry `configs/canonical.py`) keeps every
+architectural ratio of the 254K `tiny` / 1M `tiny_1m` presets and changes only
+the width numbers:
+| knob | `tiny_1m` (~1M) | `tiny_10m` (~10M) | rationale |
+|---|---:|---:|---|
+| `hidden_size` | 128 | 448 | 3.5× width |
+| `num_layers` | 3 | 3 | unchanged (pure width scaling) |
+| `num_attention_heads` | 8 | 28 | scaled with hidden (2:1 GQA kept) |
+| `num_kv_heads` | 4 | 14 | 2:1 GQA ratio unchanged |
+| `head_dim` | 16 | 16 | unchanged |
+| `intermediate_size` | 512 | 1792 | FFN stays at exactly 4× hidden |
+| `ffn_type` | dense | dense | unchanged |
+| `vocab_size` | 1024 | 1024 | unchanged (tokenizer contract intact) |
+| `max_seq_len` | 512 | 512 | unchanged |
+| `attention_type` / RoPE | full / theta 1e4 | full / theta 1e4 | unchanged |
+| `tie_word_embeddings` | False | False | un-tied, unchanged |
+| biases | none | none | unchanged |
+**Exact parameter count: 9,952,320** (verified programmatically —
+`TalosGPT(tiny_10m_config().derive()).num_parameters() == 9_952_320`, asserted
+by `tests/test_tiny_10m.py` and enforced by the canonical registry
+`configs/canonical.py`).
+**Parameter arithmetic** (dense, un-tied embeddings, no biases — the same
+formula as `ModelConfig.param_count_breakdown`):
+- embedding = `V · H = 1024 · 448 = 458,752`
+- lm_head (un-tied) = `V · H = 458,752`
+- per-layer attention = `H·(Hq·d) + H·(Hkv·d) + H·(Hkv·d) + (Hq·d)·H`
+  = `448·448 + 448·224 + 448·224 + 448·448` = `200,704 + 100,352 + 100,352 + 200,704`
+  = **602,112**
+- per-layer norms = `2 · H = 896`
+- per-layer FFN = `3 · H · I = 3 · 448 · 1792` = **2,408,448**
+- per layer total = `602,112 + 896 + 2,408,448` = `3,011,456`; × 3 layers = `9,034,368`
+- final norm = `H = 448`
+- **total = `458,752 + 458,752 + 9,034,368 + 448` = 9,952,320**
+**Design notes vs the ~1M comparison.** Total parameters scale ~9.95×
+(9,952,320 / 1,000,320 ≈ 9.95), landing in the 9–11M target (the ~10M analog
+of the 0.9–1.1M band used for `tiny_1m`). Width was chosen over depth: keeping
+the same 3 layers as `tiny_1m` and widening `hidden 128→448` (with heads
+8→28, FFN 512→1792 — every ratio preserved) makes the ~10× parameter jump
+attributable purely to width, the cleanest apples-to-apples scaling
+comparison, mirroring how `tiny_1m` scaled from `tiny` (hidden 64→128,
+layers 2→3). `vocab_size` and `max_seq_len` are unchanged, so the existing
+vocab-1024 tokenizer (`tiny_tokenizer_config`) is used verbatim with no
+retraining, and the `tokenizer_vocab ≤ model_vocab` contract is untouched.
 
 ### ~100M parameters (estimated hardware)
 
@@ -273,8 +326,10 @@ retraining, and the `tokenizer_vocab ≤ model_vocab` contract is untouched.
 > `small` (35.7M), `medium` (285M), `large` (1.64B) and the `100b`/`400b` MoE
 > configs. These are **design artifacts only** — parameter/FLOP estimates via
 > `configs.compute`, none have been trained. The progression grid above uses
-> dedicated dense configs sized to 254K → 1M → 10M → 100M; adding those configs
-> is part of the follow-up work, not evidence of a trained model.
+> dedicated dense configs sized to 254K → 1M → 10M → 100M; the 254K/1M/10M
+> rows have canonical presets (`tiny`/`tiny_1m`/`tiny_10m`), and the ~100M
+> config is the remaining follow-up work — a registered preset is not evidence
+> of a trained model.
 
 ## 4. Reproducing the 254K row (exact commands, CPU-only)
 
