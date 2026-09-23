@@ -98,6 +98,54 @@ def tiny_1m_tokenizer_config() -> TokenizerConfig:
     return tiny_tokenizer_config()
 
 
+def tiny_10m_config() -> ModelConfig:
+    """The ~10M scaling step: ``tiny_1m`` widened on the exact same architecture.
+
+    Same architectural ratios as ``tiny``/``tiny_1m`` — 2:1 GQA (28/14 heads),
+    head_dim 16, dense FFN at 4× hidden (1792/448), full attention, un-tied
+    embeddings, no biases — scaled **purely in width**: same 3 layers as
+    ``tiny_1m``, hidden 128→448 (3.5×). ``vocab_size`` and ``max_seq_len`` are
+    **unchanged** (1024 / 512) so the existing vocab-1024 tokenizer
+    (``tiny_tokenizer_config``) is used unchanged and the tokenizer↔model
+    compat contract is untouched. The exact parameter count, verified
+    programmatically, is **9,952,320** (see docs/SCALING.md §3 for the full
+    arithmetic).
+
+    Design note: width was chosen over depth so the ~10× parameter jump from
+    ``tiny_1m`` (9,952,320 / 1,000,320 ≈ 9.95) is attributable purely to
+    ``hidden 128→448`` (and the head/FFN counts that scale with it) — the
+    cleanest apples-to-apples comparison, mirroring how ``tiny_1m`` scaled
+    from ``tiny``. Keeping every ratio (2:1 GQA, head_dim 16, FFN 4× hidden)
+    means the same code path builds all three presets and only the numbers
+    change.
+    """
+    return ModelConfig(
+        vocab_size=1024,
+        hidden_size=448,
+        num_layers=3,
+        num_attention_heads=28,
+        num_kv_heads=14,
+        head_dim=16,
+        ffn_type="dense",
+        intermediate_size=1792,
+        max_seq_len=512,
+        attention_type="full",
+        rope_theta=10000.0,
+        layer_norm_eps=1e-5,
+    )
+
+
+def tiny_10m_tokenizer_config() -> TokenizerConfig:
+    """Tokenizer for ``tiny_10m``: identical to ``tiny``'s.
+
+    ``tiny_10m`` keeps ``vocab_size=1024`` unchanged (see
+    :func:`tiny_10m_config`), so the existing vocab-1024 tokenizer contract is
+    reused verbatim — no new tokenizer, no retrained merges, same byte-level
+    BPE budget (256 base bytes + 4 specials + up to 764 merges).
+    """
+    return tiny_tokenizer_config()
+
+
 def small_config() -> ModelConfig:
     """Small research model (single-GPU / small-cluster fit)."""
     return ModelConfig(
@@ -225,6 +273,7 @@ def scale_400b_config() -> ModelConfig:
 ALL_PRESETS = {
     "tiny": tiny_config,
     "tiny_1m": tiny_1m_config,
+    "tiny_10m": tiny_10m_config,
     "small": small_config,
     "medium": medium_config,
     "large": large_config,
