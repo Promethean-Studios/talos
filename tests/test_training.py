@@ -491,3 +491,222 @@ def test_generate_rejects_tokenizer_vocab_overflow(tmp_path) -> None:
         generate_from_checkpoint(tampered, PROMPT, max_new_tokens=8)
     msg = str(exc.value)
     assert "tokenizer vocab" in msg and "1024" in msg
+
+
+# ---------------------------------------------------------------------------
+# Tokenizer identity fingerprint (audit P0 fix 4): sha256 of the serialized
+# tokenizer.json recorded in the checkpoint AND metrics.json, validated on
+# every load (eval harness + generate CLI) so a same-size, different-content
+# tokenizer — the audit's silent-swap hole — fails loudly with both hashes.
+# ---------------------------------------------------------------------------
+def test_checkpoint_and_metrics_record_tokenizer_fingerprint(tmp_path) -> None:
+    """The fingerprint is written to the checkpoint and metrics.json and both
+    match the sha256 of the actual sidecar tokenizer.json."""
+    from scripts.train_oasst1 import train_run
+    from tokenizer.tokenizer import tokenizer_file_sha256
+
+    out_dir = str(tmp_path / "run")
+    args, _ = _train_run_args(tmp_path, out_dir=out_dir, epochs=1,
+                              n_docs=20, steps_per_epoch=3)
+    metrics = train_run(args)
+    tok_path = os.path.join(out_dir, "tokenizer.json")
+    expected_fp = tokenizer_file_sha256(tok_path)
+    assert metrics["tokenizer_sha256"] == expected_fp
+
+    ckpt = load_checkpoint(os.path.join(out_dir, "step-3.pt"))
+    assert ckpt["tokenizer_fingerprint"] == expected_fp
+    # Resume-enabling state is present (audit P0 fix 3).
+    assert "optimizer_state_dict" in ckpt and ckpt["optimizer_state_dict"] is not None
+    assert "rng_state" in ckpt and set(("torch", "numpy", "python")) <= set(ckpt["rng_state"])
+    assert ckpt["epoch"] == 1 and ckpt["step"] == 3
+
+    with open(os.path.join(out_dir, "metrics.json"), "r", encoding="utf-8") as fh:
+        saved = json.load(fh)
+    assert saved["tokenizer_sha256"] == expected_fp
+
+
+def test_generate_rejects_swapped_same_size_tokenizer(tmp_path) -> None:
+    """A same-size, different-content sidecar tokenizer is rejected on load
+    with both hashes printed (audit: a 512-vocab tokenizer next to a 1024
+    model used to load silently — the exact hole this closes)."""
+    from tokenizer.tokenizer import tokenizer_file_sha256
+
+    row, _, _ = _short_trained_run(tmp_path, steps=3)
+    out_dir = os.path.dirname(row.checkpoint)
+    tok_path = os.path.join(out_dir, "tokenizer.json")
+    recorded_fp = tokenizer_file_sha256(tok_path)
+
+    with open(tok_path, "r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+    # Same size, same validity, different content: swap two *byte-only* merge
+    # pairs (both components < 256, so neither depends on merge rank order —
+    # merge tokens referencing earlier merge ids would break under reordering).
+    merges = list(payload["merges"])
+    byte_only = [
+        i for i, m in enumerate(merges)
+        if int(m[0]) < 256 and int(m[1]) < 256
+    ]
+    assert len(byte_only) >= 2, "corpus too small: need two byte-only merges"
+    i, j = byte_only[0], byte_only[1]
+    merges[i], merges[j] = merges[j], merges[i]
+    payload["merges"] = merges
+    swapped = os.path.join(out_dir, "tokenizer-swapped.json")
+    with open(swapped, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh)
+    swapped_tok = ByteLevelBPETokenizer.from_file(swapped)
+    assert swapped_tok.vocab_size == ByteLevelBPETokenizer.from_file(tok_path).vocab_size
+    actual_fp = tokenizer_file_sha256(swapped)
+    assert actual_fp != recorded_fp
+
+    ckpt = load_checkpoint(row.checkpoint)
+    ckpt["tokenizer_path"] = swapped
+    tampered = str(tmp_path / "swapped-tokenizer.pt")
+    torch.save(ckpt, tampered)
+
+    # generate CLI path: rejected by the shared loader, both hashes printed.
+    with pytest.raises(ValueError) as exc:
+        generate_from_checkpoint(tampered, PROMPT, max_new_tokens=8)
+    msg = str(exc.value)
+    assert "tokenizer identity mismatch" in msg
+    assert recorded_fp in msg and actual_fp in msg  # both hashes in the error
+
+    # eval harness path: same loader, same rejection.
+    val_path = os.path.join(out_dir, "data", "val.jsonl")
+    with pytest.raises(ValueError) as exc:
+        run_eval(tampered, data=val_path, seq_len=32, batch_size=2, seed=0)
+    assert "tokenizer identity mismatch" in str(exc.value)
+
+
+def test_checkpoint_without_fingerprint_still_loads(tmp_path) -> None:
+    """Backward compatibility: pre-fingerprint checkpoints (no recorded hash)
+    still load and generate — the fingerprint check is opt-in per artifact."""
+    row, _, _ = _short_trained_run(tmp_path, steps=3)
+    ckpt = load_checkpoint(row.checkpoint)
+    ckpt.pop("tokenizer_fingerprint")
+    legacy = str(tmp_path / "legacy.pt")
+    torch.save(ckpt, legacy)
+    result = generate_from_checkpoint(legacy, PROMPT, max_new_tokens=8)
+    assert len(result.token_ids) == 8
+
+
+# ---------------------------------------------------------------------------
+# Resume-from-checkpoint (audit P0 fix 3): optimizer + RNG + step/epoch
+# counters persisted, and a resumed run is BIT-EXACT to an uninterrupted one.
+# ---------------------------------------------------------------------------
+def _train_run_args(tmp_path, *, out_dir, epochs, n_docs=100, steps_per_epoch=30):
+    """Build the Namespace for train_run (fresh or resumed) on a 100-doc corpus."""
+    src = tmp_path / "src.jsonl"
+    _write_synthetic_jsonl(str(src), n_docs=n_docs, seed=0)
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        data=str(src), out_dir=out_dir, seed=0, preset="tiny",
+        resume=None, split_ratio=0.9, split_max_docs=None,
+        bpe_num_merges=None, bpe_minfreq=2, bpe_max_docs=None, bpe_max_chars=None,
+        epochs=epochs, seq=32, batch=2, lr=3e-3, max_steps_per_epoch=steps_per_epoch,
+        val_max_steps=3, device="cpu",
+    ), src
+
+
+def test_resume_bit_exact_matches_uninterrupted(tmp_path) -> None:
+    """A 30-step run resumed at step 30 is BIT-IDENTICAL to a 60-step run that
+    never stopped: same weights, same train/val loss at every checkpoint.
+
+    Two full ``train_run`` flows (split -> tokenizer -> train -> checkpoint)
+    in separate directories: A runs 2 epochs x 30 steps uninterrupted; B runs
+    1 epoch (30 steps), then resumes with --resume to reach the same 2 epochs.
+    """
+    from scripts.train_oasst1 import train_run
+    from tokenizer.tokenizer import tokenizer_file_sha256
+
+    out_a = str(tmp_path / "run_a")
+    out_b = str(tmp_path / "run_b")
+
+    # --- run A: uninterrupted 60-step run -----------------------------------
+    args_a, _ = _train_run_args(tmp_path, out_dir=out_a, epochs=2)
+    metrics_a = train_run(args_a)
+    ckpt_a = load_checkpoint(os.path.join(out_a, "step-60.pt"))
+    assert ckpt_a["epoch"] == 2 and ckpt_a["step"] == 60
+
+    # --- run B: 30 steps, checkpoint, then resume to 60 ----------------------
+    args_b1, _ = _train_run_args(tmp_path, out_dir=out_b, epochs=1)
+    metrics_b1 = train_run(args_b1)
+    step30 = os.path.join(out_b, "step-30.pt")
+    assert os.path.isfile(step30)
+    ckpt30 = load_checkpoint(step30)
+    assert ckpt30["epoch"] == 1 and ckpt30["step"] == 30
+    # Same corpus + seed => same tokenizer in both runs (BPE determinism);
+    # the resume checkpoint's recorded fingerprint must match the metrics'
+    # recorded hash and run A's.
+    assert ckpt30["tokenizer_fingerprint"] == metrics_b1["tokenizer_sha256"]
+    assert metrics_a["tokenizer_sha256"] == metrics_b1["tokenizer_sha256"]
+
+    args_b2, _ = _train_run_args(tmp_path, out_dir=out_b, epochs=2)
+    args_b2.resume = step30
+    metrics_b2 = train_run(args_b2)
+    ckpt_b = load_checkpoint(os.path.join(out_b, "step-60.pt"))
+    assert ckpt_b["epoch"] == 2 and ckpt_b["step"] == 60
+    assert metrics_b2["resumed_from"] == os.path.abspath(step30)
+
+    # --- bit-exactness: every tensor in the final state dict is identical ----
+    sa, sb = ckpt_a["model_state_dict"], ckpt_b["model_state_dict"]
+    assert set(sa) == set(sb)
+    for key in sa:
+        assert torch.equal(sa[key], sb[key]), (
+            f"model weight {key} diverged between uninterrupted and resumed runs"
+        )
+    # Optimizer state is identical too (m/v moments + step counters).
+    oa, ob = ckpt_a["optimizer_state_dict"], ckpt_b["optimizer_state_dict"]
+    for group_a, group_b in zip(oa["param_groups"], ob["param_groups"]):
+        assert group_a == group_b
+    for idx in oa["state"]:
+        for k in oa["state"][idx]:
+            va, vb = oa["state"][idx][k], ob["state"][idx][k]
+            if isinstance(va, torch.Tensor):
+                assert torch.equal(va, vb), f"optimizer state {idx}.{k} diverged"
+            else:
+                assert va == vb, f"optimizer state {idx}.{k} diverged ({va} vs {vb})"
+    # Losses: the resumed epoch-2 row equals the uninterrupted epoch-2 row.
+    # (Run A recorded epochs 1+2; the resumed session only records epoch 2.)
+    row_a2 = metrics_a["epochs"][1]
+    row_b2 = metrics_b2["epochs"][0]
+    assert row_a2["epoch"] == row_b2["epoch"] == 2
+    assert row_a2["train_loss"] == row_b2["train_loss"]
+    assert row_a2["val_loss"] == row_b2["val_loss"]
+    assert row_b2["global_step"] == 60
+    # RNG states stored are the exact ones each run had at its final checkpoint.
+    assert set(("torch", "numpy", "python")) <= set(ckpt_a["rng_state"])
+    assert set(("torch", "numpy", "python")) <= set(ckpt_b["rng_state"])
+
+
+def test_resume_rejects_checkpoint_without_optimizer_state(tmp_path) -> None:
+    """An old v1 checkpoint (no optimizer/RNG state) cannot be resumed: clear
+    error, not a silent fresh-restart."""
+    from scripts.train_oasst1 import train_epochs, save_checkpoint
+    from scripts.train_oasst1 import split_jsonl, build_tiny_model
+    from data.tokenized import StreamingTokenizedDataset
+
+    src = tmp_path / "src.jsonl"
+    _write_synthetic_jsonl(str(src), n_docs=50, seed=0)
+    split = split_jsonl(str(src), str(tmp_path / "data"), ratio=0.9, seed=0)
+    tok_path = str(tmp_path / "tokenizer.json")
+    train_tokenizer_for_run(split.train_path, tok_path)
+    tokenizer = ByteLevelBPETokenizer.from_file(tok_path)
+    model = build_tiny_model()
+    train_ds = StreamingTokenizedDataset(
+        split.train_path, tokenizer, seq_len=32, batch_size=2, mode="pack", eos=True,
+    )
+    legacy_path = str(tmp_path / "legacy.pt")
+    save_checkpoint(  # no optimizer/rng/epoch keys (old v1 format)
+        legacy_path, model, 30, 3.0, None, tok_path,
+    )
+    legacy = load_checkpoint(legacy_path)
+    legacy.pop("optimizer_state_dict")
+    with pytest.raises(ValueError) as exc:
+        train_epochs(
+            model, train_ds, None, out_dir=str(tmp_path),
+            tokenizer_path=tok_path, lr=3e-3, epochs=2,
+            device=torch.device("cpu"), seed=0,
+            max_steps_per_epoch=5, resume_from=legacy,
+        )
+    assert "optimizer_state_dict" in str(exc.value)

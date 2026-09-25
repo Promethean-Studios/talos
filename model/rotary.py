@@ -138,6 +138,11 @@ def _yarn_linear_ramp_mask(low: int, high: int, dim: int) -> torch.Tensor:
     return torch.clamp(ramp, 0.0, 1.0)
 
 
+def _positions_exceed(positions: torch.Tensor, n: int) -> bool:
+    """Whether any absolute position in ``positions`` is ``>= n`` (cheap max)."""
+    return positions.numel() > 0 and int(positions.max()) >= n
+
+
 def apply_rotary_pos_emb(
     x: torch.Tensor,
     cos: torch.Tensor,
@@ -152,6 +157,13 @@ def apply_rotary_pos_emb(
     ``(u', v') = (u*cos - v*sin, v*cos + u*sin)`` — an orthonormal rotation.
     """
     if positions is not None:
+        if _positions_exceed(positions, cos.shape[0]):
+            raise ValueError(
+                f"position {int(positions.max())} exceeds the RoPE table length "
+                f"{cos.shape[0]} (max_seq_len) — sequences must not decode past "
+                f"max_seq_len; truncate the prompt or reset the KV cache before "
+                f"continuing"
+            )
         cos = cos.index_select(0, positions)
         sin = sin.index_select(0, positions)
     num_pairs = cos.shape[-1]
@@ -186,12 +198,25 @@ class RotaryEmbedding(nn.Module):
     def forward(
         self, x: torch.Tensor, positions: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return the cos/sin needed for ``x``'s sequence length."""
+        """Return the cos/sin needed for ``x``'s sequence length.
+
+        Raises a named ``ValueError`` (instead of a bare ``IndexError`` from
+        ``index_select``) when ``positions`` runs past ``max_seq_len`` — the
+        failure mode the library generation path hit before its context-length
+        guard existed (see ``inference.generate.generate``).
+        """
         if positions is None:
             seq_len = x.shape[-2]
             return (
                 self.cos_cached[:seq_len].to(x.dtype),
                 self.sin_cached[:seq_len].to(x.dtype),
+            )
+        if _positions_exceed(positions, self.max_seq_len):
+            raise ValueError(
+                f"position {int(positions.max())} exceeds max_seq_len "
+                f"{self.max_seq_len} in the RoPE cache — sequences must not "
+                f"decode past max_seq_len; truncate the prompt or reset the "
+                f"KV cache before continuing"
             )
         return (
             self.cos_cached.index_select(0, positions).to(x.dtype),

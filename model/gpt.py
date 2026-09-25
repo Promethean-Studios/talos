@@ -18,6 +18,7 @@ from model.block import DecoderLayer
 from model.cache import KVCache
 from model.config import ModelConfig
 from model.rms_norm import RMSNorm
+from model.utils import validate_token_ids
 
 
 class TalosGPT(nn.Module):
@@ -84,9 +85,26 @@ class TalosGPT(nn.Module):
         Returns:
             ``(logits, cache)`` — logits ``(batch, seq, vocab)`` and the
             (possibly newly created) KV cache.
+
+        Raises:
+            ValueError: when ``seq > max_seq_len``, or when any token id is
+                outside ``[0, vocab_size)`` — the embedding-seam bounds guard
+                (see :func:`model.utils.validate_token_ids`) fires *before*
+                the embedding lookup so a drifted id can never surface as a raw
+                ``IndexError`` on CPU or an uncatchable CUDA device-side
+                assert on GPU.
         """
         batch, seq = input_ids.shape
         self._validate_seq(seq)
+        # Embedding-seam token-id bounds guard: cheap (min/max), always-on, and
+        # running BEFORE the embedding/CE index ops so an out-of-range id can
+        # never poison a CUDA context. This is the defense-in-depth for a
+        # swapped tokenizer / config drift reaching the model hot path; the
+        # data pipeline validates ids at the source as well (see
+        # data.tokenized.validate_id_array and the training loops).
+        validate_token_ids(
+            input_ids, self.config.vocab_size, where="model input_ids"
+        )
 
         if position_ids is None:
             if cache is not None and use_cache:

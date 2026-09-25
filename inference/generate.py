@@ -91,6 +91,18 @@ def generate(
     Prefills ``prompt`` once, then decodes incrementally. The first generated
     token is the argmax of the prefill's final position.
 
+    Sequence-length policy (mirrors the CLI in ``scripts/generate.py``): the
+    model's ``max_seq_len`` bounds absolute positions, so ``prompt_len +
+    max_new_tokens`` must fit. When a prompt is too long, it is truncated
+    **on the left** — the most recent ``max_seq_len - max_new_tokens`` tokens
+    are kept, since a causal LM's nearest context is what conditions the
+    continuation. ``max_new_tokens >= max_seq_len`` is a clear ``ValueError``
+    (there must be room for a non-empty prompt). With the truncation in place
+    the decode loop can never drive the RoPE position table (or the KV cache)
+    past ``max_seq_len``; callers that bypass ``generate()`` (e.g. a raw
+    ``decode_step`` loop) are protected by the named position check in
+    ``model/rotary.py``.
+
     Args:
         model: A ``TalosGPT`` in eval mode.
         prompt: ``(1, prompt_len)`` token ids (batch 1).
@@ -104,6 +116,18 @@ def generate(
     """
     if prompt.shape[0] != 1:
         raise ValueError("generate() supports batch size 1 (got batch %d)" % prompt.shape[0])
+    max_seq_len = model.config.max_seq_len
+    if max_new_tokens < 1:
+        raise ValueError(f"max_new_tokens must be >= 1, got {max_new_tokens}")
+    if max_new_tokens >= max_seq_len:
+        raise ValueError(
+            f"max_new_tokens={max_new_tokens} leaves no room for a prompt "
+            f"within max_seq_len={max_seq_len} (need max_new_tokens < max_seq_len)"
+        )
+    prompt_len = prompt.shape[1]
+    if prompt_len + max_new_tokens > max_seq_len:
+        keep = max_seq_len - max_new_tokens
+        prompt = prompt[:, -keep:]  # left-truncate: keep the most recent tokens
     with torch.no_grad():
         logits, cache = prefill(model, prompt)
         tok = logits[:, -1:, :]  # (1, 1, vocab): last position's distribution

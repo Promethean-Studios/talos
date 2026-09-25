@@ -53,6 +53,7 @@ __all__ = [
     "iter_documents",
     "iter_token_arrays",
     "resolve_shard_paths",
+    "validate_id_array",
 ]
 
 
@@ -140,6 +141,82 @@ def iter_documents(
                     return
 
 
+def validate_id_array(arr: np.ndarray, vocab_size: int, *, where: str) -> None:
+    """Range-check a token-id array against ``[0, vocab_size)`` — fail at source.
+
+    Runs on the numpy arrays the moment each document is encoded (and on any
+    final padded tail / batch row), so a drifted tokenizer — one that emits an
+    id the model cannot embed, or even an id beyond its *own* vocab — fails
+    here with source context (document index, shard path) instead of deep in
+    the model as a raw ``IndexError`` (CPU) or an uncatchable CUDA
+    device-side assert (GPU, the T4 poison-pill failure mode).
+
+    Args:
+        arr: ``(n,)`` int32 token ids.
+        vocab_size: upper bound — every id must be in ``[0, vocab_size)``.
+        where: context label for the error (e.g. ``"encode of doc 3 from
+            shard.jsonl"``).
+
+    Raises:
+        ValueError: naming the first offending id, the vocab bound, and the
+            min/max over the whole array.
+    """
+    if arr.size == 0:
+        return
+    lo = int(arr.min())
+    hi = int(arr.max())
+    if lo < 0 or hi >= vocab_size:
+        bad = arr[(arr < 0) | (arr >= vocab_size)][0]
+        raise ValueError(
+            f"token id {int(bad)} out of range [0, {vocab_size}) in {where} "
+            f"(min={lo}, max={hi}) — the tokenizer produced an id that cannot "
+            f"be embedded; check for a swapped/corrupt tokenizer or a "
+            f"tokenizer/model vocab mismatch"
+        )
+
+
+def _iter_docs_with_source(
+    paths: Sequence[str],
+    text_field: str,
+    limit_docs: Optional[int],
+) -> Iterator[tuple[str, int, str]]:
+    """Yield ``(shard_path, doc_index_in_shard, text)`` with a total doc cap.
+
+    Same semantics as :func:`iter_documents` (stream one record at a time,
+    ``limit_docs`` caps the *total* across all shards) but also yields the
+    source shard path and the per-shard document index, so encode-path
+    validation errors can name exactly where a bad id was produced.
+    """
+    seen = 0
+    for path in paths:
+        if limit_docs is not None and seen >= limit_docs:
+            return
+        for doc_idx, text in enumerate(iter_documents([path], text_field=text_field, limit_docs=None)):
+            if limit_docs is not None and seen >= limit_docs:
+                return
+            yield path, doc_idx, text
+            seen += 1
+
+
+def _tokenizer_id_bound(tokenizer) -> int:
+    """The exclusive upper bound on ids a tokenizer can legitimately emit.
+
+    Uses the *configured* budget rather than the realized ``vocab_size``:
+    specials live at the top of the configured vocab
+    (``config.vocab_size - n_special .. config.vocab_size - 1``), so a
+    partially-trained tokenizer (fewer merges than its budget) can legitimately
+    emit special ids above its realized ``vocab_size`` — e.g. an untrained
+    vocab-1024 tokenizer has ``vocab_size() == 260`` but EOS/PAD at 1021/1022.
+    """
+    bound = int(tokenizer.vocab_size)
+    for attr in ("pad_id", "bos_id", "eos_id", "unk_id"):
+        try:
+            bound = max(bound, int(getattr(tokenizer, attr)) + 1)
+        except (AttributeError, TypeError):  # tokenizer lacks the attr
+            continue
+    return bound
+
+
 def iter_token_arrays(
     paths: Sequence[str],
     tokenizer,
@@ -152,6 +229,7 @@ def iter_token_arrays(
     drop_last: bool = True,
     text_field: str = "text",
     limit_docs: Optional[int] = None,
+    max_id: Optional[int] = None,
 ) -> Iterator[np.ndarray]:
     """Yield ``(batch, seq_len)`` ``int32`` numpy arrays of token ids.
 
@@ -174,6 +252,13 @@ def iter_token_arrays(
             with ``pad_id`` and yield a short final batch.
         text_field: JSON field holding the document text.
         limit_docs: stop after this many documents (``None`` = all).
+        max_id: optional hard upper bound on token ids (typically the model's
+            ``vocab_size``). Every encoded id — and any padded tail — must be
+            in ``[0, max_id)``; a tokenizer/model vocab mismatch then fails at
+            the data source instead of on the device. When ``None``, ids are
+            still validated against the tokenizer's configured id bound (its
+            budget incl. top-of-vocab specials), so a corrupt tokenizer
+            emitting out-of-vocab ids is caught.
     """
     if seq_len < 2:
         raise ValueError("seq_len must be >= 2")
@@ -183,23 +268,35 @@ def iter_token_arrays(
         raise ValueError("mode must be 'pack' or 'padded'")
 
     pad_id = int(tokenizer.pad_id)
+    tok_vocab = _tokenizer_id_bound(tokenizer)
+    if max_id is not None and max_id < 1:
+        raise ValueError(f"max_id must be >= 1, got {max_id}")
     if mode == "padded":
         yield from _iter_padded(
             paths, tokenizer, seq_len=seq_len, batch_size=batch_size,
             bos=bos, eos=eos, drop_last=drop_last, text_field=text_field,
-            limit_docs=limit_docs, pad_id=pad_id,
+            limit_docs=limit_docs, pad_id=pad_id, tok_vocab=tok_vocab,
+            max_id=max_id,
         )
         return
 
     carry = np.empty(0, dtype=np.int32)  # tokens not yet cut into blocks
     pending: List[np.ndarray] = []       # blocks waiting to fill a batch
-    for text in iter_documents(paths, text_field=text_field, limit_docs=limit_docs):
+    for path, doc_idx, text in _iter_docs_with_source(
+        paths, text_field=text_field, limit_docs=limit_docs
+    ):
         ids = tokenizer.encode(text, bos=bos, eos=eos)
         # Convert immediately: int32 = 4 bytes/token vs ~36 for list[int].
         arr = np.asarray(ids, dtype=np.int32)
         del ids
         if arr.size == 0:
             continue
+        # Encode-path guard: ids are produced here, so a bad id fails here
+        # with source context (shard + doc), never on the device.
+        where = f"encode of doc {doc_idx} from {path}"
+        validate_id_array(arr, tok_vocab, where=where)
+        if max_id is not None:
+            validate_id_array(arr, max_id, where=where)
         carry = np.concatenate((carry, arr))
         n_blocks = carry.size // seq_len
         if n_blocks == 0:
@@ -213,7 +310,11 @@ def iter_token_arrays(
                 pending = []
     if not drop_last and carry.size:
         pad = np.full(seq_len - carry.size, pad_id, dtype=np.int32)
-        pending.append(np.concatenate((carry, pad)))
+        tail = np.concatenate((carry, pad))
+        validate_id_array(tail, tok_vocab, where="padded tail")
+        if max_id is not None:
+            validate_id_array(tail, max_id, where="padded tail")
+        pending.append(tail)
         carry = np.empty(0, dtype=np.int32)
     if pending and not drop_last:
         yield np.stack(pending)
@@ -231,12 +332,20 @@ def _iter_padded(
     text_field: str,
     limit_docs: Optional[int],
     pad_id: int,
+    tok_vocab: int,
+    max_id: Optional[int],
 ) -> Iterator[np.ndarray]:
     pending: List[np.ndarray] = []
-    for text in iter_documents(paths, text_field=text_field, limit_docs=limit_docs):
+    for path, doc_idx, text in _iter_docs_with_source(
+        paths, text_field=text_field, limit_docs=limit_docs
+    ):
         ids = tokenizer.encode(text, bos=bos, eos=eos)
         arr = np.asarray(ids, dtype=np.int32)
         del ids
+        where = f"encode of doc {doc_idx} from {path}"
+        validate_id_array(arr, tok_vocab, where=where)
+        if max_id is not None:
+            validate_id_array(arr, max_id, where=where)
         row = np.full(seq_len, pad_id, dtype=np.int32)
         n = min(arr.size, seq_len)
         row[:n] = arr[:n]
@@ -266,6 +375,10 @@ class StreamingTokenizedDataset(_IterableDataset):
         mode: ``"pack"`` (default) or ``"padded"`` — see :func:`iter_token_arrays`.
         bos / eos / drop_last / text_field / limit_docs: forwarded.
         dtype: torch dtype of yielded batches (default ``torch.int32``).
+        max_id: optional hard upper bound on token ids (typically the model's
+            ``vocab_size``) — forwarded to :func:`iter_token_arrays`; a
+            tokenizer/model vocab mismatch then fails at the data source with
+            shard/doc context instead of on the device.
     """
 
     def __init__(
@@ -282,6 +395,7 @@ class StreamingTokenizedDataset(_IterableDataset):
         text_field: str = "text",
         limit_docs: Optional[int] = None,
         dtype: Optional["torch.dtype"] = None,
+        max_id: Optional[int] = None,
     ) -> None:
         if torch is None:  # pragma: no cover - guarded import
             raise ImportError("torch is required for StreamingTokenizedDataset")
@@ -303,6 +417,7 @@ class StreamingTokenizedDataset(_IterableDataset):
         self.text_field = text_field
         self.limit_docs = limit_docs
         self.dtype = dtype if dtype is not None else torch.int32
+        self.max_id = max_id
 
     def __iter__(self) -> Iterator["torch.Tensor"]:
         # With DataLoader workers, split shard files across workers so each
@@ -326,5 +441,6 @@ class StreamingTokenizedDataset(_IterableDataset):
             drop_last=self.drop_last,
             text_field=self.text_field,
             limit_docs=self.limit_docs,
+            max_id=self.max_id,
         ):
             yield torch.from_numpy(batch).to(self.dtype)
