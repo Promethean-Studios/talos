@@ -30,6 +30,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from configs.vocab import VOCAB_SIZE
 from tokenizer._logging import get_logger
 from tokenizer.bpe import train_bpe, Pair
 from tokenizer.corpus import iter_text_documents
@@ -358,8 +359,10 @@ def make_arg_parser() -> argparse.ArgumentParser:
                    help="corpus path (.txt/.jsonl or a directory); repeatable")
     p.add_argument("--text-field", default="text",
                    help="JSONL field holding the text (default: text)")
-    p.add_argument("--vocab-size", type=int, default=32768,
-                   help="total vocab size (bytes+specials+merges); e.g. 32768, 65536, 131072")
+    p.add_argument("--vocab-size", type=int, default=VOCAB_SIZE,
+                   help=f"total vocab size (bytes+specials+merges); canonical "
+                        f"default {VOCAB_SIZE} (configs.vocab.VOCAB_SIZE), e.g. "
+                        f"{VOCAB_SIZE}, 4096, 32768, 65536, 131072")
     p.add_argument("--output", default="tokenizer.json",
                    help="output JSON model file")
     p.add_argument("--pre-tokenize", default=None,

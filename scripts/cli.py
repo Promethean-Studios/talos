@@ -16,6 +16,8 @@ from typing import Optional
 
 import torch
 
+from configs.presets import tiny_config as _preset_tiny_config
+from configs.vocab import VOCAB_SIZE
 from model import TalosGPT, ModelConfig
 from model.utils import get_logger, set_seed
 from promethean import loader
@@ -42,13 +44,11 @@ def make_args() -> argparse.Namespace:
 
 def tiny_config(moe: bool) -> ModelConfig:
     if not moe:
-        return ModelConfig(
-            vocab_size=1024, hidden_size=64, num_layers=2,
-            num_attention_heads=4, num_kv_heads=2, head_dim=16,
-            ffn_type="dense", intermediate_size=256, max_seq_len=512,
-        ).derive()
+        # The canonical dense tiny preset — one definition, registry-pinned
+        # (configs.presets.tiny_config reads configs.vocab.VOCAB_SIZE).
+        return _preset_tiny_config().derive()
     return ModelConfig(
-        vocab_size=1024, hidden_size=64, num_layers=2,
+        vocab_size=VOCAB_SIZE, hidden_size=64, num_layers=2,
         num_attention_heads=4, num_kv_heads=2, head_dim=16,
         ffn_type="moe", num_experts=8, num_experts_per_tok=2,
         num_shared_experts=1, moe_intermediate_size=128,

@@ -50,7 +50,8 @@ log = get_logger("examples.tiny_train")
 def build_config(moe: bool) -> ModelConfig:
     """Return the config to train: the canonical dense tiny preset, or a MoE variant."""
     if not moe:
-        # The canonical prototype: the `tiny` dense preset (254,272 params).
+        # The canonical prototype: the `tiny` dense preset (254,272 params,
+        # registry-pinned in configs/canonical.py).
         return tiny_config().derive()
     return ModelConfig(
         vocab_size=2048, hidden_size=128, num_layers=3,

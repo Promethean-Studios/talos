@@ -11,6 +11,7 @@ config is the dev-sized model that runs on one consumer GPU.
 """
 from __future__ import annotations
 
+from configs.vocab import VOCAB_SIZE
 from model.config import ModelConfig
 from tokenizer.vocab import TokenizerConfig
 
@@ -18,7 +19,7 @@ from tokenizer.vocab import TokenizerConfig
 def tiny_config() -> ModelConfig:
     """Tiny dev model — fits on a single consumer GPU, CPU-instantiable."""
     return ModelConfig(
-        vocab_size=1024,
+        vocab_size=VOCAB_SIZE,
         hidden_size=64,
         num_layers=2,
         num_attention_heads=4,
@@ -43,13 +44,14 @@ def tiny_tokenizer_config() -> TokenizerConfig:
     tokenizer trained with the default overflows the tiny model (ids ≥ 1024
     cannot be embedded; specials would sit at 32764+).
 
-    This config fixes ``vocab_size=1024``: 256 base byte tokens + 4 special
-    tokens (ids 1020..1023, LLaMA-style at the top) + **764 merge slots**
-    (``1024 - 256 - 4``). Training learns at most 764 merges, so every token id
-    stays inside the model. Byte-level encoding needs no merges to be lossless,
-    so English round-trips exactly even before/at any merge budget.
+    This config fixes ``vocab_size=VOCAB_SIZE`` (1024): 256 base byte tokens
+    + 4 special tokens (ids 1020..1023, LLaMA-style at the top) + **764 merge
+    slots** (``VOCAB_SIZE - 256 - 4``). Training learns at most 764 merges, so
+    every token id stays inside the model. Byte-level encoding needs no merges
+    to be lossless, so English round-trips exactly even before/at any merge
+    budget.
     """
-    return TokenizerConfig(vocab_size=1024)
+    return TokenizerConfig(vocab_size=VOCAB_SIZE)
 
 
 def tiny_1m_config() -> ModelConfig:
@@ -72,7 +74,7 @@ def tiny_1m_config() -> ModelConfig:
     parameter scaling comes purely from hidden 64→128 and layers 2→3.
     """
     return ModelConfig(
-        vocab_size=1024,
+        vocab_size=VOCAB_SIZE,
         hidden_size=128,
         num_layers=3,
         num_attention_heads=8,
@@ -120,7 +122,7 @@ def tiny_10m_config() -> ModelConfig:
     change.
     """
     return ModelConfig(
-        vocab_size=1024,
+        vocab_size=VOCAB_SIZE,
         hidden_size=448,
         num_layers=3,
         num_attention_heads=28,
@@ -138,12 +140,93 @@ def tiny_10m_config() -> ModelConfig:
 def tiny_10m_tokenizer_config() -> TokenizerConfig:
     """Tokenizer for ``tiny_10m``: identical to ``tiny``'s.
 
-    ``tiny_10m`` keeps ``vocab_size=1024`` unchanged (see
+    ``tiny_10m`` keeps ``vocab_size=VOCAB_SIZE`` (1024) unchanged (see
     :func:`tiny_10m_config`), so the existing vocab-1024 tokenizer contract is
     reused verbatim — no new tokenizer, no retrained merges, same byte-level
     BPE budget (256 base bytes + 4 specials + up to 764 merges).
     """
     return tiny_tokenizer_config()
+
+
+def tiny_100m_config() -> ModelConfig:
+    """The ~100M scaling step: ``tiny_10m`` scaled to the audit's §13 candidate.
+
+    Same architectural ratios as ``tiny``/``tiny_1m``/``tiny_10m`` — 2:1 GQA
+    (64/32 heads), head_dim 16, dense FFN at 4× hidden (4096/1024), full
+    attention, un-tied embeddings, no biases — scaled to **hidden 1024 × 6
+    layers**. ``vocab_size=VOCAB_SIZE`` (1024) and ``max_seq_len`` 512 are
+    **unchanged**, so the existing vocab-1024 tokenizer
+    (``tiny_tokenizer_config``) is reused verbatim and the tokenizer↔model
+    compat contract is untouched. The exact parameter count, verified
+    programmatically, is **96,482,304** (arithmetic below).
+
+    Shape rationale (audit §13): of the two candidate shapes, hidden-1024 × 6
+    layers (96,482,304) was chosen over hidden-896 × 8 layers (98,188,160)
+    because (a) 1024 is a power of two — the cleanest hardware alignment and
+    the audit's headline candidate, whose full fp32 T4 memory model (weights +
+    grads + AdamW + activations at batch 32 × seq 64 **and** batch 32 × seq
+    512) was already computed in §13; (b) parameter arithmetic stays
+    round-numbered: per layer, attention = 3H² = 3,145,728, dense SwiGLU FFN =
+    12H² = 12,582,912, norms = 2H; total = ``2·V·H + L·(15H² + 2H) + H`` =
+    2·1024·1024 + 6·15,730,688 + 1024 = **96,482,304**, squarely inside the
+    owner's 95–105M target with an exact, registry-pinned count (the
+    ``tiny_1m``/``tiny_10m`` precedent). Depth doubles from 3 to 6 with the
+    width jump (448 → 1024); every ratio of the family is preserved.
+    """
+    return ModelConfig(
+        vocab_size=VOCAB_SIZE,
+        hidden_size=1024,
+        num_layers=6,
+        num_attention_heads=64,
+        num_kv_heads=32,
+        head_dim=16,
+        ffn_type="dense",
+        intermediate_size=4096,
+        max_seq_len=512,
+        attention_type="full",
+        rope_theta=10000.0,
+        layer_norm_eps=1e-5,
+    )
+
+
+def tiny_100m_tokenizer_config() -> TokenizerConfig:
+    """Tokenizer for ``tiny_100m``: identical to ``tiny``'s (vocab 1024).
+
+    ``tiny_100m`` keeps ``vocab_size=VOCAB_SIZE`` (1024) unchanged (see
+    :func:`tiny_100m_config`), so the existing vocab-1024 tokenizer contract is
+    reused verbatim — no new tokenizer, no retrained merges, same byte-level
+    BPE budget (256 base bytes + 4 specials + up to 764 merges). The model's
+    embedding rows stay exactly 1024, so every token id the tokenizer can emit
+    is embeddable with zero padding.
+    """
+    return tiny_tokenizer_config()
+
+
+#: canonical preset name -> tokenizer-config builder (all reuse the sole
+#: vocab-1024 contract today; the registry exists so a future preset with a
+#: different vocab is a one-line deliberate change, not a silent re-wire).
+TOKENIZER_CONFIGS = {
+    "tiny": tiny_tokenizer_config,
+    "tiny_1m": tiny_1m_tokenizer_config,
+    "tiny_10m": tiny_10m_tokenizer_config,
+    "tiny_100m": tiny_100m_tokenizer_config,
+}
+
+
+def preset_tokenizer_config(preset: str) -> TokenizerConfig:
+    """Tokenizer config for a *canonical* preset, by name (registry-driven).
+
+    Raises ``ValueError`` for unknown presets so a typo or a not-yet-registered
+    preset fails loudly at the training-script seam instead of silently using a
+    default budget.
+    """
+    try:
+        return TOKENIZER_CONFIGS[preset]()
+    except KeyError:
+        raise ValueError(
+            f"no tokenizer config registered for preset {preset!r} "
+            f"(registered: {', '.join(sorted(TOKENIZER_CONFIGS))})"
+        ) from None
 
 
 def small_config() -> ModelConfig:
@@ -274,6 +357,7 @@ ALL_PRESETS = {
     "tiny": tiny_config,
     "tiny_1m": tiny_1m_config,
     "tiny_10m": tiny_10m_config,
+    "tiny_100m": tiny_100m_config,
     "small": small_config,
     "medium": medium_config,
     "large": large_config,
