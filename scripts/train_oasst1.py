@@ -15,10 +15,12 @@ framework, no new architecture:
       -> streaming training                   data.tokenized.StreamingTokenizedDataset
          (same objective/components as         + AdamW + CrossEntropyLoss, pack mode,
           examples/tiny_train.py)              x[:, :-1] -> x[:, 1:]
-      -> per-epoch checkpoint artifact        weights + model config + step + train/val
-         + tokenizer.json next to it           loss + tokenizer path in one .pt file
+      -> per-epoch checkpoint artifact        weights + optimizer + RNG state + step/epoch
+         + tokenizer.json next to it           + tokenizer fingerprint + losses in one .pt
       -> train + validation loss saved        out_dir/metrics.json (losses, wall time,
-                                              peak RSS, params, tokenizer vocab)
+                                              peak RSS, params, tokenizer vocab + sha256)
+      -> resume from any checkpoint           --resume step-<N>.pt continues the run with
+         (bit-exact vs uninterrupted runs)     optimizer + RNG state restored
 
 Why the loop lives here instead of examples/tiny_train.py: the existing
 ``train_stream`` helper is step-based (no epoch boundaries, no evaluation, no
@@ -29,7 +31,7 @@ flat so a checkpoint and its tokenizer always sit side by side::
     out_dir/
       data/train.jsonl        data/val.jsonl      # disjoint, deterministic split
       tokenizer.json                             # trained on train split only
-      step-<N>.pt                                # checkpoint (weights+config+losses)
+      step-<N>.pt                                # checkpoint (weights+opt+RNG+losses)
       metrics.json                               # run report
 
 Usage::
@@ -37,6 +39,20 @@ Usage::
     python -m tools.make_synthetic_oasst1 --docs 300 --seed 0 --output /tmp/oasst1.jsonl
     python -m scripts.train_oasst1 --data /tmp/oasst1.jsonl --out-dir runs/oasst1-tiny \\
         --epochs 3 --seq 64 --batch 4 --seed 0
+    # resume a 100K-step Colab campaign from the last checkpoint:
+    python -m scripts.train_oasst1 --data /tmp/oasst1.jsonl --out-dir runs/oasst1-tiny \\
+        --resume runs/oasst1-tiny/step-7680.pt --epochs 20000 --seq 64 --batch 4 --seed 0
+
+Pipeline integrity guards (all cheap, all always-on):
+
+* every batch is token-id-range-checked at the data source (per encoded
+  document, ``data.tokenized.validate_id_array``), at batch assembly
+  (``model.utils.validate_token_ids`` on the train/eval loops), and at the
+  embedding seam (``TalosGPT.forward``) — an out-of-range id can never reach a
+  CUDA index kernel and poison the T4 context (audit P0 fix 1);
+* the checkpoint records the sha256 of the trained ``tokenizer.json`` and
+  resumed runs verify it, so a swapped/re-trained sidecar tokenizer fails
+  loudly instead of silently mis-tokenizing (audit P0 fix 4).
 """
 from __future__ import annotations
 
@@ -50,6 +66,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Iterable, List, Optional, Sequence
 
+import numpy as np
 import torch
 
 # Repo-root packages are importable when this module is run from the repo root
@@ -59,13 +76,16 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from configs.canonical import CANONICAL_PRESETS  # noqa: E402
+from configs.canonical import CANONICAL_PRESETS, resolve_preset  # noqa: E402
 from configs.presets import ALL_PRESETS, tiny_tokenizer_config  # noqa: E402
 from data.tokenized import StreamingTokenizedDataset  # noqa: E402
-from model import TalosGPT  # noqa: E402
-from model.utils import get_logger, set_seed  # noqa: E402
+from model import ModelConfig, TalosGPT  # noqa: E402
+from model.utils import get_logger, set_seed, validate_token_ids  # noqa: E402
 from tokenizer.corpus import iter_text_documents  # noqa: E402
-from tokenizer.tokenizer import ByteLevelBPETokenizer  # noqa: E402
+from tokenizer.tokenizer import (  # noqa: E402
+    ByteLevelBPETokenizer,
+    tokenizer_file_sha256,
+)
 from tokenizer.train import train_tokenizer  # noqa: E402
 
 log = get_logger("scripts.train_oasst1")
@@ -75,6 +95,32 @@ EXPECTED_TINY_PARAMS = 254_272
 EXPECTED_TINY_VOCAB = 1024
 
 CHECKPOINT_FORMAT = "talos-training-checkpoint-v1"
+
+
+def capture_rng_state() -> dict:
+    """Snapshot every RNG source (torch CPU/GPU, numpy, python random).
+
+    Stored in each checkpoint so a resumed run continues with the exact RNG
+    state the uninterrupted run would have had (the repo's determinism
+    guarantees make resume bit-exact — asserted by the test suite).
+    """
+    state = {
+        "torch": torch.get_rng_state(),
+        "numpy": np.random.get_state(),
+        "python": random.getstate(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state: dict) -> None:
+    """Restore a snapshot from :func:`capture_rng_state` (or its old pair)."""
+    torch.set_rng_state(state["torch"])
+    np.random.set_state(state["numpy"])
+    random.setstate(state["python"])
+    if "cuda" in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda"])
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +342,10 @@ def evaluate(
     """Mean causal-LM loss over a streamed (never materialized) dataset.
 
     Returns ``None`` when the stream contains no full batches (e.g. an empty
-    validation split). The model is left in ``train()`` mode afterwards.
+    validation split). The model is left in ``train()`` mode afterwards. Each
+    batch is token-id-range-checked at assembly (before it reaches the model)
+    so a drifted tokenizer fails here with batch context, never as an
+    ``IndexError``/CUDA assert inside the model.
     """
     was_training = model.training
     model.eval()
@@ -309,6 +358,7 @@ def evaluate(
                 if max_steps is not None and steps >= max_steps:
                     break
                 x = batch.to(device).long()
+                validate_token_ids(x, vocab, where="validation batch")
                 logits, _ = model(x[:, :-1])
                 n = x[:, 1:].numel()
                 total += float(loss_fn(logits.reshape(-1, vocab), x[:, 1:].reshape(-1)))
@@ -327,8 +377,19 @@ def save_checkpoint(
     train_loss: float,
     val_loss: Optional[float],
     tokenizer_path: str,
+    *,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    rng_state: Optional[dict] = None,
+    epoch: Optional[int] = None,
 ) -> None:
-    """One checkpoint artifact: weights + full config + step + losses + tokenizer path."""
+    """One checkpoint artifact: weights + config + step + losses + tokenizer info.
+
+    Format ``talos-training-checkpoint-v1`` stays **backward compatible**: the
+    original keys are unchanged and the resume-enabling keys (``optimizer_state_dict``,
+    ``rng_state``, ``epoch``, ``tokenizer_fingerprint``) are additive, so
+    checkpoints written before this change still load for eval/generation, and
+    new checkpoints load in any old reader.
+    """
     cfg = model.config
     payload = {
         "format": CHECKPOINT_FORMAT,
@@ -341,7 +402,14 @@ def save_checkpoint(
         #: absolute path so the checkpoint is self-describing from anywhere;
         #: the tokenizer artifact itself lives next to the checkpoint in out_dir.
         "tokenizer_path": os.path.abspath(tokenizer_path),
+        #: sha256 of the serialized tokenizer.json — content identity, so a
+        #: swapped/re-trained sidecar is caught on load (audit P0 fix 4).
+        "tokenizer_fingerprint": tokenizer_file_sha256(tokenizer_path),
         "model_state_dict": model.state_dict(),
+        # Resume-enabling state (additive, v1 format): optimizer + RNG + counters.
+        "optimizer_state_dict": None if optimizer is None else optimizer.state_dict(),
+        "rng_state": rng_state,
+        "epoch": epoch,
     }
     torch.save(payload, path)
 
@@ -364,24 +432,60 @@ def train_epochs(
     seed: int,
     max_steps_per_epoch: Optional[int] = None,
     val_max_steps: Optional[int] = None,
+    resume_from: Optional[dict] = None,
 ) -> TrainingHistory:
     """Train the tiny model on the streamed train split, epoch by epoch.
 
     Per epoch: one pass over the train stream (deterministic order — same
     ``seed`` reproduces the same run), mean train loss, validation loss over a
     *separate* stream (no token-level leakage), and a checkpoint saved with
-    weights + config + step + losses. AdamW + CrossEntropyLoss on
+    weights + config + step + losses (+ optimizer/RNG state, see
+    :func:`save_checkpoint`). AdamW + CrossEntropyLoss on
     ``x[:, :-1] -> x[:, 1:]`` — the identical objective examples/tiny_train.py
     uses.
+
+    Resume: when ``resume_from`` (a checkpoint dict from
+    :func:`load_checkpoint`) is given, the model/optimizer/RNG state and the
+    step/epoch counters are restored *before* the loop, and training continues
+    from ``resume_step + 1``. ``--epochs`` is the **target total**: the loop
+    runs from ``resume.epoch + 1`` to ``epochs``. Because the pipeline is
+    fully deterministic (fixed seed, no RNG in the data path, no dropout),
+    a resumed run is bit-identical to an uninterrupted run that never stopped
+    — asserted by ``tests/test_training.py::test_resume_bit_exact``.
     """
     set_seed(seed)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     loss_fn = torch.nn.CrossEntropyLoss()
     vocab = model.config.vocab_size
     history = TrainingHistory()
-    global_step = 0
+    start_epoch, global_step = 1, 0
+    if resume_from is not None:
+        if resume_from.get("optimizer_state_dict") is None:
+            raise ValueError(
+                "cannot resume: checkpoint has no optimizer_state_dict — it "
+                "was written before resume support (old v1 format); retrain "
+                "from step 0 or re-save with the current script"
+            )
+        model.load_state_dict(resume_from["model_state_dict"])
+        opt.load_state_dict(resume_from["optimizer_state_dict"])
+        restore_rng_state(resume_from["rng_state"])
+        # Keep the caller's --lr authoritative (AdamW.state_dict records the
+        # lr at save time under the 'lr' group key).
+        for group in opt.param_groups:
+            group["lr"] = lr
+        start_epoch = int(resume_from.get("epoch", 0)) + 1
+        global_step = int(resume_from["step"])
+        if start_epoch > epochs:
+            raise ValueError(
+                f"resume checkpoint is already at epoch {start_epoch - 1} "
+                f"(>= --epochs {epochs}) — nothing left to train; raise --epochs"
+            )
+        log.info(
+            "resuming from step %d (epoch %d completed) — continuing to epoch %d",
+            global_step, start_epoch - 1, epochs,
+        )
     t_run = time.monotonic()
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         model.train()
         epoch_losses: List[float] = []
         steps = 0
@@ -390,6 +494,7 @@ def train_epochs(
             if max_steps_per_epoch is not None and steps >= max_steps_per_epoch:
                 break
             x = batch.to(device).long()
+            validate_token_ids(x, vocab, where="train batch")
             logits, _ = model(x[:, :-1])
             loss = loss_fn(logits.reshape(-1, vocab), x[:, 1:].reshape(-1))
             opt.zero_grad()
@@ -409,7 +514,8 @@ def train_epochs(
         )
         ckpt_path = os.path.join(out_dir, f"step-{global_step}.pt")
         save_checkpoint(
-            ckpt_path, model, global_step, train_loss, val_loss, tokenizer_path
+            ckpt_path, model, global_step, train_loss, val_loss, tokenizer_path,
+            optimizer=opt, rng_state=capture_rng_state(), epoch=epoch,
         )
         row = EpochRow(
             epoch=epoch,
@@ -445,6 +551,12 @@ def make_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=0, help="fixed seed for split + training (default 0)")
     p.add_argument("--preset", default="tiny",
                    help=f"canonical preset to train ({', '.join(sorted(CANONICAL_PRESETS))}; default tiny)")
+    p.add_argument("--resume", default=None, metavar="step-<N>.pt",
+                   help="resume training from this checkpoint (weights + optimizer "
+                        "+ RNG + step/epoch restored; tokenizer fingerprint must "
+                        "match the sidecar; --epochs is then the target TOTAL). "
+                        "The split + tokenizer are NOT re-trained on resume — the "
+                        "checkpoint's sidecar tokenizer is verified and reused.")
     # split
     p.add_argument("--split-ratio", type=float, default=0.9, help="train fraction (default 0.9)")
     p.add_argument("--split-max-docs", type=int, default=None,
@@ -475,12 +587,52 @@ def _resolve_device(device: Optional[str]) -> torch.device:
 
 
 def train_run(args: argparse.Namespace) -> dict:
-    """Run the full chain; returns the metrics dict (also saved to metrics.json)."""
+    """Run the full chain; returns the metrics dict (also saved to metrics.json).
+
+    With ``--resume <step-*.pt>`` the run **continues** an existing run: the
+    split is re-derived deterministically (identical files, no re-training of
+    the split), the tokenizer is loaded from the checkpoint's recorded path and
+    verified by sha256 fingerprint (P0 fix 4), and the model/optimizer/RNG +
+    counters are restored inside :func:`train_epochs`. Tokenizer training and
+    preset build happen only on a fresh run.
+    """
     t0 = time.monotonic()
     device = _resolve_device(args.device)
     set_seed(args.seed)
     out_dir = args.out_dir
     os.makedirs(os.path.join(out_dir, "data"), exist_ok=True)
+
+    # ---- resume: load + pre-validate the checkpoint before anything else ----
+    resume_ckpt = None
+    if args.resume:
+        if not os.path.isfile(args.resume):
+            raise FileNotFoundError(f"--resume checkpoint not found: {args.resume}")
+        resume_ckpt = load_checkpoint(args.resume)
+        if resume_ckpt.get("format") != CHECKPOINT_FORMAT:
+            raise ValueError(
+                f"resume checkpoint has unsupported format "
+                f"{resume_ckpt.get('format')!r}: expected {CHECKPOINT_FORMAT!r}"
+            )
+        ckpt_cfg = ModelConfig(**resume_ckpt["model_config"]).derive()
+        ckpt_preset = resolve_preset(ckpt_cfg)
+        if ckpt_preset != args.preset:
+            raise ValueError(
+                f"--resume checkpoint is the {ckpt_preset} preset but --preset "
+                f"is {args.preset!r} — the preset must match the resumed run"
+            )
+        exp_params, exp_vocab = CANONICAL_PRESETS[ckpt_preset]
+        if int(resume_ckpt["n_params"]) != exp_params:
+            raise ValueError(
+                f"resume checkpoint records {resume_ckpt['n_params']:,} params "
+                f"but the canonical {ckpt_preset} preset is exactly "
+                f"{exp_params:,} — corrupted or tampered checkpoint"
+            )
+        if resume_ckpt.get("optimizer_state_dict") is None:
+            raise ValueError(
+                f"resume checkpoint {args.resume} has no optimizer_state_dict — "
+                f"it predates resume support (old v1 format); use a checkpoint "
+                f"written by this version of the script"
+            )
 
     # ---- canonical preset config, printed before anything else ------------
     preset = args.preset
@@ -492,7 +644,8 @@ def train_run(args: argparse.Namespace) -> dict:
     exp_params, exp_vocab = CANONICAL_PRESETS[preset]
     cfg = ALL_PRESETS[preset]().derive()
     print("=" * 72)
-    print("Talos OASST1-style training run")
+    print("Talos OASST1-style training run"
+          + (f" (RESUMING from {args.resume})" if resume_ckpt else ""))
     print(f"  model preset  : {preset} ({cfg.ffn_type}) — vocab={cfg.vocab_size} "
           f"hidden={cfg.hidden_size} layers={cfg.num_layers} "
           f"heads={cfg.num_attention_heads} kv={cfg.num_kv_heads} "
@@ -504,6 +657,9 @@ def train_run(args: argparse.Namespace) -> dict:
     print("=" * 72)
 
     # ---- 1) deterministic train/val split (disjoint files, no leakage) ---
+    # Re-derived on resume too: deterministic, so the files are byte-identical
+    # to the original run's (no re-tokenization happens — the tokenizer and
+    # its fingerprint are taken from the checkpoint below).
     split = split_jsonl(
         args.data,
         os.path.join(out_dir, "data"),
@@ -514,16 +670,43 @@ def train_run(args: argparse.Namespace) -> dict:
     print(f"  split: {split.total_docs} docs -> train {split.train_docs} / val {split.val_docs} "
           f"({os.path.basename(split.train_path)}, {os.path.basename(split.val_path)})")
 
-    # ---- 2) Talos-native BPE tokenizer on the TRAIN split only -----------
-    tokenizer_path = os.path.join(out_dir, "tokenizer.json")
-    tokenizer = train_tokenizer_for_run(
-        split.train_path,
-        tokenizer_path,
-        num_merges=args.bpe_num_merges,
-        minfreq=args.bpe_minfreq,
-        max_docs=args.bpe_max_docs,
-        max_chars=args.bpe_max_chars,
-    )
+    # ---- 2) tokenizer: train on a fresh run, verify+reuse on resume --------
+    if resume_ckpt is None:
+        tokenizer_path = os.path.join(out_dir, "tokenizer.json")
+        tokenizer = train_tokenizer_for_run(
+            split.train_path,
+            tokenizer_path,
+            num_merges=args.bpe_num_merges,
+            minfreq=args.bpe_minfreq,
+            max_docs=args.bpe_max_docs,
+            max_chars=args.bpe_max_chars,
+        )
+    else:
+        tokenizer_path = resume_ckpt["tokenizer_path"]
+        if not tokenizer_path or not os.path.isfile(tokenizer_path):
+            raise FileNotFoundError(
+                f"resume checkpoint's tokenizer not found ({tokenizer_path!r}) "
+                f"— expected the sidecar tokenizer.json next to the checkpoint"
+            )
+        tokenizer = ByteLevelBPETokenizer.from_file(tokenizer_path)
+        recorded_fp = resume_ckpt.get("tokenizer_fingerprint")
+        if not recorded_fp:
+            raise ValueError(
+                f"resume checkpoint {args.resume} has no tokenizer_fingerprint "
+                f"— written before identity fingerprints existed; use a "
+                f"checkpoint written by this version of the script"
+            )
+        actual_fp = tokenizer_file_sha256(tokenizer_path)
+        if actual_fp != recorded_fp:
+            raise ValueError(
+                f"tokenizer identity mismatch on resume: checkpoint records "
+                f"sha256 {recorded_fp} but the sidecar tokenizer.json at "
+                f"{tokenizer_path} hashes to {actual_fp} — the tokenizer was "
+                f"swapped/re-trained since the run; refusing to continue with "
+                f"the wrong tokenizer"
+            )
+        print(f"  tokenizer     : reused from checkpoint (vocab {tokenizer.vocab_size}, "
+              f"{tokenizer.merge_count} merges) — sha256 verified")
 
     # ---- 3) canonical preset model + hard param-count guard (fail fast) ---
     model = build_preset_model(preset).to(device)
@@ -531,13 +714,15 @@ def train_run(args: argparse.Namespace) -> dict:
     print(f"  model: {n_params:,} params (vocab {model.config.vocab_size}) — config guard OK")
 
     # ---- 4) streamed token batches (existing data pipeline) --------------
+    # max_id=cfg.vocab_size: a tokenizer/model vocab mismatch fails at the data
+    # source (per-document, with shard/doc context) instead of on the device.
     train_ds = StreamingTokenizedDataset(
         split.train_path, tokenizer, seq_len=args.seq, batch_size=args.batch,
-        mode="pack", eos=True,
+        mode="pack", eos=True, max_id=cfg.vocab_size,
     )
     val_ds = StreamingTokenizedDataset(
         split.val_path, tokenizer, seq_len=args.seq, batch_size=args.batch,
-        mode="pack", eos=True,
+        mode="pack", eos=True, max_id=cfg.vocab_size,
     )
 
     # ---- 5) train with per-epoch validation + checkpoints ----------------
@@ -551,6 +736,7 @@ def train_run(args: argparse.Namespace) -> dict:
         seed=args.seed,
         max_steps_per_epoch=args.max_steps_per_epoch,
         val_max_steps=args.val_max_steps,
+        resume_from=resume_ckpt,
     )
 
     last = history.rows[-1]
@@ -560,9 +746,13 @@ def train_run(args: argparse.Namespace) -> dict:
         "vocab_size": cfg.vocab_size,
         "tokenizer_vocab_size": tokenizer.vocab_size,
         "tokenizer_merges": tokenizer.merge_count,
+        #: content identity of the trained tokenizer (sha256 of tokenizer.json)
+        #: — a swapped/re-trained sidecar is detectable against this (P0 fix 4).
+        "tokenizer_sha256": tokenizer_file_sha256(tokenizer_path),
         "train_docs": split.train_docs,
         "val_docs": split.val_docs,
         "split_seed": split.seed,
+        "resumed_from": os.path.abspath(args.resume) if args.resume else None,
         "epochs": [asdict(r) for r in history.rows],
         "final_train_loss": last.train_loss,
         "final_val_loss": last.val_loss,

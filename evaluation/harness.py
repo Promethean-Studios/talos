@@ -53,9 +53,12 @@ if _REPO_ROOT not in sys.path:
 from configs.canonical import CANONICAL_PRESETS, resolve_preset  # noqa: E402
 from data.tokenized import StreamingTokenizedDataset  # noqa: E402
 from model import ModelConfig, TalosGPT  # noqa: E402
-from model.utils import set_seed  # noqa: E402
+from model.utils import set_seed, validate_token_ids  # noqa: E402
 from scripts.train_oasst1 import CHECKPOINT_FORMAT, load_checkpoint  # noqa: E402
-from tokenizer.tokenizer import ByteLevelBPETokenizer  # noqa: E402
+from tokenizer.tokenizer import (  # noqa: E402
+    ByteLevelBPETokenizer,
+    tokenizer_file_sha256,
+)
 
 EVAL_METRICS_FORMAT = "talos-oasst1-eval-metrics-v1"
 
@@ -154,8 +157,12 @@ def load_checkpoint_artifacts(
 
     Fails loudly (``ValueError``) on: unknown checkpoint format, a parameter
     count that disagrees with the checkpoint's recorded ``n_params``, a
-    tokenizer whose vocab overflows the model's embedding rows, or a missing
-    tokenizer file. The model is rebuilt from the checkpoint's own
+    tokenizer whose vocab overflows the model's embedding rows, a missing
+    tokenizer file, or a **tokenizer identity mismatch** — when the checkpoint
+    records a ``tokenizer_fingerprint`` (sha256 of the serialized
+    ``tokenizer.json``, written by current saves), the sidecar's hash must
+    match, so a silently-swapped/re-trained same-size tokenizer is rejected
+    with both hashes printed. The model is rebuilt from the checkpoint's own
     ``model_config`` (no architecture guessing) and returned in ``eval()``
     mode.
     """
@@ -213,6 +220,20 @@ def load_checkpoint_artifacts(
             f"{cfg.vocab_size} — tokenizer/model mismatch (ids would be "
             f"unembeddable)"
         )
+    # Tokenizer content identity: a same-size, different-content tokenizer (the
+    # exact 512-vocab swap scenario from the audit) passes the size check but
+    # must still be rejected — the fingerprint is the only guard against it.
+    recorded_fp = ckpt.get("tokenizer_fingerprint")
+    if recorded_fp:
+        actual_fp = tokenizer_file_sha256(tok_path)
+        if actual_fp != recorded_fp:
+            raise ValueError(
+                f"tokenizer identity mismatch for {tok_path}: the checkpoint "
+                f"was trained with tokenizer.json sha256 {recorded_fp} but the "
+                f"sidecar file hashes to {actual_fp} — the tokenizer was "
+                f"swapped or re-trained after the run; refusing to decode with "
+                f"the wrong tokenizer"
+            )
     return ckpt, model, tokenizer
 
 
@@ -238,7 +259,7 @@ def _evaluate_split_data(
     loss_fn = torch.nn.CrossEntropyLoss(reduction="sum")
     dataset = StreamingTokenizedDataset(
         jsonl_path, tokenizer, seq_len=seq_len, batch_size=batch_size,
-        mode="pack", eos=True, drop_last=drop_last,
+        mode="pack", eos=True, drop_last=drop_last, max_id=model.config.vocab_size,
     )
     vocab = model.config.vocab_size
     total_loss, correct, tokens, batches = 0.0, 0, 0, 0
@@ -248,6 +269,7 @@ def _evaluate_split_data(
             if max_steps is not None and batches >= max_steps:
                 break
             x = batch.to(device).long()
+            validate_token_ids(x, vocab, where="eval batch")
             logits, _ = model(x[:, :-1])
             targets = x[:, 1:]
             n = targets.numel()

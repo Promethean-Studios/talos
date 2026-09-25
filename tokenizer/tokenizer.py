@@ -15,6 +15,7 @@ recognising special-token strings inside the input instead.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -29,6 +30,25 @@ from tokenizer.pre_tokenize import iter_words_with_gaps, resolve_pattern
 from tokenizer.vocab import BASE_VOCAB_SIZE, TokenizerConfig, Vocabulary
 
 log = get_logger("tokenizer")
+
+
+def tokenizer_file_sha256(path: str) -> str:
+    """sha256 hex digest of a serialized ``tokenizer.json``'s raw bytes.
+
+    This is the tokenizer **content identity** fingerprint: two tokenizers with
+    the same vocab size but different merges/special-token config hash
+    differently, so a silently-swapped sidecar (the exact scenario where a
+    512-vocab tokenizer loads instead of the trained 1024 one — same
+    size-based contract, garbage outputs) is caught at load time. The digest is
+    of the file bytes as written by :meth:`ByteLevelBPETokenizer.save`, which
+    serializes deterministically; record it at save time (checkpoint +
+    metrics.json) and validate it wherever the tokenizer is loaded.
+    """
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 class ByteLevelBPETokenizer:
