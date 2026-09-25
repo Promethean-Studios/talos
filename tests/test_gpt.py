@@ -1,4 +1,5 @@
 """Integration tests for the full TalosGPT model (forward/backward, cache)."""
+import pytest
 import torch
 
 from model import TalosGPT, ModelConfig
@@ -118,6 +119,46 @@ def test_sequence_length_validation():
         assert False, "expected ValueError for over-long sequence"
     except ValueError:
         pass
+
+
+def test_token_id_bounds_guard_passes_valid_boundary_ids():
+    """The embedding-seam guard must accept the full legal id range [0, vocab)."""
+    model = TalosGPT(dense_tiny(max_seq_len=64))  # vocab_size 256
+    x = torch.tensor([[0, 255, 1, 128]])  # min = 0, max = 255 = vocab - 1
+    logits, _ = model(x)
+    assert logits.shape == (1, 4, 256)
+
+
+def test_token_id_bounds_guard_rejects_out_of_range():
+    """Out-of-range ids fail with a clear ValueError, NOT a raw IndexError.
+
+    This is the CUDA device-side-assert defense: on GPU an unbounded id would
+    poison the context with an uncatchable assert; the guard fires before the
+    embedding kernel so training/eval never reach that state. The message must
+    name the offending id and the vocab bound.
+    """
+    model = TalosGPT(dense_tiny(max_seq_len=64))  # vocab_size 256
+    for bad in (-1, 256, 999):
+        with pytest.raises(ValueError) as exc:
+            model(torch.tensor([[bad]]))
+        msg = str(exc.value)
+        assert "[0, 256)" in msg, f"bound missing from guard message: {msg}"
+        assert str(bad) in msg, f"offending id missing from guard message: {msg}"
+        assert "input_ids" in msg, f"where-label missing from guard message: {msg}"
+
+    # The guard also covers the decode path (position_ids given) and mixed
+    # batches (one bad id among valid ones must still be caught and named).
+    with pytest.raises(ValueError) as exc:
+        model(torch.tensor([[5, 7, 300, 9]]), position_ids=torch.tensor([[0, 1, 2, 3]]))
+    assert "300" in str(exc.value) and "[0, 256)" in str(exc.value)
+
+
+def test_token_id_bounds_guard_fires_before_embedding():
+    """Guard error type is ValueError — never the embedding's raw IndexError."""
+    model = TalosGPT(dense_tiny(max_seq_len=64))
+    with pytest.raises(ValueError) as exc:
+        model(torch.tensor([[1024]]), use_cache=True)
+    assert "vocab" in str(exc.value).lower()
 
 
 def test_param_count_reasonable():

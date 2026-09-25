@@ -19,7 +19,11 @@ The generation-time consistency guarantee (any mismatch fails loudly with a
 * the recorded ``vocab_size`` equals the rebuilt config's ``vocab_size``;
 * the sidecar ``tokenizer.json`` exists and ``tokenizer_vocab_size <=
   model_vocab_size`` — the ``tokenizer/model_compat.py`` contract, so every
-  token id the tokenizer can produce is embeddable by the model.
+  token id the tokenizer can produce is embeddable by the model;
+* the sidecar ``tokenizer.json``'s sha256 matches the fingerprint recorded in
+  the checkpoint (``tokenizer_fingerprint``) — a same-size but different-
+  content tokenizer (the silent-swap hole the audit found, e.g. a 512-vocab
+  sidecar next to a 1024-vocab model) is rejected with both hashes printed.
 
 Decoding is **greedy by default** (deterministic — no RNG anywhere in the
 prefill/argmax path). Temperature sampling is available but requires an

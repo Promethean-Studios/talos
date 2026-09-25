@@ -15,10 +15,16 @@ canonical ``tiny`` preset, short sequences).
 """
 from __future__ import annotations
 
+import pytest
 import torch
 
 from configs.presets import tiny_config
-from inference.generate import generate, prefill_decode_max_abs_diff, prefill
+from inference.generate import (
+    decode_step,
+    generate,
+    prefill_decode_max_abs_diff,
+    prefill,
+)
 from model import TalosGPT
 from model.utils import set_seed
 from training.synthetic import build_recurrent_corpus
@@ -160,3 +166,84 @@ def test_prefill_accepts_optional_empty_cache() -> None:
     assert cache_returned is provided  # the caller's cache object is reused
     assert cache_returned.length == prompt.shape[1]
     assert float((logits_default - logits_passed).abs().max()) <= LOGIT_ATOL
+
+
+# ---------------------------------------------------------------------------
+# Context-length guard (audit P0 fix 2): the library generate() must truncate
+# (left) instead of driving the RoPE index table past max_seq_len, and the
+# boundary cases must raise clear ValueErrors — never the old bare IndexError
+# from model/rotary.RotaryEmbedding.forward.
+# ---------------------------------------------------------------------------
+def test_generate_left_truncates_overflow_prompt() -> None:
+    """prompt(510) + max_new(8) > max_seq_len(512): left-truncate, not crash.
+
+    Regression for the audit's live reproduction: ``generate(prompt=510,
+    max_new=8)`` used to die on the 3rd decode step with a bare ``IndexError``
+    from the RoPE ``index_select``. The guard now left-truncates the prompt to
+    ``max_seq_len - max_new_tokens`` (504) — mirroring the CLI — and decodes
+    all 8 tokens. Truncation is proven by identity: the continuation of the
+    long prompt equals the continuation of its last 504 tokens.
+    """
+    model = _tiny_model(seed=0)
+    cfg = model.config
+    assert cfg.max_seq_len == 512
+    set_seed(7)
+    long_prompt = torch.randint(0, cfg.vocab_size, (1, 510))
+    short_prompt = long_prompt[:, -(cfg.max_seq_len - 8):]  # last 504 tokens
+
+    with torch.no_grad():
+        out_long = generate(model, long_prompt, 8, greedy=True)
+        out_short = generate(model, short_prompt, 8, greedy=True)
+
+    assert len(out_long) == 8
+    assert out_long == out_short  # identical conditioning => identical continuation
+    assert all(0 <= t < cfg.vocab_size for t in out_long)
+
+
+def test_generate_handles_exact_boundary() -> None:
+    """prompt(504) + max_new(8) == max_seq_len(512): fits, no truncation."""
+    model = _tiny_model(seed=0)
+    set_seed(11)
+    prompt = torch.randint(0, model.config.vocab_size, (1, 504))
+    with torch.no_grad():
+        out = generate(model, prompt, 8, greedy=True)
+    assert len(out) == 8
+
+
+def test_generate_rejects_max_new_tokens_ge_max_seq_len() -> None:
+    """max_new_tokens >= max_seq_len must be a clear ValueError (no prompt room)."""
+    model = _tiny_model(seed=0)
+    prompt = torch.zeros(1, 4, dtype=torch.long)
+    for bad in (model.config.max_seq_len, model.config.max_seq_len + 10):
+        with pytest.raises(ValueError) as exc:
+            generate(model, prompt, bad)
+        msg = str(exc.value)
+        assert "max_new_tokens" in msg and str(model.config.max_seq_len) in msg
+
+
+def test_generate_rejects_nonpositive_max_new_tokens() -> None:
+    model = _tiny_model(seed=0)
+    with pytest.raises(ValueError) as exc:
+        generate(model, torch.zeros(1, 4, dtype=torch.long), 0)
+    assert "max_new_tokens" in str(exc.value)
+
+
+def test_decode_past_max_seq_len_raises_named_error() -> None:
+    """A raw decode_step past max_seq_len gets the named RoPE ValueError.
+
+    The KV-cache-friendly error must surface, not be shadowed by an
+    ``IndexError`` from ``index_select`` — this is the exact crash site the
+    audit reproduced (model/rotary.py, RotaryEmbedding.forward).
+    """
+    model = _tiny_model(seed=0)
+    cfg = model.config
+    set_seed(5)
+    ids = torch.randint(0, cfg.vocab_size, (1, cfg.max_seq_len))
+    with torch.no_grad():
+        _, cache = prefill(model, ids)
+    assert cache.length == cfg.max_seq_len
+    tok = torch.tensor([[0]], dtype=torch.long)
+    with pytest.raises(ValueError) as exc:
+        decode_step(model, cache, tok, position=cfg.max_seq_len)
+    msg = str(exc.value)
+    assert "max_seq_len" in msg and str(cfg.max_seq_len) in msg

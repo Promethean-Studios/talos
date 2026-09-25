@@ -20,6 +20,7 @@ from data.tokenized import (
     iter_documents,
     iter_token_arrays,
     resolve_shard_paths,
+    validate_id_array,
 )
 from data.writers import MAX_BUFFER_RECORDS, ShardedWriter
 from tokenizer.tokenizer import ByteLevelBPETokenizer
@@ -270,6 +271,76 @@ def test_streaming_dataset_accepts_single_jsonl_file(tokenizer, tmp_path):
     batches = list(ds)
     assert len(batches) == 2
     assert batches[0].shape == (1, 4)
+
+
+# ---------------------------------------------------------------------------
+# Token-id bounds guard at the encode path (audit P0 fix 1): a drifted
+# tokenizer must fail at the data source with context, never on the device.
+# ---------------------------------------------------------------------------
+class _PoisonTokenizer:
+    """A tokenizer whose ``encode`` emits an id beyond its own vocab (corrupt)."""
+
+    vocab_size = 256
+    pad_id = 255
+
+    def encode(self, text, bos=False, eos=False):
+        return [0, 2000]  # 2000 >= vocab_size 256
+
+
+@pytest.mark.parametrize("mode", ["pack", "padded"])
+def test_encode_path_rejects_out_of_vocab_ids(mode, tmp_path):
+    """An id >= the tokenizer's own vocab is rejected with doc/shard context."""
+    p = tmp_path / "corpus.jsonl"
+    _write_jsonl(p, [{"text": "hello"}, {"text": "world"}])
+    with pytest.raises(ValueError) as exc:
+        list(iter_token_arrays(
+            [str(p)], _PoisonTokenizer(), seq_len=8, batch_size=1,
+            mode=mode, eos=False, drop_last=False,
+        ))
+    msg = str(exc.value)
+    assert "out of range [0, 256)" in msg
+    assert "2000" in msg  # names the offending id
+    assert "doc 0" in msg and "corpus.jsonl" in msg  # names the source
+
+
+def test_encode_path_low_level_validate_id_array():
+    with pytest.raises(ValueError) as exc:
+        validate_id_array(np.array([3, -1, 5], dtype=np.int32), 16, where="unit")
+    assert "-1" in str(exc.value) and "[0, 16)" in str(exc.value) and "unit" in str(exc.value)
+    validate_id_array(np.array([0, 15], dtype=np.int32), 16, where="unit")  # no raise
+
+
+@pytest.mark.parametrize("mode", ["pack", "padded"])
+def test_encode_path_rejects_ids_beyond_model_vocab(mode, tokenizer, tmp_path):
+    """max_id (model vocab) < some emitted id fails at the source (max_id=64)."""
+    p = tmp_path / "corpus.jsonl"
+    _write_jsonl(p, [{"text": "hello world"}])  # 'h' = byte 104 > 64
+    for max_id in (64, 100):
+        with pytest.raises(ValueError) as exc:
+            list(iter_token_arrays(
+                [str(p)], tokenizer, seq_len=16, batch_size=1,
+                mode=mode, eos=False, drop_last=False, max_id=max_id,
+            ))
+        assert f"out of range [0, {max_id})" in str(exc.value)
+    # A model vocab that comfortably covers the data streams fine.
+    batches = list(iter_token_arrays(
+        [str(p)], tokenizer, seq_len=16, batch_size=1,
+        mode=mode, eos=False, drop_last=False, max_id=1024,
+    ))
+    assert batches and int(batches[0].max()) < 1024
+
+
+def test_streaming_dataset_max_id_rejects_bad_ids(tokenizer, tmp_path):
+    """StreamingTokenizedDataset passes max_id through to the encode guard."""
+    p = tmp_path / "corpus.jsonl"
+    _write_jsonl(p, [{"text": "hello corpus"}])
+    ds = StreamingTokenizedDataset(
+        str(p), tokenizer, seq_len=8, batch_size=1, mode="pack",
+        eos=False, drop_last=False, max_id=32,  # byte 104 'h' > 32
+    )
+    with pytest.raises(ValueError) as exc:
+        list(ds)
+    assert "out of range [0, 32)" in str(exc.value)
 
 
 # ---------------------------------------------------------------------------
