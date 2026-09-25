@@ -95,8 +95,12 @@ def test_parquet_reader_streams_batches(tmp_path):
 # ---------------------------------------------------------------------------
 # Writer: eager flush / bounded buffer
 # ---------------------------------------------------------------------------
-def test_writer_default_shard_size_bounded():
-    assert ShardedWriter("/nonexistent", write_manifest=False).shard_size == 10_000
+def test_writer_default_shard_size_bounded(tmp_path):
+    # tmp_path, not a hardcoded absolute path: ShardedWriter.__init__ runs
+    # os.makedirs(), which needs a writable location. "/nonexistent" only
+    # "worked" on the build box because it runs as root — CI's non-root
+    # runner rightly got PermissionError.
+    assert ShardedWriter(str(tmp_path / "out"), write_manifest=False).shard_size == 10_000
 
 
 def test_writer_flushes_buffer_in_bytes_mode(tmp_path):
