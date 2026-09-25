@@ -251,6 +251,10 @@ def load_artifact(dir_path: str) -> Tuple[TalosGPT, dict]:
             f"{' unexpected ' + str(unexpected[:5]) if unexpected else ''}"
         )
     model.load_state_dict(tensors, strict=True)
+    # Free the raw 4-bytes-per-param tensor dict immediately: it is a full copy
+    # of the weights (e.g. ~386 MiB for tiny_100m) and callers often hold the
+    # source model + this one at the same time for bit-exactness checks.
+    del tensors
     return model, meta
 
 
