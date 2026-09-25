@@ -14,8 +14,8 @@ The generation-time consistency guarantee (any mismatch fails loudly with a
 * the checkpoint's recorded ``model_config`` rebuilds a model whose parameter
   count equals the recorded ``n_params`` (and, for the canonical presets, the
   per-preset canonical count — 254,272 for ``tiny``, 1,000,320 for ``tiny_1m``,
-  9,952,320 for ``tiny_10m`` — enforced by the registry in
-  ``configs/canonical.py``);
+  9,952,320 for ``tiny_10m``, 96,482,304 for ``tiny_100m`` — enforced by the
+  registry in ``configs/canonical.py``, same path for every preset);
 * the recorded ``vocab_size`` equals the rebuilt config's ``vocab_size``;
 * the sidecar ``tokenizer.json`` exists and ``tokenizer_vocab_size <=
   model_vocab_size`` — the ``tokenizer/model_compat.py`` contract, so every
@@ -30,8 +30,8 @@ prefill/argmax path). Temperature sampling is available but requires an
 explicit ``--seed`` (reproducible sampling needs one; a missing seed is a clear
 error, not a silent default).
 
-Sequence length policy (``max_seq_len`` = 512 for the tiny preset): `prompt +
-max_new_tokens` must fit within ``max_seq_len``. Prompts longer than
+Sequence length policy (``max_seq_len`` = 512 for the canonical presets):
+`prompt + max_new_tokens` must fit within ``max_seq_len``. Prompts longer than
 ``max_seq_len - max_new_tokens`` are truncated **on the left** — the most
 recent tokens are kept, since a causal LM's nearest context is what conditions
 the continuation. ``max_new_tokens`` must be strictly smaller than

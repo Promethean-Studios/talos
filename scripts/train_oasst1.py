@@ -7,11 +7,13 @@ framework, no new architecture:
     JSONL (OASST1-shaped, any path)
       -> deterministic train/val split        split_jsonl()  (fixed seed, disjoint files)
       -> Talos-native byte-level BPE          tokenizer.train.train_tokenizer()
-         (vocab_size 1024, TRAIN SPLIT ONLY,   corpus via tokenizer.corpus.iter_text_documents;
-          max_docs/max_chars/num_merges/       knobs exposed as CLI flags)
+         (vocab 1024 shared by every canonical  corpus via tokenizer.corpus.iter_text_documents;
+          preset — configs.vocab.VOCAB_SIZE,     max_docs/max_chars/num_merges/
+          TRAIN SPLIT ONLY,                      knobs exposed as CLI flags)
           minfreq knobs)
-      -> canonical tiny preset                configs.presets.tiny_config()
-         (254,272 params, vocab 1024)          fails fast on any config drift
+      -> canonical preset by --preset           configs.presets.<preset>_config()
+         (registry-pinned exact params+vocab,   fails fast on any config drift
+          any of tiny/tiny_1m/tiny_10m/tiny_100m)
       -> streaming training                   data.tokenized.StreamingTokenizedDataset
          (same objective/components as         + AdamW + CrossEntropyLoss, pack mode,
           examples/tiny_train.py)              x[:, :-1] -> x[:, 1:]
@@ -77,7 +79,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from configs.canonical import CANONICAL_PRESETS, resolve_preset  # noqa: E402
-from configs.presets import ALL_PRESETS, tiny_tokenizer_config  # noqa: E402
+from configs.presets import ALL_PRESETS, preset_tokenizer_config  # noqa: E402
 from data.tokenized import StreamingTokenizedDataset  # noqa: E402
 from model import ModelConfig, TalosGPT  # noqa: E402
 from model.utils import get_logger, set_seed, validate_token_ids  # noqa: E402
@@ -89,10 +91,6 @@ from tokenizer.tokenizer import (  # noqa: E402
 from tokenizer.train import train_tokenizer  # noqa: E402
 
 log = get_logger("scripts.train_oasst1")
-
-#: Owner-fixed canonical tiny prototype: EXACTLY 254,272 params at vocab 1024.
-EXPECTED_TINY_PARAMS = 254_272
-EXPECTED_TINY_VOCAB = 1024
 
 CHECKPOINT_FORMAT = "talos-training-checkpoint-v1"
 
@@ -203,22 +201,29 @@ def train_tokenizer_for_run(
     train_path: str,
     tokenizer_path: str,
     *,
+    preset: str = "tiny",
     num_merges: Optional[int] = None,
     minfreq: int = 2,
     max_docs: Optional[int] = None,
     max_chars: Optional[int] = None,
     text_field: str = "text",
 ) -> ByteLevelBPETokenizer:
-    """Train a vocab-1024 byte-level BPE on the train split and persist it.
+    """Train a byte-level BPE on the train split and persist it.
 
-    Uses the canonical :func:`configs.presets.tiny_tokenizer_config` (1024 =
-    256 base bytes + 4 specials + up to 764 merges), consumed **one document at
-    a time** via the PR-#16 unique-word frequency table, so memory stays
-    bounded. Exposes the new ``num_merges`` / ``minfreq`` / ``max_docs`` /
-    ``max_chars`` knobs. The artifact is written next to the checkpoints so
-    eval/generation can load the exact same tokenizer later.
+    Uses the canonical preset's tokenizer config
+    (:func:`configs.presets.preset_tokenizer_config` — the vocab-1024 contract
+    shared by every canonical preset: 256 base bytes + 4 specials + up to 764
+    merges), consumed **one document at a time** via the PR-#16 unique-word
+    frequency table, so memory stays bounded. Exposes the ``num_merges`` /
+    ``minfreq`` / ``max_docs`` / ``max_chars`` knobs. The artifact is written
+    next to the checkpoints so eval/generation can load the exact same
+    tokenizer later. The trained vocab is checked against the *preset model's*
+    vocab size (``ALL_PRESETS[preset]().vocab_size``) so a tokenizer/model
+    mismatch fails here with the model's real bound, regardless of which
+    canonical preset is being trained.
     """
-    config = tiny_tokenizer_config()
+    config = preset_tokenizer_config(preset)
+    model_vocab = ALL_PRESETS[preset]().vocab_size
     texts: Iterable[str] = iter_text_documents(
         [train_path], jsonl_field=text_field, on_invalid="die"
     )
@@ -231,11 +236,11 @@ def train_tokenizer_for_run(
         max_chars=max_chars,
     )
     tokenizer = result.tokenizer
-    if tokenizer.vocab_size > EXPECTED_TINY_VOCAB:
+    if tokenizer.vocab_size > model_vocab:
         raise ValueError(
-            f"tokenizer vocab_size {tokenizer.vocab_size} exceeds the tiny "
-            f"model's {EXPECTED_TINY_VOCAB} — config drift in "
-            f"configs/presets.tiny_tokenizer_config"
+            f"tokenizer vocab_size {tokenizer.vocab_size} exceeds the "
+            f"{preset} model's {model_vocab} — config drift in "
+            f"configs/presets.{preset}_tokenizer_config"
         )
     tokenizer.save(tokenizer_path)
     log.info(
@@ -258,10 +263,11 @@ def check_preset_compat(preset: str, cfg, n_params: int) -> None:
     Guards the hard requirement for whichever preset is being trained: its
     exact canonical parameter count at its exact canonical vocab size (from
     :data:`configs.canonical.CANONICAL_PRESETS`). Any drift in
-    ``configs/presets`` is caught here *before* training starts. ``tiny`` is
-    enforced at exactly 254,272 params / vocab 1024; ``tiny_1m`` at exactly
-    1,000,320 params / vocab 1024; ``tiny_10m`` at exactly 9,952,320 params /
-    vocab 1024.
+    ``configs/presets`` is caught here *before* training starts. Every
+    registered canonical preset is enforced through this same path — ``tiny``
+    at exactly 254,272 params / vocab 1024, ``tiny_1m`` at exactly 1,000,320,
+    ``tiny_10m`` at exactly 9,952,320, ``tiny_100m`` at exactly 96,482,304 —
+    with no per-preset code anywhere.
     """
     expected, expected_vocab = CANONICAL_PRESETS[preset]
     problems: List[str] = []
@@ -289,6 +295,7 @@ def check_tiny_compat(cfg, n_params: int) -> None:
     Guards the hard requirement: exactly 254,272 parameters at vocab_size 1024
     (hidden 64, 2 layers, 4 heads, 2 KV heads, dense FFN, seq 512). Any drift
     in ``configs/presets.tiny_config`` is caught here *before* training starts.
+    (Registry-enforced via :func:`check_preset_compat` — no per-preset logic.)
     """
     check_preset_compat("tiny", cfg, n_params)
 
@@ -676,6 +683,7 @@ def train_run(args: argparse.Namespace) -> dict:
         tokenizer = train_tokenizer_for_run(
             split.train_path,
             tokenizer_path,
+            preset=preset,
             num_merges=args.bpe_num_merges,
             minfreq=args.bpe_minfreq,
             max_docs=args.bpe_max_docs,

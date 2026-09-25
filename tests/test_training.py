@@ -16,11 +16,11 @@ import os
 import pytest
 import torch
 
+from configs.canonical import CANONICAL_PRESETS
 from configs.presets import tiny_config
 from model import ModelConfig, TalosGPT
 from model.utils import set_seed
 from scripts.train_oasst1 import (
-    EXPECTED_TINY_PARAMS,
     build_tiny_model,
     check_tiny_compat,
     evaluate,
@@ -156,7 +156,7 @@ def test_oasst1_e2e_split_tokenize_train_checkpoint_reload(tmp_path) -> None:
 
     # 3) canonical tiny model with the hard 254,272-param guard
     model = build_tiny_model()
-    assert model.num_parameters() == EXPECTED_TINY_PARAMS == 254_272
+    assert model.num_parameters() == CANONICAL_PRESETS["tiny"][0] == 254_272  # noqa: E501
     assert model.config.vocab_size == 1024
 
     from data.tokenized import StreamingTokenizedDataset
@@ -284,7 +284,7 @@ def test_eval_checkpoint_full_metrics_short_run(tmp_path) -> None:
         seed=0,
     )
     # Parameter count must match the recorded (and canonical 254,272) count.
-    assert result.params == EXPECTED_TINY_PARAMS == 254_272
+    assert result.params == CANONICAL_PRESETS["tiny"][0] == 254_272  # noqa: E501
     assert result.vocab_size == 1024
     # Perplexity = exp(natural-log loss): finite and positive.
     assert torch.isfinite(torch.tensor(result.val_loss))
@@ -376,7 +376,7 @@ def test_generate_from_checkpoint_smoke(tmp_path) -> None:
     assert result.max_new_tokens == GENERATED_LEN
     # Every generated id is a valid model-vocab id (in-bounds for the embedding).
     assert all(0 <= t < result.vocab_size for t in result.token_ids)
-    assert result.params == EXPECTED_TINY_PARAMS == 254_272
+    assert result.params == CANONICAL_PRESETS["tiny"][0] == 254_272  # noqa: E501
     assert result.vocab_size == 1024
     # tokenizer/model compat: tokenizer vocab never exceeds model vocab.
     assert result.tokenizer_vocab_size <= result.vocab_size

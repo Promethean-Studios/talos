@@ -189,8 +189,9 @@ def load_checkpoint_artifacts(
         )
     # Enforce the *per-preset* canonical count: the checkpoint's rebuilt config
     # must correspond to a registered canonical preset and match that preset's
-    # exact parameter count (and vocab). This covers ``tiny`` (254,272),
-    # ``tiny_1m`` (1,000,320) and ``tiny_10m`` (9,952,320) with the same path.
+    # exact parameter count (and vocab). This covers every registration —
+    # ``tiny`` (254,272), ``tiny_1m`` (1,000,320), ``tiny_10m`` (9,952,320),
+    # ``tiny_100m`` (96,482,304) — with the same path (configs/canonical.py).
     preset = resolve_preset(cfg)
     expected, expected_vocab = CANONICAL_PRESETS[preset]
     if actual != expected:

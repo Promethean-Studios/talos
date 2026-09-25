@@ -311,25 +311,36 @@ retraining, and the `tokenizer_vocab ≤ model_vocab` contract is untouched.
 
 ### ~100M parameters (estimated hardware)
 
-- **Rough config:** dense, vocab ~8192, hidden ~1024, 16–24 layers (single-
-  high-end-GPU or small-multi-GPU fit).
-- **Honest estimate:** needs a high-end GPU (24+ GiB) or a small multi-GPU
-  node; expect tens of GiB RSS; training from hours to ~a day on a modest
-  corpus. BF16 weights ~200 MiB and AdamW optimizer state still fit one large
-  GPU. This is the first scale where hybrid/sliding-window attention (already
-  implemented and unit-tested) would be exercised in a real training run.
+#### Config: `tiny_100m` (implemented; validation complete, training pending)
+
+- **Config:** dense, the canonical family's **vocab 1024** (per the audit §14
+  recommendation — single source of truth `configs.vocab.VOCAB_SIZE`), hidden
+  **1024**, **6 layers**, 64/32 GQA heads (2:1), head_dim 16, dense SwiGLU FFN
+  at 4× hidden, un-tied embeddings, no biases, seq 512. Exact, registry-pinned
+  parameter count: **96,482,304** (`hidden-1024 × 6` was chosen over
+  `hidden-896 × 8` — see the arithmetic in `configs/presets.py`
+  `tiny_100m_config` and the audit §13 memory table, which was computed for
+  exactly this shape).
+- **Honest estimate:** fits a single 16 GB T4 in fp32 (audit §13: ~2.2–2.4 GiB
+  at batch 32 × seq 64, ~7.7–9.2 GiB at batch 32 × seq 512, incl. CUDA
+  overhead); weights + grads + AdamW = 16×P ≈ 1.44 GiB regardless of batch.
+  Recommended T4 starting point: batch 32 × seq 64 (same step shape as the
+  10M runs) — see the PR validation ladder for the per-shape memory table.
 - **Purpose:** pre-announced stopping point — the largest single-GPU dense
   run the team plans before any MoE work; the last scale where a claimed
-  "scaling trend" can be honestly supported by measured points.
+  "scaling trend" can be honestly supported by measured points. The preset is
+  implemented and fully validated (exact count, forward/backward, checkpoint
+  round-trip, generation smoke, suite green); a training run is the next
+  owner decision (see the business plan's in-flight section).
 
 > **Note on existing presets:** `configs/presets.py` already contains
 > `small` (35.7M), `medium` (285M), `large` (1.64B) and the `100b`/`400b` MoE
 > configs. These are **design artifacts only** — parameter/FLOP estimates via
 > `configs.compute`, none have been trained. The progression grid above uses
-> dedicated dense configs sized to 254K → 1M → 10M → 100M; the 254K/1M/10M
-> rows have canonical presets (`tiny`/`tiny_1m`/`tiny_10m`), and the ~100M
-> config is the remaining follow-up work — a registered preset is not evidence
-> of a trained model.
+> dedicated dense configs sized to 254K → 1M → 10M → 100M; the 254K/1M/10M/100M
+> rows have canonical presets (`tiny`/`tiny_1m`/`tiny_10m`/`tiny_100m`), and
+> having a registered preset is **not** evidence of a trained model — the 100M
+> preset is validated but untrained as of this writing.
 
 ## 4. Reproducing the 254K row (exact commands, CPU-only)
 

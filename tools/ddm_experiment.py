@@ -51,6 +51,7 @@ if _REPO_ROOT not in sys.path:
 
 import torch  # noqa: E402
 
+from configs.canonical import CANONICAL_PRESETS  # noqa: E402
 from configs.presets import tiny_config  # noqa: E402
 from experiments.ddm_kv_cache import DiskTieredKVCache  # noqa: E402
 from inference.generate import decode_step, prefill  # noqa: E402
@@ -735,7 +736,7 @@ def run_experiment(
         "environment": _environment_info(),
         "config": {
             "preset": "configs.presets.tiny_config().derive()",
-            "parameters": 254_272,
+            "parameters": CANONICAL_PRESETS["tiny"][0],
             "batch": 1,
             "dtype": "float32",
             "device": device,
