@@ -7,10 +7,14 @@ framework, no new architecture:
     JSONL (OASST1-shaped, any path)
       -> deterministic train/val split        split_jsonl()  (fixed seed, disjoint files)
       -> Talos-native byte-level BPE          tokenizer.train.train_tokenizer()
-         (vocab 1024 shared by every canonical  corpus via tokenizer.corpus.iter_text_documents;
-          preset — configs.vocab.VOCAB_SIZE,     max_docs/max_chars/num_merges/
-          TRAIN SPLIT ONLY,                      knobs exposed as CLI flags)
-          minfreq knobs)
+         (vocab 1024 shared by every          preset configs.presets.preset_tokenizer_config,
+          canonical preset —                     max_docs/max_chars/num_merges/minfreq
+          configs.vocab.VOCAB_SIZE,             knobs exposed as CLI flags)
+          TRAIN SPLIT ONLY)                   OR LOAD an established tokenizer.json via
+                                              --tokenizer-json (the corpus-pretraining
+                                              path: no BPE training; the sidecar copy's
+                                              sha256 fingerprint is recorded in every
+                                              checkpoint + metrics.json)
       -> canonical preset by --preset           configs.presets.<preset>_config()
          (registry-pinned exact params+vocab,   fails fast on any config drift
           any of tiny/tiny_1m/tiny_10m/tiny_100m)
@@ -32,7 +36,8 @@ flat so a checkpoint and its tokenizer always sit side by side::
 
     out_dir/
       data/train.jsonl        data/val.jsonl      # disjoint, deterministic split
-      tokenizer.json                             # trained on train split only
+      tokenizer.json                             # BPE-trained on train split, or a
+                                                 # copy of the --tokenizer-json file
       step-<N>.pt                                # checkpoint (weights+opt+RNG+losses)
       metrics.json                               # run report
 
@@ -63,6 +68,7 @@ import json
 import os
 import random
 import resource
+import shutil
 import sys
 import time
 from dataclasses import asdict, dataclass, field
@@ -574,6 +580,14 @@ def make_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--bpe-minfreq", type=int, default=2, help="BPE min pair frequency (default 2)")
     p.add_argument("--bpe-max-docs", type=int, default=None, help="BPE training doc cap")
     p.add_argument("--bpe-max-chars", type=int, default=None, help="BPE training char cap")
+    p.add_argument("--tokenizer-json", default=None, metavar="path/to/tokenizer.json",
+                   help="load an EXISTING Talos tokenizer.json instead of training "
+                        "BPE from --data (the BPE-training path stays the default "
+                        "when this is omitted). The file is copied into "
+                        "out_dir/tokenizer.json and its sha256 fingerprint is "
+                        "recorded in every checkpoint + metrics.json; on --resume "
+                        "the provided file's fingerprint must match the "
+                        "checkpoint's recorded one.")
     # training
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--seq", type=int, default=64, help="sequence length per row")
@@ -677,19 +691,39 @@ def train_run(args: argparse.Namespace) -> dict:
     print(f"  split: {split.total_docs} docs -> train {split.train_docs} / val {split.val_docs} "
           f"({os.path.basename(split.train_path)}, {os.path.basename(split.val_path)})")
 
-    # ---- 2) tokenizer: train on a fresh run, verify+reuse on resume --------
+    # ---- 2) tokenizer: BPE-train, load an established tokenizer, or reuse ---
+    # On a fresh run: BPE-train from the split (default) or LOAD an existing
+    # tokenizer.json (corpus-pretraining path — the established Talos tokenizer
+    # is trained once and reused, not re-derived from the corpus). Either way
+    # the artifact lands at out_dir/tokenizer.json so the checkpoint sidecar +
+    # sha256 fingerprint machinery below sees exactly one canonical file.
+    tokenizer_origin: str
     if resume_ckpt is None:
         tokenizer_path = os.path.join(out_dir, "tokenizer.json")
-        tokenizer = train_tokenizer_for_run(
-            split.train_path,
-            tokenizer_path,
-            preset=preset,
-            num_merges=args.bpe_num_merges,
-            minfreq=args.bpe_minfreq,
-            max_docs=args.bpe_max_docs,
-            max_chars=args.bpe_max_chars,
-        )
+        if args.tokenizer_json:
+            if not os.path.isfile(args.tokenizer_json):
+                raise FileNotFoundError(
+                    f"--tokenizer-json not found: {args.tokenizer_json}"
+                )
+            shutil.copyfile(args.tokenizer_json, tokenizer_path)
+            tokenizer = ByteLevelBPETokenizer.from_file(tokenizer_path)
+            tokenizer_origin = "loaded"
+            print(f"  tokenizer     : loaded from {args.tokenizer_json} (vocab "
+                  f"{tokenizer.vocab_size}, {tokenizer.merge_count} merges) — BPE "
+                  f"training skipped; copied to {tokenizer_path}")
+        else:
+            tokenizer = train_tokenizer_for_run(
+                split.train_path,
+                tokenizer_path,
+                preset=preset,
+                num_merges=args.bpe_num_merges,
+                minfreq=args.bpe_minfreq,
+                max_docs=args.bpe_max_docs,
+                max_chars=args.bpe_max_chars,
+            )
+            tokenizer_origin = "trained"
     else:
+        tokenizer_origin = "resumed"
         tokenizer_path = resume_ckpt["tokenizer_path"]
         if not tokenizer_path or not os.path.isfile(tokenizer_path):
             raise FileNotFoundError(
@@ -713,8 +747,31 @@ def train_run(args: argparse.Namespace) -> dict:
                 f"swapped/re-trained since the run; refusing to continue with "
                 f"the wrong tokenizer"
             )
-        print(f"  tokenizer     : reused from checkpoint (vocab {tokenizer.vocab_size}, "
-              f"{tokenizer.merge_count} merges) — sha256 verified")
+        if args.tokenizer_json:
+            provided_fp = tokenizer_file_sha256(args.tokenizer_json)
+            if provided_fp != recorded_fp:
+                raise ValueError(
+                    f"--tokenizer-json {args.tokenizer_json} does not match the "
+                    f"resume checkpoint's recorded tokenizer fingerprint "
+                    f"(sha256 {provided_fp[:12]}… vs {recorded_fp[:12]}…) — "
+                    f"refusing to resume with a different tokenizer"
+                )
+            print(f"  tokenizer     : reused from checkpoint — --tokenizer-json "
+                  f"matches the recorded fingerprint (sha256 verified)")
+        else:
+            print(f"  tokenizer     : reused from checkpoint (vocab {tokenizer.vocab_size}, "
+                  f"{tokenizer.merge_count} merges) — sha256 verified")
+
+    # Uniform vocab contract: loaded or trained, the tokenizer's realized vocab
+    # must fit inside the preset model's embedding rows (the trained path checks
+    # this too; the loaded path gets the same guard here).
+    model_vocab = ALL_PRESETS[preset]().vocab_size
+    if tokenizer.vocab_size > model_vocab:
+        raise ValueError(
+            f"tokenizer vocab_size {tokenizer.vocab_size} exceeds the {preset} "
+            f"model's {model_vocab} — the tokenizer cannot be embedded; use a "
+            f"tokenizer built for the canonical vocab-{model_vocab} contract"
+        )
 
     # ---- 3) canonical preset model + hard param-count guard (fail fast) ---
     model = build_preset_model(preset).to(device)
@@ -757,6 +814,11 @@ def train_run(args: argparse.Namespace) -> dict:
         #: content identity of the trained tokenizer (sha256 of tokenizer.json)
         #: — a swapped/re-trained sidecar is detectable against this (P0 fix 4).
         "tokenizer_sha256": tokenizer_file_sha256(tokenizer_path),
+        #: where the tokenizer came from: "trained" (BPE from --data, the
+        #: default), "loaded" (established tokenizer via --tokenizer-json), or
+        #: "resumed" (verified against the checkpoint fingerprint).
+        "tokenizer_origin": tokenizer_origin,
+        "tokenizer_json_arg": args.tokenizer_json,
         "train_docs": split.train_docs,
         "val_docs": split.val_docs,
         "split_seed": split.seed,

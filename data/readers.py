@@ -256,6 +256,10 @@ class HuggingFaceReader(DatasetReader):
     streaming=True)`` so rows are fetched lazily instead of downloading and
     materialising the entire split in RAM/scratch disk first. Pass
     ``streaming=False`` to opt out (e.g. when shuffling requires full material).
+
+    ``config`` selects a named dataset configuration (e.g. ``"sample-10BT"``
+    for ``HuggingFaceFW/fineweb-edu``); ``revision`` pins a git revision of
+    the dataset. Both are forwarded to ``load_dataset`` only for string ids.
     """
 
     def __init__(
@@ -265,12 +269,17 @@ class HuggingFaceReader(DatasetReader):
         source: Optional[str] = None,
         text_field: str = "text",
         streaming: bool = True,
+        config: Optional[str] = None,
+        revision: Optional[str] = None,
     ) -> None:
         self._ds = _require_datasets()
         if isinstance(dataset, str):
-            self._data = self._ds.load_dataset(
-                dataset, split=split, streaming=streaming
-            )
+            kwargs: Dict[str, Any] = {"split": split, "streaming": streaming}
+            if config is not None:
+                kwargs["config"] = config
+            if revision is not None:
+                kwargs["revision"] = revision
+            self._data = self._ds.load_dataset(dataset, **kwargs)
         else:
             self._data = dataset
         self.source = source or getattr(self._data, "info", None) and getattr(
