@@ -371,3 +371,348 @@ python -m scripts.prepare_corpus \
   the best-effort HF revision/sha (skip with `--no-hf-metadata`). If a later re-run with the same
   flags must be bit-identical, the HF dataset revision must be pinned the same way (recorded, but
   no auto-pin); the val-region placement is independent of `--target-tokens` by construction.
+---
+
+## 9. Training Objective (VERIFIED in the loop)
+
+The packed path and the JSONL path use the **identical objective** (`scripts/train_oasst1.py:717-724`):
+
+```python
+logits, _ = model(x[:, :-1])                     # input  = tokens 0..S-2  (shape B, S-1, V)
+loss = loss_fn(logits.reshape(-1, vocab),        #        → (B*(S-1), V)
+               x[:, 1:].reshape(-1))             # target = tokens 1..S-1  (B*(S-1),)
+opt.zero_grad(); loss.backward(); opt.step()
+```
+
+- `loss_fn = torch.nn.CrossEntropyLoss()` (`:751`) — **mean reduction** over `B*(S-1)` tokens.
+  (Note the eval path uses `CrossEntropyLoss(reduction="sum")` and normalizes externally — §9.2.)
+- Every batch is token-id-range-checked before the model (`validate_token_ids`, `:717`), and the
+  model re-checks at the embedding seam (`model/gpt.py:100-104`).
+- One optimizer step = one batch (no gradient accumulation anywhere — see §10).
+- Per-epoch mean train loss: `sum(epoch_losses)/len(epoch_losses)` (`:841-843`), recorded per epoch.
+
+### 9.1 Shapes
+
+| Quantity | Value |
+|---|---|
+| micro-batch | `(B, S)` token rows |
+| logits | `(B, S-1, V)` with V = 1024 (verified live: `(2, 64, 1024)` for a 64-token probe) |
+| tokens per step (micro) | `B × (S-1)` — **this is the number the token budget counts** |
+| loss reduction | mean (train); sum-then-/count (val) |
+
+### 9.2 Validation loss / perplexity
+
+`evaluate()` (`:588-625`) computes mean NLL over the val stream: `sum(loss)/count` over all full
+batches; `val_max_steps` caps the number of val batches (CI/smoke). It returns `None` for an empty
+val stream. Perplexity is **not computed by the trainer**; the eval harness reports
+`val_perplexity` (`evaluation/harness.py:90`) — `exp(val_loss)` on the same mean-NLL basis. Use
+`scripts/eval_checkpoint.py` for the official per-checkpoint loss/ppl/acc numbers (§27).
+
+---
+
+## 10. Hyperparameters
+
+### 10.1 Optimizer — from code, `scripts/train_oasst1.py:749-751`
+
+```python
+opt = torch.optim.AdamW(model.parameters(), lr=lr)
+loss_fn = torch.nn.CrossEntropyLoss()
+```
+
+Only `lr` is configurable. **Everything else is torch AdamW default**:
+
+| Parameter | Value | Configurable? |
+|---|---|---|
+| optimizer | AdamW | fixed |
+| `lr` | `--lr` default **3e-3** | `---lr` |
+| `betas` | `(0.9, 0.999)` | **NEEDS IMPLEMENTATION** (not exposed) |
+| `eps` | `1e-8` | **NEEDS IMPLEMENTATION** (not exposed) |
+| `weight_decay` | `0.01` (AdamW default) | **NEEDS IMPLEMENTATION** (not exposed) |
+| gradient clipping | none | **MISSING** — see §12 |
+| gradient accumulation | none (batch == micro-batch == optimizer step) | **MISSING** if ever needed |
+
+### 10.2 LR schedule (CURRENT; `TokenSchedule`, `:127-198`)
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--lr` | `3e-3` | peak LR; linear warmup 0→lr over `--warmup-tokens`, then decay per `--lr-decay`; step LR is a pure function of tokens consumed so far (pre-step count) |
+| `--warmup-tokens` | `0` | linear warmup span; 0 = no warmup (fixed LR). Must be `< token budget` when budget set |
+| `--lr-decay` | `"none"` | `none` (fixed LR) or `cosine` — cosine from `lr` down to `min_lr_ratio × lr = 10 %` over `budget - warmup`; **cosine requires `--token-budget`** |
+| `MIN_LR_RATIO` | `0.1` (code constant `:120`) | floor for cosine decay, not a flag |
+
+### 10.3 Batch / sequence / tokens
+
+| Quantity | Value | Notes |
+|---|---|---|
+| `--batch` | default 4 (`:948-949`) | for `tiny_100m` on a T4 use 32 at S=64 (plan/§11); batch 4 is the CLI default, mirror of tiny A/B runs |
+| `--seq` | JSONL default 64; **packed: manifest `seq_len` wins** (`:1066-1079`); explicit `--seq` must equal the manifest or it errors | `--packed-dir` rows are used verbatim |
+| tokens/step | `B × (S-1)` (e.g. 32×63 = 2,016 at B=32/S=64; 4×511 = 2,044 at B=4/S=512) | counts toward `--token-budget` |
+
+### 10.4 Frequencies (what exists TODAY)
+
+| Event | Frequency | Where |
+|---|---|---|
+| validation pass | **once per epoch end** (`:844-847`) | no intra-epoch val; an epoch on the packed path = one pass over the whole packed train stream |
+| checkpoint (`step-<N>.pt`) | **once per epoch end** (`:842-868`) | the ONLY checkpoint cadence; a long epoch ⇒ large unsaved window (see §13 super-save MISSING) |
+| `metrics.json` / metadata | written once at run end (`:1426-1494`) | per-epoch losses are inside `metrics.json → epochs[]` and the live stdout line |
+| budget stop | mid-epoch allowed: the partial epoch still gets val + a checkpoint (`:828-840`, `:853-856`) | budget break does NOT skip the epoch-end checkpoint |
+
+---
+
+## 11. Batch / Throughput (T4)
+
+### 11.1 Owner-reported T4 benchmarks — CITED AS OWNER-REPORTED, not repo artifacts
+
+These were reported by the owner; they are **not present in the repo or `/home/team/shared`** (all
+repo throughput records are CPU; the audit found no measured T4 tok/s anywhere). Treat magnitudes as
+truth, exact digits as unverifiable:
+
+| Shape | Owner-reported value |
+|---|---|
+| B=1 (next-token) | ~0.465 s/step, ~2.153 steps/s, ~1.82 GB peak VRAM |
+| B=4, seq 512 (next-token) | ~0.553 s/step, ~1.808 steps/s, ~4.3 GB peak VRAM, ~2,044 tokens/step |
+
+Implications (if transferable to tiny_100m at S=512): roughly **2 steps/s × 2,044 tokens ≈ ~3.7K
+tok/s** at B=4/S=512 → a 200M-token milestone ≈ ~15 h of pure GPU time; a 1.93 B-token Chinchilla
+budget ≈ ~145 h. These are **estimates from owner-reported numbers**, not measurements — see §26.
+
+### 11.2 Computed VRAM model (audit §13, computed not measured)
+
+| Shape | fp32 peak VRAM (computed) |
+|---|---|
+| B=32, S=64 | ~2.2–2.4 GiB |
+| B=32, S=512 | ~7.7–9.2 GiB |
+| weights+grads+AdamW (any batch) | ~1.44 GiB |
+
+Repo recommendation: **batch 32 × seq 64 to start** (`docs/SCALING.md:327`). The audit concludes
+VRAM is not the binding constraint on a 16 GB T4; throughput is.
+
+### 11.3 Precision — the hard rule
+
+- **FP32 is the safe and only sanctioned mode** (no AMP code exists in the repo at all).
+- **BF16 is unsupported on T4 (SM 7.5)** — do not attempt.
+- **FP16/AMP FAILED (owner-reported, do NOT enable):**
+  `RuntimeError: value cannot be converted to type c10::Half without overflow`
+  in the attention masked-fill path: `model/attention.py:182-184` builds
+  `mask = torch.zeros_like(scores); mask = mask.masked_fill(~allowed…, NEG_INF)` — under fp16
+  autocast the `-inf` fill in fp16 overflows. The plan forbids AMP until this path is proven safe.
+
+### 11.4 Required preflight batch benchmark (before the real run)
+
+Because no measured T4 number exists for `tiny_100m` specifically: run a short benchmark on the T4
+first (spec in §17 — currently NEEDS IMPLEMENTATION as a mode; a manual 20-step run with
+`--max-steps-per-epoch` is the working substitute). Record s/step, tok/s and peak VRAM
+(`torch.cuda.max_memory_allocated()` + `nvidia-smi`) for your chosen (B, S); then convert your token
+budget to wall-clock: `budget / tok_s`.
+
+---
+
+## 12. Numerical Stability (AUDITED — gaps are real)
+
+Audit result (verified by reading `train_epochs` and grep on 2026-09-27):
+
+| Guard | Status in repo | Evidence |
+|---|---|---|
+| NaN/Inf loss detection | **MISSING** — no `isfinite`/`isnan` check on loss in `train_epochs` | `scripts/train_oasst1.py:710-860`; grep for `isnan|isfinite` → only `float("nan")` fallback at `:842` |
+| NaN/Inf gradient detection | **MISSING** — no gradient post-check | same loop |
+| gradient clipping | **MISSING** — no `clip_grad_norm_` anywhere in the repo | grep `clip` → only the metadata comment |
+| failed-step behavior / abort semantics | **MISSING** — there is no failure path at all; an exception propagates and the process dies with no checkpoint of the last step | loop structure |
+| checkpoint-before-abort | **MISSING** — nothing saves a checkpoint on error | n/a |
+| Self-reporting of the gap | the run metadata **records the truth**: `"gradient_clip_type": None, "nan_inf_detection": False` | `:1330-1334`; a code comment claims these guards "live notebook-side… wrap the optimizer step unchanged" (`:738-739`) — **but they are absent from the current shared Colab notebooks too** (grep of `shared/colab/gen_notebook.py` + `.ipynb` → nothing on 2026-09-27) |
+
+**What must be added before a long unattended run (spec — mark as MISSING):**
+
+1. Per-step after `loss.backward()`: check `torch.isfinite(loss)` and, optionally,
+   `all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)`.
+2. On non-finite: **save a checkpoint of the current state first** (weights + optimizer as-is),
+   log a loud error, then abort (exit non-zero) — never silently continue into poisoned weights.
+3. Optionally `torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)` before `opt.step()`.
+4. These can live either in the trainer (new flags `--grad-clip` / a NaN-abort policy) or in a
+   notebook/CLI wrapper around the optimizer step **as long as the checkpoint-before-abort
+   requirement is met**. The current repo has neither; the wrapper claim in the trainer comment is
+   not backed by any file found in this repo or `shared/colab`.
+
+---
+
+## 13. Checkpointing
+
+### 13.1 v1 format (`talos-training-checkpoint-v1`) — fields, from `save_checkpoint` (`:626-683`)
+
+| Field | Content |
+|---|---|
+| `format` | `"talos-training-checkpoint-v1"` |
+| `step` | global optimizer step (monotonic across resume) |
+| `model_config` | `asdict(cfg)` (already derived) |
+| `n_params` | `model.num_parameters()` (checked on resume) |
+| `vocab_size` | `cfg.vocab_size` |
+| `train_loss` / `val_loss` | per-epoch losses |
+| `tokenizer_path` | absolute path of the sidecar `tokenizer.json` (None on manifest-only packed runs) |
+| `tokenizer_fingerprint` | sha256 of the serialized tokenizer (or manifest-recorded sha on packed runs without sidecar) |
+| `model_state_dict` | full weights |
+| `optimizer_state_dict` | AdamW state (resume-enabling, additive; old v1 ckpts lack it → resume refuses) |
+| `rng_state` | torch CPU/GPU + numpy + python RNG snapshots (`capture_rng_state`, `:341-356`) |
+| `epoch` | last completed epoch |
+| `tokens_consumed` | **tokens since run start, including all prior resumed sessions** |
+| `run_metadata` | the SAME dict as `train_run_metadata.json` |
+
+### 13.2 `tokens_consumed` accounting (CURRENT)
+
+- Incremented per step by `B*(S-1)` (`:826-830`); persisted in every checkpoint.
+- On resume, restored from the checkpoint; for **legacy** checkpoints without the counter the
+  trainer estimates `step × batch × (seq-1)` (exact for constant-shape legacy runs) and warns
+  (`:765-784`).
+- **Budget semantics**: `--token-budget` counts tokens since run start *including resumed ones*
+  (`--tokenizer…`/`--token-budget` help `:950-956`); if the budget is already consumed at resume,
+  the run finishes with no new steps (`:785-800`).
+
+### 13.3 Directory resume + corruption fallback (CURRENT)
+
+- `--resume <path>` accepts a **file** `step-<N>.pt` or a **directory**; directories are scanned
+  for `step-<N>.pt` (regex `:208`) and sorted **numerically descending** (never lexicographic —
+  regression-guarded, `:206-221`).
+- Each candidate passes `validate_resume_checkpoint` (`:222-252`: format, preset resolution,
+  exact `n_params`, optimizer presence); failing candidates are skipped with a warning and the
+  next-newest is tried; if all fail, the run refuses to start (`:993-1013`).
+- Resume also enforces: same data source (`:1060-1065`), same packed-corpus identity
+  (`manifest_identity` — seq/dtype/tokenizer/rows; `:1086-1105`), same tokenizer fingerprint
+  (`:1178-1208`), and `--epochs` is then the **target total** (`:741-747`), elapsing from resumed
+  epoch+1.
+
+### 13.4 Write atomicity — honest caveat
+
+- The **metadata JSON sidecars are atomic** (`tmp` + `os.replace`; `write_run_metadata:312-321`).
+- The **`.pt` checkpoint itself is a plain `torch.save` — NOT atomic**. A crash mid-save can leave
+  a truncated `step-N.pt`; on resume the corrupted candidate is detected by
+  `load_checkpoint`/validation and skipped (fallback to the next-newest) — this is exactly why the
+  corrupt-fallback scanner exists. Long-term hardening (temp-file + rename for `.pt`) is
+  **NEEDS IMPLEMENTATION**.
+- **Intra-epoch ("super-save") checkpointing: MISSING.** Staged 200–250M-token budgets at ~2K
+  tok/s mean epochs of many hours with no intermediate checkpoint; the only protection today is a
+  short epoch budget or the owner-reported B=1/B=4 cadence. A `--super-save-every N` flag is
+  specified in §29.
+
+### 13.5 Drive persistence (CURRENT as a manual step)
+
+Nothing in the repo uploads to Drive. The Colab run must either write its `--out-dir` directly on
+the mounted Drive or copy `step-*.pt` + `metrics.json` + `train_run_metadata.json` + `tokenizer.json`
+to Drive after each epoch (notebook cell). The existing 1M/10M notebooks copy the whole run dir to
+Drive at the end (`shared/colab/gen_notebook.py` persist step); multi-session resilience requires
+per-epoch copy (**NEEDS IMPLEMENTATION** for the 100M notebook).
+
+---
+
+## 14. Google Drive Layout (PROPOSED)
+
+Deployment convention from the plan — no code enforces it. Root: `/content/drive/MyDrive/Talos/Styx_100M/`
+
+| Dir | Required before run? | Generated during run? | Contents |
+|---|---|---|---|
+| `tokenizer/` | **yes** — `tokenizer.json` (download from HF, verify sha256 `58e4ad40…`) | no | established tokenizer |
+| `data/` | optional — if prep runs on Colab it writes here | yes | `prepare_corpus` `--out-dir`: `shard-*.npy`, `manifest.json`, `run_metadata.json` |
+| `checkpoints/` | no | yes | trainer `--out-dir`: `step-<N>.pt`, `train_run_metadata.json`, `metrics.json`, `tokenizer.json` copy |
+| `logs/` | no | yes | saved stdout/`nohup` logs per session (nothing writes here by default — the trainer's output is stdout only; capturing it is the operator's job) |
+| `eval/` | no | yes | `eval_checkpoint --out-metrics` outputs, `generate` sample captures |
+| `metadata/` | no | yes | copies of manifests/run_metadata if you want a single landing zone |
+
+Disk budget (computed):
+- packed corpus: 2 B real tokens ≈ **7.7 GB int32** / **3.9 GB uint16** (memo §3.1); a 15M-token val
+  slice ≈ 60 MB int32. Fits Colab scratch (~78 GB) and Drive free tier with care.
+- checkpoint: `step-N.pt` ≈ **~1.16 GB** fp32 (model state 96,482,304×4 B ≈ 386 MB + AdamW m/v
+  ≈ 772 MB + config/RNG overhead). ~15 GB free Drive ⇒ **~12 checkpoints** (or convert to
+  uint16/safetensors and prune old steps).
+- tokenizer.json: 26 KB.
+
+**Drive storage preflight: MISSING (no repo check exists).** Before the run, verify quota with
+`df -h` on the mounted Drive (or the drive API) so the checkpoint cadence × size fits; the plan's
+preflight gate §16 includes it as a NEEDS IMPLEMENTATION item.
+
+---
+
+## 15. Monitoring (what the trainer actually logs TODAY)
+
+### 15.1 stdout
+
+1. At start: banner lines — packed corpus summary (seq/dtype/train+val rows/tokens/shards), model
+   preset line, expected params/vocab line (`expected: EXACTLY 96,482,304 params, vocab_size 1024`),
+   data/seed/epochs/seq/batch/lr/device, budget line (`budget: N tokens | warmup W | lr-decay X`),
+   run-metadata path (`train_oasst1.py:1101-1148, 1399`).
+2. Per epoch (`:868-875`): `epoch %d/%d: steps=%d train_loss=%.4f val_loss=%s checkpoint=%s`.
+3. At end (`:1491-1498`): final train/val loss, tokens consumed (+ `(REACHED)` if budget hit), wall
+   time (s), peak RSS (MiB), checkpoint path, metrics path.
+
+### 15.2 `metrics.json` fields (`:1426-1493`)
+
+`format`, `params`, `vocab_size`, `tokenizer_vocab_size`, `tokenizer_merges`,
+`tokenizer_sha256`, `tokenizer_origin`, `tokenizer_json_arg`, `data_source`,
+`train_docs`/`val_docs`/`split_seed` (jsonl) or `train_rows`/`val_rows` (packed), `resumed_from`,
+`epochs[]` (`EpochRow`: epoch/steps/global_step/train_loss/val_loss/checkpoint/wall_s),
+`final_train_loss`, `final_val_loss`, `tokens_processed`, `token_budget`, `tokens_consumed`,
+`steps`, `budget_reached`, `lr_schedule` (`{type, warmup_tokens, token_budget, min_lr_ratio}`),
+`wall_s`, `peak_rss_mb` (**host RAM**, not GPU), `device`, `checkpoint`, `tokenizer_path`,
+`run_metadata_file`.
+
+### 15.3 What is NOT logged (MISSING)
+
+- **GPU memory** (VRAM) — only host `peak_rss_mb` (RAM) is recorded; `torch.cuda.max_memory…` is
+  never called.
+- **ETA / tok/s live** — wall time is per-run and per-epoch; no live throughput line and no ETA.
+- **Per-step loss** — only the epoch mean is stored (stdout line per epoch; a partial-epoch budget
+  stop records the partial epoch mean).
+- Any of these require a small addition (new trainer flags or an operator-side
+  `torch.cuda.memory` sampler) — mark **NEEDS IMPLEMENTATION**.
+
+---
+
+## 16. Preflight Gate (the owner's 32-point checklist — reconstructed; script MISSING)
+
+> **Source note:** the owner's 32-point checklist was not found verbatim in the repo or
+> `/home/team/shared` on 2026-09-27 (search for "preflight"/"checklist"/"32-point" — no hits). The
+> gate below is reconstructed by the team from the repo's actual guards + the plan + the 100M
+> audit's P0/P1 fix list (`shared/talos-100m-audit.md` §16). Treat the mapping as authoritative;
+> the original owner wording may differ.
+>
+> **Implementation status: `scripts/preflight.py` is MISSING** (proposed; none exists). Every row
+> below that maps to existing code can be run today with the cited one-liner; the NEEDS
+> IMPLEMENTATION rows are the reason a preflight script should be written.
+
+| # | Check | Status | How it is satisfied today / proposed |
+|---|---|---|---|
+| 1 | GPU is a T4 and torch sees CUDA | PARTIAL (no script; trivially runnable) | `python -c "import torch; print(torch.cuda.get_device_name(0))"`; notebook asserts T4 (shared/colab) |
+| 2 | CUDA version / driver compatible with torch | PARTIAL | `torch.version.cuda` + `nvidia-smi` — operator check |
+| 3 | Repo checkout at the intended commit, clean | CURRENT | `git_repo_state()` records commit/branch/dirty in metadata (`train_oasst1.py:256-281`); preflight should assert `d8bfbdd` |
+| 4 | No uncommitted drift | CURRENT (recorded) | same `git_repo_state()`; trainer does not refuse on dirty — an explicit preflight `git status --porcelain` assert is NEEDS IMPLEMENTATION |
+| 5 | Deps importable (torch, numpy, datasets, tokenizers) | PARTIAL | `pip check`-style; `datasets` needed only for prep |
+| 6 | `tokenizer.json` exists at the chosen path | CURRENT | `--tokenizer-json` raises `FileNotFoundError` (`train_oasst1.py:977-981`) |
+| 7 | Tokenizer sha256 == `58e4ad40…` | CURRENT | `tokenizer_file_sha256` + compare; on resume checked against checkpoint fp (`:1178-1196`) |
+| 8 | Tokenizer vocab (1024) ≤ model vocab (1024) | CURRENT | `:1200-1207` raises on violation |
+| 9 | Model builds with `--preset tiny_100m` | CURRENT | `build_preset_model` (`:546-557`) |
+| 10 | Param count == 96,482,304 | CURRENT | `check_preset_compat` (`:503-533`); resume re-checks (`:222-252`) |
+| 11 | vocab == 1024 from the single source | CURRENT | registry + `configs.vocab.VOCAB_SIZE`; `tests/test_vocab_seam.py` |
+| 12 | Packed corpus manifest loads & validates | CURRENT | `data/packed.py:87-221` (`load_packed_manifest`) — exact `expected_seq/vocab/tokenizer_sha256` |
+| 13 | Manifest seq == trainer seq (no silent reshape) | CURRENT | `:1066-1079` errors on mismatch |
+| 14 | Manifest dtype ∈ {int32, uint16} | CURRENT | `VALID_DTYPES` + `_check_rows_and_ids` dtype check (`data/packed.py:58-86`) |
+| 15 | Shard files exist and match manifest rows/shape | CURRENT | header mmap check per shard at stream time (`data/packed.py:52-86`) |
+| 16 | Val region disjoint from train region | CURRENT (by construction) | `--val-skip-docs` carve (`prepare_corpus.py:25-31` docstring); manifest `val_region`/`train_region` records |
+| 17 | Target tokens ≥ val tokens + safety margin | PARTIAL | no code check; the stop condition is `val+train >= target` (`prepare_corpus.py`); operator arithmetic — NEEDS IMPLEMENTATION as validation |
+| 18 | Token budget ≥ warmup tokens (schedule sanity) | CURRENT | `TokenSchedule` validation (`train_oasst1.py:118-135`) |
+| 19 | Checkpoint dir writable / Drive mounted & has space | **MISSING** | no free-space check anywhere — preflight.py NEEDS IMPLEMENTATION (`df`/drive API) |
+| 20 | `--out-dir` writable and empty-or-resumable | PARTIAL | trainer mkdirs (`:1115-1120`); no "refuse to clobber a different run" guard — NEEDS IMPLEMENTATION |
+| 21 | Resume checkpoint valid (format/params/preset) if resuming | CURRENT | `validate_resume_checkpoint` (`:222-252`) + numeric scan (`:206-221`) |
+| 22 | Resume data-source identity matches CLI | CURRENT | `:1060-1065`; packed identity `:1086-1105` |
+| 23 | Resume tokenizer fingerprint matches | CURRENT | `:1178-1208` |
+| 24 | Budget not already exhausted at resume | CURRENT | `:785-800` warns + no-op finish |
+| 25 | `--lr-decay cosine` only with `--token-budget` | CURRENT | `TokenSchedule` validation (`:118-127`) |
+| 26 | Batch×seq fits VRAM (preflight benchmark) | **MISSING/NEEDS IMPLEMENTATION** | no trainer benchmark mode — §17 spec; manual 20-step smoke is the current substitute |
+| 27 | FP32 mode forced (no AMP anywhere) | CURRENT by absence | no autocast in repo; preflight asserts no env var forces AMP |
+| 28 | Token-ID bounds proven on a live batch | CURRENT | `validate_token_ids` at data source + batch + model seam; guards tested (`tests/test_training.py::test_invalid_token_id_rejected`-style) |
+| 29 | Generation length guard (CLI) | CURRENT | `scripts/generate.py` truncation (`:179-198` per audit); library `generate()` guard fixed in P0 (#25) |
+| 30 | Before-run smoke: N steps train + val + checkpoint write | PARTIAL | use `--max-steps-per-epoch N --val-max-steps M` (existing flags); an automated smoke cell/mode is NEEDS IMPLEMENTATION |
+| 31 | All run config recorded (dataset/tokenizer/model/train + token counts) | CURRENT | `train_run_metadata.json` + manifest metadata (`train_oasst1.py:282-340`; `prepare_corpus.py:344-548`) |
+| 32 | Owner approval gate for the full run | PROPOSED | plan requirement (2026-09-27): training report → owner approval → launch. No code involved. |
+
+**Proposed `scripts/preflight.py` shape (NEEDS IMPLEMENTATION, do not claim it exists):**
+`python -m scripts.preflight --preset tiny_100m --packed-dir <dir> --tokenizer-json <path>
+--checkpoint-dir <dir> [--budget N --batch B --seq S --epochs E]` → runs every CURRENT row above
+against the real repo, reports per-row PASS/FAIL with file:line evidence, and exits non-zero on any
+FAIL. Rows marked MISSING above are the ones it must add (disk free, GPU mem probe, smoke-run,
+out-dir clobber guard).
