@@ -716,3 +716,351 @@ preflight gate §16 includes it as a NEEDS IMPLEMENTATION item.
 against the real repo, reports per-row PASS/FAIL with file:line evidence, and exits non-zero on any
 FAIL. Rows marked MISSING above are the ones it must add (disk free, GPU mem probe, smoke-run,
 out-dir clobber guard).
+
+---
+
+## 17. Benchmark (NEEDS IMPLEMENTATION — spec)
+
+There is **no benchmark mode in the trainer today** (no flag; `--max-steps-per-epoch` + wall time
+is the manual substitute). The plan requires a short measured benchmark on the new dataset before
+any long run. Spec for the mode to add (do not claim it exists):
+
+**Proposed invocation:** `python -m scripts.train_oasst1 --preset tiny_100m --packed-dir <dir>
+--token-budget <B*(S-1)*N> --max-steps-per-epoch N --epochs 1 --batch B --seq S --device cuda
+[--benchmark]` — or a separate `--benchmark-steps N` flag that stops after N optimizer steps
+without val.
+
+**Procedure (works today without the flag):**
+1. Run N=20-50 steps at the chosen (B, S) with `--max-steps-per-epoch N --epochs 1` on the T4.
+2. Measure: `s/step` (epoch `wall_s / steps` from `metrics.json`), `tok/s =
+   steps*B*(S-1)/wall_s`, **peak VRAM** via `torch.cuda.max_memory_allocated()` + `nvidia-smi`
+   (operator-side; the trainer records host RSS only), loss stability (first vs last epoch mean,
+   and absence of NaN — remember §12: no automatic NaN detection).
+3. Prefer S=512 over S=64 for the *final* shape decision: the audit's VRAM model says S=512 is the
+   tighter configuration (7.7-9.2 GiB), and the owner-reported B=4/S=512 numbers (§11) are the only
+   T4 datapoints at that shape.
+4. Wall-clock estimate for the real run: `budget / measured_tok_s` (+ val + checkpoint overhead ≈
+   val-tokens/tok_s + one ~1.16 GB checkpoint write per epoch).
+
+**Deliverable of the benchmark:** the owner-report numbers for §16 rows 1-2, 26 and §26 — a
+measured tok/s for tiny_100m on a T4, which currently does not exist anywhere.
+
+---
+
+## 18. Training Procedure (25 steps, fresh runtime)
+
+All commands assume a fresh Colab T4 runtime, repo cloned at `/content/talos`, python available,
+and the packed corpus prepared (§8) either on Drive or in Colab scratch.
+
+1. **Mount Drive** (if using `Styx_100M`): Colab left-panel → Drive mount; confirm
+   `/content/drive/MyDrive/Talos/Styx_100M/` exists with `tokenizer/` and `data/` populated.
+2. **Assert GPU**: `import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))`
+   → must print a T4.
+3. **Check disk**: `df -h /content /content/drive` — corpus (≤8 GB int32 per 2B tokens) +
+   checkpoints (~1.16 GB each) + scratch must fit (Colab ~78 GB scratch; Drive quota is yours).
+4. **Clone the repo** at the exact commit: `git clone https://github.com/Promethean-Studios/talos
+   /content/talos && cd /content/talos && git checkout d8bfbdd`.
+5. **Install deps**: `pip install torch==2.13.* numpy safetensors datasets` (CPU wheel is fine for
+   prep; Colab's torch is CUDA-enabled by default — verify `torch.cuda.is_available()` after).
+6. **Verify tokenizer**: `sha256sum <Styx_100M>/tokenizer/tokenizer.json` ==
+   `58e4ad40b174c9fde3cec8e86188115bcdee173e7fcd188e7ba139a04b549e48`.
+7. **Inspect the corpus manifest**: `python -c "import json;m=json.load(open('<packed-dir>/manifest.json'));print(m['seq_len'],m['dtype'],m['metadata']['counts'])"` — confirm `seq_len=512`,
+   `dtype=int32` (or uint16), tokenizer sha256 matches step 6.
+8. **Choose the token budget** `N` (owner-approved; §25 math) and the step shape `B × S`.
+9. **Compute steps**: `steps = N // (B*(S-1))` (budget is primary; epochs only bound the loop).
+10. **Set `--epochs` large enough that the budget stops the run first** (e.g. `--epochs` such that
+    `epochs × train_rows/B >= steps`); the budget hits mid-epoch and still saves a checkpoint.
+11. **Smoke run (owner-mandated before the real run):**
+    ```bash
+    python -m scripts.train_oasst1 --preset tiny_100m --packed-dir <data_dir> \
+      --tokenizer-json <tok_path> --out-dir <run_dir> \
+      --token-budget 41000 --max-steps-per-epoch 20 --val-max-steps 2 \
+      --batch 4 --seq 512 --device cuda --seed 0
+    ```
+    20 steps × 4×511 = 40,880 tokens — the packed analog of the existing 20-step smoke (shared/colab);
+    assert the run prints `expected: EXACTLY 96,482,304 params, vocab_size 1024`, writes a
+    `step-20.pt`, and `metrics.json` has `final_val_loss` finite.
+12. **Benchmark** (§17) at your chosen (B, S) for ~30-50 steps; record measured tok/s + peak VRAM.
+13. **Compute expected wall-clock** = `N / tok_s`; sanity-check against §26 milestones; if > 12 h,
+    plan multi-session with resume (each Colab session ends with a checkpoint on Drive).
+14. **Launch the real run:**
+    ```bash
+    nohup python -m scripts.train_oasst1 --preset tiny_100m \
+      --packed-dir <data_dir> --tokenizer-json <tok_path> \
+      --out-dir /content/drive/MyDrive/Talos/Styx_100M/checkpoints/fw-edu-run \
+      --token-budget N --warmup-tokens W --lr-decay cosine \
+      --batch B --seq 512 --device cuda --seed 0 \
+      > /content/drive/MyDrive/Talos/Styx_100M/logs/run1.log 2>&1 &
+    ```
+    (warmup example for a 200M budget: `--warmup-tokens 2000000` = 1 % — tune per plan; fixed-LR
+    runs omit `--warmup-tokens`/`--lr-decay`.)
+15. **Watch epoch lines**: `epoch k/E: steps=… train_loss=… val_loss=… checkpoint=…`; confirm loss is
+    finite and decreasing-ish; **there is no automatic NaN abort (§12) — monitor manually.**
+16. **Copy to Drive after each epoch** (if `--out-dir` is on scratch): `cp -r <run_dir>/step-*.pt
+    <run_dir>/metrics.json <run_dir>/train_run_metadata.json …/checkpoints/` (per-epoch automation:
+    NEEDS IMPLEMENTATION, §13.5).
+17. **On disconnect/timeout/new session**: resume (§19) —
+    `python -m scripts.train_oasst1 … --resume <run_dir> --epochs <same target> …`
+    (the directory scan picks the numerically-newest valid checkpoint).
+18. **On budget stop** (`tokens N / budget N (REACHED)` in stdout): training is done; do not extend
+    `--token-budget` without owner approval (gate §16 row 32).
+19. **Eval the final checkpoint on the held-out val slice**: §27.
+20. **Generation samples**: `python -m scripts.generate --checkpoint <run_dir> --prompt "…"`
+    (greedy, deterministic; 5 fixed prompts per the 10M notebook convention).
+21. **Consistency guard** (mirror the 10M notebook cell): load `step-<N>.pt`, assert
+    `ck["format"]=="talos-training-checkpoint-v1"`, `ck["n_params"]==96_482_304`,
+    `ck["vocab_size"]==1024`, `ck["tokens_consumed"]==N`.
+22. **Export safetensors** (release format): `python -m scripts.export_safetensors --checkpoint
+    <ckpt> --out-dir <release>/talos-mini-100m-fw-edu` (§27/§30).
+23. **Write the run report** from `metrics.json` + `train_run_metadata.json` + `manifest.json`
+    (dataset, token counts, budget, LR config, wall, tok/s, milestone achieved).
+24. **Owner decision artifacts**: eval numbers + generation samples + report → decide SFT (OASST1,
+    §24) or budget extension.
+25. **Clean up**: prune old `step-*.pt` beyond the last few on Drive (each ≈1.16 GB) — keep the
+    final one + `metrics.json` + metadata forever.
+
+---
+
+## 19. Resume / Recovery
+
+### 19.1 Failure matrix — exact commands
+
+| Event | What survives | Recovery command (all flags must match the original run EXCEPT `--resume`/`--epochs`) |
+|---|---|---|
+| Colab disconnect / runtime reset | last epoch's `step-*.pt` on Drive (+ in-checkpoint optimizer/RNG/counters) | `python -m scripts.train_oasst1 … --resume <run_dir> --epochs <SAME TOTAL>` (dir scan → numeric-newest valid) |
+| Session OOM / killed mid-epoch | all prior epoch checkpoints; current epoch lost | same as above (resume from last completed epoch's checkpoint) |
+| NaN/Inf loss (no auto-abort exists!) | whatever the last epoch wrote | manual: kill, inspect `metrics.json`, resume from the last good step, or restart with a lower LR (§12 — guard MISSING) |
+| Corrupt/truncated `step-N.pt` (crash mid-save, non-atomic `.pt`) | older valid checkpoints | `--resume <run_dir>` — the scanner skips the corrupt candidate with a warning and uses the next-newest (`:993-1013`) |
+| Tokenizer file missing on resume | none (refuses) | restore `tokenizer.json` to the recorded `tokenizer_path`, or unpacked-run: pass `--tokenizer-json` matching the recorded fingerprint (`:1178-1208`) |
+| Drive unavailable at resume | the run dir is unreachable | re-mount Drive; if checkpoints were staged on scratch they are gone — this is why per-epoch Drive copy matters |
+| Budget already consumed at resume | — | run finishes with a warning and no new steps (`:785-800`); raise `--token-budget` only with approval |
+| Epochs already reached (resume) | — | `ValueError: …nothing left to train; raise --epochs` (`:773-775`) |
+| Wrong preset passed | — | `ValueError` from `validate_resume_checkpoint` (`:230-242`) |
+
+### 19.2 What resume REJECTS (all CURRENT, all loud `ValueError`)
+
+- **Wrong architecture/preset**: checkpoint resolves to a different canonical preset than
+  `--preset` (`:230-242`); `n_params` ≠ canonical count → "corrupted or tampered checkpoint".
+- **Wrong tokenizer**: file sha256 ≠ checkpoint's recorded fingerprint; `--tokenizer-json` on
+  resume must match the fingerprint; on the packed path the manifest sha256 must match too
+  (`:1178-1208`).
+- **Wrong dataset**: `data_provenance.source` differs (jsonl vs packed) (`:1060-1065`); on packed,
+  `manifest_identity` (seq/dtype/tokenizer/rows) must equal the recorded identity (`:1086-1105`).
+- **Wrong seq**: explicit `--seq` ≠ manifest `seq_len` on the packed path (`:1066-1079`).
+- **Pre-resume-support checkpoints** (no `optimizer_state_dict`): resume refuses (`:755-758`).
+
+### 19.3 Override policy (documented)
+
+- `--epochs` is the **target total** (not "additional"); resume runs `resume.epoch+1…epochs`
+  (`:741-747`).
+- `--lr` from the CLI **overrides** the checkpoint's stored LR after resume (all param groups
+  reset to the CLI value, `:762-763`); warmup/decay/tokens-consumed continue from restored
+  counters.
+- Resume is **bit-exact vs. an uninterrupted run on CPU** (test-asserted,
+  `tests/test_training.py::test_resume_bit_exact`; ckpt RNG snapshot/restore `:341-366`) — on CUDA
+  see §23 (not bit-reproducible).
+
+---
+
+## 20. APIs (exact signatures from code — no invented APIs)
+
+### 20.1 `scripts/prepare_corpus.py`
+
+- `prepare_corpus(reader, tokenizer, *, out_dir, target_tokens, val_tokens, tokenizer_path,
+  seq_len, dtype, val_skip_docs, stream_buffer_docs, rows_per_shard, text_field, dataset_meta,
+  args_echo=None) -> dict` (metadata) — `:333`.
+- CLI: `python -m scripts.prepare_corpus` — full flag table §8.1 (`:557-591`).
+
+### 20.2 `scripts/train_oasst1.py` (the trainer)
+
+- `make_arg_parser() -> argparse.ArgumentParser` — `:886` (all flags in §21).
+- `train_run(args: argparse.Namespace) -> dict` (the metrics dict; also writes `metrics.json`) —
+  `:993`.
+- `train_epochs(model, train_ds, val_ds, *, out_dir, tokenizer_path, lr, epochs, device, seed,
+  max_steps_per_epoch=None, val_max_steps=None, resume_from=None, token_budget=None,
+  warmup_tokens=0, lr_decay="none", run_metadata=None) -> TrainingHistory` — `:689`.
+- `save_checkpoint(path, model, step, train_loss, val_loss, tokenizer_path, *, optimizer=None,
+  rng_state=None, epoch=None, tokens_consumed=None, run_metadata=None, tokenizer_fingerprint=None)`
+  — `:626`. `load_checkpoint(path) -> dict` — `:684`.
+- `list_checkpoint_candidates(checkpoint_dir) -> List[str]` — `:206`.
+  `validate_resume_checkpoint(ckpt, preset) -> None` — `:222`.
+- `evaluate(model, dataset, device, *, max_steps=None) -> Optional[float]` — `:588`.
+- `build_preset_model(preset) -> TalosGPT` — `:546` (calls `check_preset_compat` `:503`).
+- `split_jsonl(src_path, out_dir, ratio=0.9, seed=0, max_docs=None) -> SplitResult` — `:382`
+  (JSONL path only).
+- `TokenSchedule(lr, warmup_tokens, decay, budget, min_lr_ratio=MIN_LR_RATIO)` with
+  `lr_at(tokens) -> float` and `to_dict()` — `:127`.
+- `capture_rng_state() -> dict` / `restore_rng_state(state)` — `:341/:358`.
+- `write_run_metadata(out_dir, run_metadata) -> str` — `:312` (atomic).
+- `tokenizer_file_sha256(path) -> str` — `tokenizer/tokenizer.py:35`.
+
+### 20.3 Data layer
+
+- `data/packed.py`:
+  - `load_packed_manifest(dir, *, expected_seq=None, expected_vocab=None,
+    expected_tokenizer_sha256=None) -> dict` — `:87`.
+  - `manifest_identity(manifest) -> dict` — `:223` (stable identity: format/seq/dtype/tokenizer
+    sha/row counts).
+  - `packed_phase_shard_paths(manifest, dir, phase) -> List[str]` — `:258`.
+  - `PackedTokenDataset(shard_paths, *, seq_len, batch_size=1, expected_dtype="int32",
+    max_id=None, drop_last=True)` — `:270` (IterableDataset, yields `(B, seq)` int32 tensors).
+- `data/readers.py`: `HuggingFaceReader(dataset_id, split, text_field, streaming=True,
+  config=None)`; also `JSONLReader(paths, source, text_field)`, `ParquetReader(...)`.
+- `data/tokenized.py`: `StreamingTokenizedDataset(path, tokenizer, seq_len, batch_size, mode,
+  eos, max_id, dtype, …)` (JSONL path only).
+
+### 20.4 Model
+
+- `tiny_100m_config() -> ModelConfig` — `configs/presets.py:96`; `.derive()` — `model/config.py:92`;
+  `TalosGPT(config, attention_backend=None)`, `.forward(input_ids, position_ids=None,
+  use_cache=False, cache=None) -> (logits, cache)`, `.num_parameters(trainable_only=True) -> int`
+  — `model/gpt.py:24, 68, 168`. `ModelConfig(**asdict)` round-trips checkpoints (`:226` in trainer).
+
+### 20.5 Checkpoint load/validate + eval entrypoints
+
+- `scripts/eval_checkpoint.py::make_arg_parser()` — `:47`; `evaluation.harness.run_eval(
+  checkpoint_path, data=None, *, train_data=None, seq_len=64, batch_size=4, drop_last=True,
+  max_steps=None, seed=0, device=None, out_metrics=None) -> EvalResult` — `:300`.
+- `scripts/generate.py::make_arg_parser()` — `:265`.
+- `scripts/export_safetensors.py::make_arg_parser()` — `:309`.
+
+---
+
+## 21. CLI — every flag
+
+### 21.1 `scripts/train_oasst1.py` (`make_arg_parser`, `:886-969`)
+
+| Flag | Type | Default | Required | Valid values / notes |
+|---|---|---|---|---|
+| `--data` | path | None | one of `--data`/`--packed-dir` | JSONL corpus (OASST1 path) |
+| `--packed-dir` | dir | None | one of `--data`/`--packed-dir` | `prepare_corpus` output; rows verbatim |
+| `--out-dir` | dir | — | **yes** | run dir (split/tokenizer/checkpoints/metrics/metadata) |
+| `--seed` | int | 0 | no | split+training seed |
+| `--preset` | str | `"tiny"` | no | any of the 4 canonical presets; use `tiny_100m` |
+| `--resume` | path | None | no | `step-<N>.pt` file or dir (numeric-newest valid; corrupt skip) |
+| `--split-ratio` | float | 0.9 | no | JSONL only |
+| `--split-max-docs` | int | None | no | JSONL only |
+| `--bpe-num-merges` | int | None | no | JSONL BPE path only (default 764) |
+| `--bpe-minfreq` | int | 2 | no | JSONL BPE path only |
+| `--bpe-max-docs` | int | None | no | JSONL BPE path only |
+| `--bpe-max-chars` | int | None | no | JSONL BPE path only |
+| `--tokenizer-json` | path | None | on packed: recommended | existing tokenizer.json; fingerprint machinery §6 |
+| `--epochs` | int | 1 | no | target TOTAL epochs (incl. resumed) |
+| `--seq` | int | None (JSONL: 64) | no | packed: must equal manifest `seq_len` or error |
+| `--batch` | int | 4 | no | batch size |
+| `--lr` | float | 3e-3 | no | peak LR |
+| `--token-budget` | int | None | no | PRIMARY stop target: tokens since run start incl. resumed |
+| `--warmup-tokens` | int | 0 | no | linear warmup span (must be < budget if budget set) |
+| `--lr-decay` | str | `"none"` | no | `none` \| `cosine` (cosine needs `--token-budget`) |
+| `--max-steps-per-epoch` | int | None | no | CI/smoke cap |
+| `--val-max-steps` | int | None | no | CI/smoke cap on val batches |
+| `--device` | str | None (auto) | no | auto → `cuda` if available else `cpu` |
+
+**Missing options (NEEDS IMPLEMENTATION — do not try to pass them):** `--grad-clip`,
+`--nan-abort`, `--super-save-every`, `--benchmark`, `--fp16`/`--amp` (FORBIDDEN, §11), `--eta`,
+`--vit`… none of these exist.
+
+### 21.2 `scripts/prepare_corpus.py` — full table in §8.1 (11 flags; `--tokenizer-json`,
+`--target-tokens`, `--out-dir` required).
+
+### 21.3 `scripts/eval_checkpoint.py` (`:47-85`)
+
+`--checkpoint` (file or dir; required) · `--data` (val JSONL; default = ckpt dir's
+`data/val.jsonl`) · `--train-data` (optional train loss) · `--seq` (64) · `--batch` (4) ·
+`--keep-partial` (flag) · `--max-steps` (None) · `--seed` (0) · `--device` (auto) ·
+`--out-metrics` (default `<ckpt dir>/eval-metrics.json`).
+
+### 21.4 `scripts/generate.py` (`:265-291`)
+
+`--checkpoint` (file or dir; required) · `--prompt` (required) · `--max-new-tokens` (32) ·
+`--temperature` (None = greedy argmax, deterministic) · `--seed` (None; mandatory with
+`--temperature`) · `--device` (auto).
+
+### 21.5 `scripts/export_safetensors.py`
+
+`--checkpoint` (required) · `--out-dir` (required).
+
+---
+
+## 22. Configuration Precedence
+
+| Level | Wins over | Notes |
+|---|---|---|
+| **Code default** | — | e.g. `--lr` default 3e-3, `--batch` 4, preset `tiny` |
+| **Preset** | code defaults | `--preset tiny_100m` fixes the model config from `ALL_PRESETS`; the config registry (`configs/canonical.py`) defines the exact count |
+| **CLI** | preset + code defaults | `--lr`, `--batch`, `--seq`, `--epochs`, `--token-budget`, … |
+
+**No hidden overrides exist.** Three documented, intentional exceptions (all in code, all loud):
+
+1. **Packed `seq`**: the manifest's `seq_len` is authoritative; `--seq` may only *equal* it
+   (`:1066-1079`). (`effective_seq` is the manifest value unless `--seq` matches.)
+2. **Resume LR**: the CLI `--lr` replaces the checkpoint's stored LR after resume (`:762-763`).
+3. **Resume epochs**: `--epochs` is the target total, not additional (`:741-747`).
+
+Everything a run *did* is recorded (not enforced) in `train_run_metadata.json`
+(`training_config` + `model_config` + `data_provenance` + `tokenizer` + `git`) and in the manifest
+metadata (`args` echo) — so a post-hoc audit can always tell which precedence was in effect.
+
+---
+
+## 23. Reproducibility
+
+### 23.1 What is verified
+
+- **CPU bit-reproducibility is a VERIFIED repo fact**: fixed seed, no dropout, no RNG in the data
+  path, deterministic batch order; resume is bit-exact vs. an uninterrupted run (test-asserted
+  `tests/test_training.py::test_resume_bit_exact`). Same `(src, ratio, seed)` → identical JSONL
+  split (`split_jsonl`); same packed rows → identical train order (rows stream verbatim).
+- Per-checkpoint RNG snapshots (torch CPU/GPU + numpy + python random) are captured and restored
+  (`capture_rng_state`/`restore_rng_state`, `:341-366`).
+- Identity machinery: tokenizer sha256 (file content), `manifest_identity` (format/seq/dtype/
+  tokenizer sha/rows), checkpoint `n_params`/`vocab_size`, `git_repo_state`
+  (`{commit, branch, dirty}`, `:256-281`) in the run metadata, and `train_run_metadata.json`
+  embedded in every checkpoint.
+
+### 23.2 What is NOT (say it plainly)
+
+- **CUDA is NOT bit-reproducible.** torch CUDA kernels (esp. reduction/matmul) are not
+  deterministic across runs/hardware; resume on a T4 is *state-continuous* (optimizer + RNG
+  restored), not bit-identical to an uninterrupted T4 run. Do not assert bit-equality for any
+  T4-vs-T4 or T4-vs-CPU comparison; compare losses at ~1e-4 tolerance or better, report
+  `device` in every artifact (the repo does).
+- The repo's determinism tests are CPU; the packed corpus prep is deterministic given an identical
+  HF stream (HF revision is recorded, not pinned — a dataset-fetch drift between prep runs changes
+  the stream; the manifest records the revision/sha it saw).
+
+---
+
+## 24. Data Preservation (OASST1 → SFT later)
+
+- **OASST1 is preserved untouched for the SFT stage** (owner directive 2026-09-27): the existing
+  OASST1-derived ~20.6M-token subset and its JSONL pipeline (`--data` path, `split_jsonl`, BPE
+  training, `StreamingTokenizedDataset`) remain intact and are NOT consumed by the pretraining
+  pipeline. `--packed-dir` and `--data` are exclusive inputs; nothing mixes them.
+- The canonical OASST1 subset identity for the SFT phase: rows 0-1999, content-sha
+  `bfe3285da9dd1e250822449ae956b0bcec4921231179876ac983fd0c508d1f6c` (NUL-joined texts; the file
+  sha varies with JSONL serialization) — per `shared/colab/README.md` and `benchmarks/phase-b/
+  data-provenance.json`.
+- **Pipeline (fixed order):** FineWeb-Edu packed corpus → `tiny_100m` pretraining → OASST1 SFT
+  (later, separate run) → evaluation. **Never mix OASST1 into the base corpus.**
+- The research memo's runner-up (fineweb general) is a *corpus choice*, not an SFT mix; an 80/20
+  edu/web mix is allowed at the corpus stage if the owner approves the report (§16 row 32).
+
+---
+
+## 25. Token-Budget Training
+
+- **`--token-budget` is the PRIMARY stop target.** The trainer stops mid-epoch as soon as
+  `tokens_consumed >= budget`, then still runs validation and writes the epoch checkpoint
+  (`:828-856`). `--epochs` only bounds the loop; whichever limit comes first wins.
+- Step-based mode is documented separately and still exists: omitting `--token-budget` gives the
+  legacy fixed-LR/epochs behavior (optionally `--max-steps-per-epoch`), exactly the machinery the
+  1M/10M ladder runs used.
+- **Budget → steps math**: `steps_needed = ceil(tokens_remaining / (B * (S-1)))` where
+  `tokens_remaining = budget - tokens_consumed` (from the resumed checkpoint).
+  Examples: B=32/S=64 → 2,016 tok/step; B=4/S=512 → 2,044 tok/step.
+- **Resumed tokens are included**: the budget counts tokens since RUN START (all sessions);
+  legacy checkpoints without the counter are estimated as `step × B × (S-1)` (exact for
+  constant-shape runs) with a warning (`:765-784`).
+- LR schedule is token-indexed: warmup spans `[0, W)`, cosine decays over `[W, budget)` to
+  10 % — both computed from `tokens_consumed` pre-step (`TokenSchedule.lr_at`, `:137-153`).
