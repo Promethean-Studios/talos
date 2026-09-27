@@ -698,17 +698,18 @@ def train_run(args: argparse.Namespace) -> dict:
     # the artifact lands at out_dir/tokenizer.json so the checkpoint sidecar +
     # sha256 fingerprint machinery below sees exactly one canonical file.
     tokenizer_origin: str
+    tokenizer_json = getattr(args, "tokenizer_json", None)
     if resume_ckpt is None:
         tokenizer_path = os.path.join(out_dir, "tokenizer.json")
-        if args.tokenizer_json:
-            if not os.path.isfile(args.tokenizer_json):
+        if tokenizer_json:
+            if not os.path.isfile(tokenizer_json):
                 raise FileNotFoundError(
-                    f"--tokenizer-json not found: {args.tokenizer_json}"
+                    f"--tokenizer-json not found: {tokenizer_json}"
                 )
-            shutil.copyfile(args.tokenizer_json, tokenizer_path)
+            shutil.copyfile(tokenizer_json, tokenizer_path)
             tokenizer = ByteLevelBPETokenizer.from_file(tokenizer_path)
             tokenizer_origin = "loaded"
-            print(f"  tokenizer     : loaded from {args.tokenizer_json} (vocab "
+            print(f"  tokenizer     : loaded from {tokenizer_json} (vocab "
                   f"{tokenizer.vocab_size}, {tokenizer.merge_count} merges) — BPE "
                   f"training skipped; copied to {tokenizer_path}")
         else:
@@ -747,11 +748,11 @@ def train_run(args: argparse.Namespace) -> dict:
                 f"swapped/re-trained since the run; refusing to continue with "
                 f"the wrong tokenizer"
             )
-        if args.tokenizer_json:
-            provided_fp = tokenizer_file_sha256(args.tokenizer_json)
+        if tokenizer_json:
+            provided_fp = tokenizer_file_sha256(tokenizer_json)
             if provided_fp != recorded_fp:
                 raise ValueError(
-                    f"--tokenizer-json {args.tokenizer_json} does not match the "
+                    f"--tokenizer-json {tokenizer_json} does not match the "
                     f"resume checkpoint's recorded tokenizer fingerprint "
                     f"(sha256 {provided_fp[:12]}… vs {recorded_fp[:12]}…) — "
                     f"refusing to resume with a different tokenizer"
@@ -818,7 +819,7 @@ def train_run(args: argparse.Namespace) -> dict:
         #: default), "loaded" (established tokenizer via --tokenizer-json), or
         #: "resumed" (verified against the checkpoint fingerprint).
         "tokenizer_origin": tokenizer_origin,
-        "tokenizer_json_arg": args.tokenizer_json,
+        "tokenizer_json_arg": tokenizer_json,
         "train_docs": split.train_docs,
         "val_docs": split.val_docs,
         "split_seed": split.seed,
