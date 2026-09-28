@@ -580,9 +580,48 @@ class TrainingHistory:
     #: token-budget stop state (additive; default = no budget -> False)
     budget_reached: bool = False
     token_budget: Optional[int] = None
+    # --- numerical-stability state (hardening pass; always-on detection) ---
+    #: structured records of every skipped NaN/Inf step (see train_epochs).
+    bad_step_events: List[Dict[str, Any]] = field(default_factory=list)
+    #: total bad steps across the whole run (all sessions).
+    total_bad_steps: int = 0
+    #: bad steps since the last good step (drives the abort policy).
+    consecutive_bad_steps: int = 0
+    #: pre-clip total grad norm of the last clipped step (None when --grad-clip
+    #: is off — the default).
+    last_grad_norm: Optional[float] = None
+    #: loss of the most recent good step (the epoch-mean counterpart is in the
+    #: rows; this is the last single-step value, useful in abort reports).
+    last_good_loss: Optional[float] = None
+    #: most recent intra-epoch (--save-every-tokens) checkpoint path, if any.
+    last_periodic_checkpoint: Optional[str] = None
+    #: set when the run aborts after K consecutive bad steps.
+    aborted: bool = False
+    abort_reason: Optional[str] = None
+    #: TOTAL attempted steps across the run (good + bad). Equals the executed-
+    #: step count on healthy runs; on aborts it is the honest "how far did the
+    #: loop get" number (executed = attempts - total_bad_steps).
+    attempts: int = 0
 
     def row(self, epoch: int) -> EpochRow:
         return next(r for r in self.rows if r.epoch == epoch)
+
+
+class BadStepsAbort(RuntimeError):
+    """Raised by :func:`train_epochs` after ``--max-consecutive-bad-steps``
+    consecutive NaN/Inf steps.
+
+    Carries the partially-built :class:`TrainingHistory` (bad-step events,
+    counters, abort reason) so :func:`train_run` can still write an honest
+    ``metrics.json`` + finish-stamped ``train_run_metadata.json`` sidecar
+    before re-raising. The last safety checkpoint holds the last-good weights
+    and is fully resume-able (``--resume <out-dir>`` picks it as the
+    numeric-newest valid checkpoint).
+    """
+
+    def __init__(self, message: str, *, history: TrainingHistory) -> None:
+        super().__init__(message)
+        self.history = history
 
 
 def evaluate(
@@ -637,6 +676,7 @@ def save_checkpoint(
     tokens_consumed: Optional[int] = None,
     run_metadata: Optional[dict] = None,
     tokenizer_fingerprint: Optional[str] = None,
+    last_grad_norm: Optional[float] = None,
 ) -> None:
     """One checkpoint artifact: weights + config + step + losses + tokenizer info.
 
@@ -645,6 +685,17 @@ def save_checkpoint(
     ``rng_state``, ``epoch``, ``tokenizer_fingerprint``) are additive, so
     checkpoints written before this change still load for eval/generation, and
     new checkpoints load in any old reader.
+
+    This is the trainer's SINGLE checkpoint writer — epoch-end checkpoints,
+    intra-epoch ``--save-every-tokens`` checkpoints and NaN/Inf safety
+    checkpoints all go through it (no duplicated save logic anywhere).
+
+    The write is **atomic** (serialize to ``<path>.tmp``, then ``os.replace``):
+    a crash mid-save can never leave a truncated ``step-<N>.pt`` that the
+    numeric-newest resume scan would otherwise select. ``last_grad_norm`` is
+    the pre-clip total grad norm of the most recent clipped step
+    (``--grad-clip`` > 0; ``None`` when clipping is off or before the first
+    clipped step).
     """
     cfg = model.config
     if tokenizer_fingerprint is None:
@@ -677,8 +728,14 @@ def save_checkpoint(
         "tokens_consumed": None if tokens_consumed is None else int(tokens_consumed),
         # Run-metadata sidecar (additive; the SAME dict as train_run_metadata.json).
         "run_metadata": run_metadata,
+        #: pre-clip total grad norm of the most recent clipped step (D2) —
+        #: ``None`` when --grad-clip is off. The *flag* lives in
+        #: run_metadata.training_config; this is the dynamic value.
+        "last_grad_norm": None if last_grad_norm is None else float(last_grad_norm),
     }
-    torch.save(payload, path)
+    tmp_path = path + ".tmp"
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, path)
 
 
 def load_checkpoint(path: str) -> dict:
@@ -704,6 +761,9 @@ def train_epochs(
     warmup_tokens: int = 0,
     lr_decay: str = "none",
     run_metadata: Optional[dict] = None,
+    save_every_tokens: int = 0,
+    grad_clip: float = 0.0,
+    max_consecutive_bad_steps: int = 3,
 ) -> TrainingHistory:
     """Train the model on the streamed train split, epoch by epoch.
 
@@ -722,7 +782,10 @@ def train_epochs(
     runs from ``resume.epoch + 1`` to ``epochs``. Because the pipeline is
     fully deterministic (fixed seed, no RNG in the data path, no dropout),
     a resumed run is bit-identical to an uninterrupted run that never stopped
-    — asserted by ``tests/test_training.py::test_resume_bit_exact``.
+    — asserted by ``tests/test_training.py::test_resume_bit_exact``. See
+    §13.2 of docs/trainer.md for the exact mid-epoch resume semantics (the
+    remainder of a partially-completed epoch is NOT re-trained; the next epoch
+    re-streams from its start, and ``tokens_consumed`` is exact either way).
 
     Token budget (DELIVERABLE 2): with ``token_budget`` set, training stops as
     soon as tokens consumed SINCE RUN START (restored from the checkpoint on
@@ -735,9 +798,27 @@ def train_epochs(
     linearly over the first W tokens; ``lr_decay="cosine"`` decays ``lr`` to
     ``MIN_LR_RATIO * lr`` over the budget after warmup. Defaults reproduce the
     fixed-LR trainer exactly (``lr_at`` == ``lr`` at every step). The schedule
-    only sets ``param_groups[0]["lr"]`` per step — gradient clipping and
-    NaN/Inf detection (wherever present) wrap the optimizer step and are
-    untouched by the schedule.
+    only sets ``param_groups[0]["lr"]`` per step.
+
+    Numerical-stability guards (hardening pass — detection is ALWAYS on):
+
+    * **Loss finiteness** is checked *before* ``backward`` and **gradient
+      finiteness** *after* it. On a bad step (NaN/Inf loss or any non-finite
+      gradient): the optimizer step is skipped entirely, a loud structured
+      event is recorded (``history.bad_step_events`` → ``metrics.json``: step,
+      tokens consumed, tensor, stat), a **safety checkpoint** of the last-good
+      state is written immediately (`step-<N>.pt`, see :func:`save_checkpoint`),
+      and after ``max_consecutive_bad_steps`` consecutive bad steps the run
+      aborts with :class:`BadStepsAbort` (the last safety checkpoint is the
+      recoverable state). A good step resets the consecutive counter.
+    * **Gradient clipping** with ``grad_clip`` > 0 runs
+      ``torch.nn.utils.clip_grad_norm_`` after the finiteness check; the
+      PRE-clip total norm is recorded in ``history.last_grad_norm`` and written
+      into every subsequent checkpoint + ``metrics.json``. ``grad_clip == 0``
+      (default) leaves the optimizer step untouched.
+    * **Intra-epoch checkpoints** with ``save_every_tokens`` > 0 write a
+      regular v1 checkpoint (same writer, atomic) every N consumed tokens,
+      keyed to absolute multiples of N since run start (restored on resume).
     """
     set_seed(seed)
     schedule = TokenSchedule(lr=lr, warmup_tokens=warmup_tokens, decay=lr_decay,
@@ -801,6 +882,77 @@ def train_epochs(
                 token_budget, tokens_consumed,
             )
             history.budget_reached = True
+    # Tokenizer identity for checkpoint payloads is fixed for the whole run;
+    # compute once so the periodic/safety/epoch-end writers all share it.
+    ckpt_fp: Optional[str] = None
+    if tokenizer_path:
+        ckpt_fp = tokenizer_file_sha256(tokenizer_path)
+    elif run_metadata is not None:
+        ckpt_fp = (run_metadata.get("tokenizer") or {}).get("sha256")
+    # Periodic-checkpoint cadence: absolute multiples of save_every_tokens
+    # since run start (restored on resume), so a disconnect loses at most ~N
+    # newly-consumed tokens no matter how many sessions the run has had.
+    last_periodic_multiple = (
+        tokens_consumed // save_every_tokens if save_every_tokens > 0 else 0
+    )
+
+    def handle_bad_step(
+        step_no: int,
+        tokens_before: int,
+        tensor: str,
+        stat: str,
+        loss_value: Optional[float],
+    ) -> None:
+        """One NaN/Inf step: skip the optimizer step entirely, persist the
+        last-good state as a safety checkpoint, record the event, and abort
+        once ``max_consecutive_bad_steps`` consecutive bad steps accumulate."""
+        history.consecutive_bad_steps += 1
+        history.total_bad_steps += 1
+        ckpt_path = os.path.join(out_dir, f"step-{step_no}.pt")
+        ckpt_loss = (
+            history.last_good_loss
+            if history.last_good_loss is not None
+            else float("nan")
+        )
+        save_checkpoint(
+            ckpt_path, model, step_no, ckpt_loss, None, tokenizer_path,
+            optimizer=opt, rng_state=capture_rng_state(), epoch=epoch,
+            tokens_consumed=tokens_before, run_metadata=run_metadata,
+            tokenizer_fingerprint=ckpt_fp, last_grad_norm=history.last_grad_norm,
+        )
+        event = {
+            "step": step_no,
+            "tokens_consumed": int(tokens_before),
+            "tensor": tensor,
+            "stat": stat,
+            "loss": None if loss_value is None else float(loss_value),
+            "consecutive_bad_steps": history.consecutive_bad_steps,
+            "checkpoint": os.path.basename(ckpt_path),
+        }
+        history.bad_step_events.append(event)
+        log.error(
+            "BAD STEP epoch=%d step=%d: %s is %s (loss=%s), %d tokens consumed "
+            "before it — optimizer step SKIPPED, safety checkpoint %s written "
+            "(consecutive bad steps %d; abort at %d)",
+            epoch, step_no, tensor, stat,
+            "n/a" if loss_value is None else f"{loss_value:.6g}",
+            tokens_before, os.path.basename(ckpt_path),
+            history.consecutive_bad_steps,
+            max_consecutive_bad_steps if max_consecutive_bad_steps > 0 else 0,
+        )
+        if (
+            max_consecutive_bad_steps > 0
+            and history.consecutive_bad_steps >= max_consecutive_bad_steps
+        ):
+            history.aborted = True
+            history.abort_reason = (
+                f"{history.consecutive_bad_steps} consecutive bad steps (last: "
+                f"{tensor} is {stat} at step {step_no}); run aborted — "
+                f"recoverable last-good state saved at "
+                f"{os.path.basename(ckpt_path)}"
+            )
+            raise BadStepsAbort(history.abort_reason, history=history)
+
     t_run = time.monotonic()
     for epoch in range(start_epoch, epochs + 1):
         if history.budget_reached:
@@ -816,21 +968,80 @@ def train_epochs(
                 break
             x = batch.to(device).long()
             validate_token_ids(x, vocab, where="train batch")
+            # Every ATTEMPT consumes a step number (a bad step is an attempted
+            # step: it gets an event + a safety checkpoint but no weight update
+            # and no tokens) — checkpoint files stay unique and monotonic.
+            global_step += 1
+            steps += 1
+            history.attempts += 1
             # LR schedule: the step's LR is a function of tokens consumed so
             # far (pre-step). Fixed-LR runs (no warmup, decay "none") always
             # resolve to the caller's lr — bit-identical to the old trainer.
             opt.param_groups[0]["lr"] = schedule.lr_at(tokens_consumed)
             logits, _ = model(x[:, :-1])
             loss = loss_fn(logits.reshape(-1, vocab), x[:, 1:].reshape(-1))
+            # ---- loss finiteness BEFORE backward (always on) ----
+            if not torch.isfinite(loss):
+                stat = "nan" if torch.isnan(loss.detach()) else "inf"
+                handle_bad_step(
+                    global_step, tokens_consumed, "loss", stat,
+                    float(loss.detach()),
+                )
+                continue
             opt.zero_grad()
             loss.backward()
+            # ---- gradient finiteness AFTER backward (always on) ----
+            bad_param: Optional[str] = None
+            bad_grad: Optional[torch.Tensor] = None
+            for pname, p in model.named_parameters():
+                if p.grad is not None and not torch.isfinite(p.grad).all():
+                    bad_param, bad_grad = pname, p.grad
+                    break
+            if bad_param is not None:
+                assert bad_grad is not None
+                stat = "nan" if torch.isnan(bad_grad).any() else "inf"
+                handle_bad_step(
+                    global_step, tokens_consumed, f"grad:{bad_param}", stat, None
+                )
+                continue
+            # ---- gradient clipping (records the PRE-clip total norm) ----
+            if grad_clip > 0:
+                history.last_grad_norm = float(
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                )
             opt.step()
-            epoch_losses.append(float(loss.detach()))
+            history.consecutive_bad_steps = 0
+            step_loss = float(loss.detach())
+            epoch_losses.append(step_loss)
+            history.last_good_loss = step_loss
             step_tokens = int(x[:, 1:].numel())
             tokens_consumed += step_tokens
             history.tokens_processed = tokens_consumed
-            steps += 1
-            global_step += 1
+            # ---- intra-epoch periodic checkpoint (--save-every-tokens) ----
+            if save_every_tokens > 0:
+                multiple = tokens_consumed // save_every_tokens
+                if multiple > last_periodic_multiple:
+                    last_periodic_multiple = multiple
+                    pckpt_path = os.path.join(
+                        out_dir, f"step-{global_step}.pt"
+                    )
+                    save_checkpoint(
+                        pckpt_path, model, global_step,
+                        sum(epoch_losses) / len(epoch_losses), None,
+                        tokenizer_path, optimizer=opt,
+                        rng_state=capture_rng_state(), epoch=epoch,
+                        tokens_consumed=tokens_consumed,
+                        run_metadata=run_metadata,
+                        tokenizer_fingerprint=ckpt_fp,
+                        last_grad_norm=history.last_grad_norm,
+                    )
+                    history.last_periodic_checkpoint = pckpt_path
+                    log.info(
+                        "periodic checkpoint %s (epoch %d step %d, %d tokens "
+                        "consumed)",
+                        os.path.basename(pckpt_path), epoch, global_step,
+                        tokens_consumed,
+                    )
             if token_budget is not None and tokens_consumed >= token_budget:
                 history.budget_reached = True
                 break
@@ -847,18 +1058,11 @@ def train_epochs(
             else None
         )
         ckpt_path = os.path.join(out_dir, f"step-{global_step}.pt")
-        # On the packed path without a tokenizer sidecar file, the recorded
-        # identity is the manifest's tokenizer sha256 (from run_metadata).
-        ckpt_fp = None
-        if tokenizer_path:
-            ckpt_fp = tokenizer_file_sha256(tokenizer_path)
-        elif run_metadata is not None:
-            ckpt_fp = (run_metadata.get("tokenizer") or {}).get("sha256")
         save_checkpoint(
             ckpt_path, model, global_step, train_loss, val_loss, tokenizer_path,
             optimizer=opt, rng_state=capture_rng_state(), epoch=epoch,
             tokens_consumed=tokens_consumed, run_metadata=run_metadata,
-            tokenizer_fingerprint=ckpt_fp,
+            tokenizer_fingerprint=ckpt_fp, last_grad_norm=history.last_grad_norm,
         )
         row = EpochRow(
             epoch=epoch,
@@ -960,6 +1164,33 @@ def make_arg_parser() -> argparse.ArgumentParser:
                    help="LR decay after warmup: 'none' (default, fixed LR) or "
                         "'cosine' — cosine from --lr down to 10% of it over "
                         "--token-budget (requires --token-budget).")
+    p.add_argument("--save-every-tokens", type=int, default=0, metavar="N",
+                   help="write an intra-epoch checkpoint every N consumed "
+                        "tokens (0 = the default epoch-end-only cadence). Same "
+                        "v1 format + embedded run metadata as epoch-end "
+                        "checkpoints, through the same atomic writer; cadence "
+                        "is keyed to absolute multiples of N since run start "
+                        "(restored on resume), so a disconnect loses at most "
+                        "~N newly-consumed tokens. For a T4 run at ~2K "
+                        "tok/s, N = one epoch's tokens is the natural value.")
+    p.add_argument("--grad-clip", type=float, default=0.0, metavar="N",
+                   help="max_grad_norm for torch.nn.utils.clip_grad_norm_ "
+                        "after backward (0 = off, the default — the optimizer "
+                        "step is byte-identical to the pre-hardening trainer). "
+                        "The PRE-clip total grad norm of each clipped step is "
+                        "recorded in metrics.json and in every subsequent "
+                        "checkpoint; the setting is recorded in the run "
+                        "metadata's gradient_clip_type.")
+    p.add_argument("--max-consecutive-bad-steps", type=int, default=3,
+                   metavar="K",
+                   help="abort the run with a recoverable checkpoint after K "
+                        "consecutive NaN/Inf steps (default 3; 0 = never "
+                        "abort — bad steps are still skipped and safety-"
+                        "checkpointed). NaN/Inf loss + gradient detection is "
+                        "ALWAYS on: a bad step skips the optimizer step "
+                        "entirely, logs a structured event (step, tokens, "
+                        "tensor, stat) into metrics.json, and immediately "
+                        "writes a safety checkpoint of the last-good state.")
     p.add_argument("--max-steps-per-epoch", type=int, default=None,
                    help="cap steps per epoch (CI / smoke runs)")
     p.add_argument("--val-max-steps", type=int, default=None,
@@ -988,6 +1219,25 @@ def _verify_and_load_tokenizer(
             "tokenizer"
         )
     return ByteLevelBPETokenizer.from_file(path)
+
+
+def _write_final_artifacts(
+    out_dir: str, run_metadata: Dict[str, Any], metrics: dict
+) -> None:
+    """Stamp the finish time into the sidecar, then persist sidecar + metrics.
+
+    Shared by the clean-finish and :class:`BadStepsAbort` paths so an aborted
+    run leaves exactly the same artifacts (plus its bad-step records + abort
+    reason) as a clean one. Checkpoints carry the START-time dict — only
+    ``timestamps.finished`` is filled in here, after training.
+    """
+    run_metadata.setdefault("timestamps", {})["finished"] = (
+        datetime.now(timezone.utc).isoformat()
+    )
+    write_run_metadata(out_dir, run_metadata)
+    with open(os.path.join(out_dir, "metrics.json"), "w", encoding="utf-8") as fh:
+        json.dump(metrics, fh, indent=2)
+        fh.write("\n")
 
 
 def train_run(args: argparse.Namespace) -> dict:
@@ -1024,6 +1274,23 @@ def train_run(args: argparse.Namespace) -> dict:
     token_budget = getattr(args, "token_budget", None)
     warmup_tokens = getattr(args, "warmup_tokens", 0) or 0
     lr_decay = getattr(args, "lr_decay", "none")
+    # --- hardening-pass flags (D1/D2/D3; additive, defaults = old behavior) --
+    save_every_tokens = getattr(args, "save_every_tokens", 0) or 0
+    grad_clip = getattr(args, "grad_clip", 0.0) or 0.0
+    max_consecutive_bad_steps = getattr(args, "max_consecutive_bad_steps", 3)
+    if max_consecutive_bad_steps is None:
+        max_consecutive_bad_steps = 3
+    if save_every_tokens < 0:
+        raise ValueError(
+            f"--save-every-tokens must be >= 0, got {save_every_tokens}"
+        )
+    if grad_clip < 0:
+        raise ValueError(f"--grad-clip must be >= 0, got {grad_clip}")
+    if max_consecutive_bad_steps < 0:
+        raise ValueError(
+            f"--max-consecutive-bad-steps must be >= 0, got "
+            f"{max_consecutive_bad_steps} (0 = never abort)"
+        )
     if packed_dir_arg and args.data:
         raise ValueError("pass exactly one of --data / --packed-dir, not both")
     data_src = "packed" if packed_dir_arg else ("jsonl" if args.data else None)
@@ -1327,11 +1594,16 @@ def train_run(args: argparse.Namespace) -> dict:
         "epochs": args.epochs,
         "max_steps_per_epoch": args.max_steps_per_epoch,
         "seed": args.seed,
-        #: this trainer has no gradient-clipping/NaN-detection step of its own
-        #: (those guard layers live notebook-side and wrap the optimizer step
-        #: unchanged); recorded explicitly for the record.
-        "gradient_clip_type": None,
-        "nan_inf_detection": False,
+        #: numerical-stability guards live IN this trainer (hardening pass):
+        #: NaN/Inf loss+gradient detection is always on; --grad-clip configures
+        #: torch.nn.utils.clip_grad_norm_ after backward (0 = off); a bad step
+        #: skips the optimizer step, writes a safety checkpoint, and after
+        #: --max-consecutive-bad-steps consecutive failures the run aborts.
+        "gradient_clip_type": ("max_grad_norm" if grad_clip > 0 else None),
+        "grad_clip_max_norm": (float(grad_clip) if grad_clip > 0 else None),
+        "nan_inf_detection": True,
+        "max_consecutive_bad_steps": max_consecutive_bad_steps,
+        "save_every_tokens": save_every_tokens,
         "device": str(device),
     }
     tokenizer_meta = {
@@ -1410,85 +1682,137 @@ def train_run(args: argparse.Namespace) -> dict:
     print(f"  run metadata  : {metadata_path}")
 
     # ---- 5) train with per-epoch validation + checkpoints ----------------
-    history = train_epochs(
-        model, train_ds, val_ds,
-        out_dir=out_dir,
-        tokenizer_path=tokenizer_path,
-        lr=args.lr,
-        epochs=args.epochs,
-        device=device,
-        seed=args.seed,
-        max_steps_per_epoch=args.max_steps_per_epoch,
-        val_max_steps=args.val_max_steps,
-        resume_from=resume_ckpt,
-        token_budget=token_budget,
-        warmup_tokens=warmup_tokens,
-        lr_decay=lr_decay,
-        run_metadata=run_metadata,
-    )
+    def _assemble_metrics(history: TrainingHistory) -> dict:
+        """The run report dict; shared by the clean-finish and abort paths so
+        an aborted run records exactly the same fields (plus its bad-step
+        events + abort reason)."""
+        last = history.rows[-1] if history.rows else None
+        return {
+            "format": "talos-oasst1-training-metrics-v1",
+            "params": n_params,
+            "vocab_size": cfg.vocab_size,
+            "tokenizer_vocab_size": tokenizer_meta["vocab_size"],
+            "tokenizer_merges": tokenizer_meta["merges"],
+            #: content identity of the tokenizer that produced/owns the tokens
+            #: (sha256 of out_dir/tokenizer.json, or the packed manifest's record).
+            "tokenizer_sha256": tokenizer_meta["sha256"],
+            "tokenizer_origin": tokenizer_origin,
+            "tokenizer_json_arg": tokenizer_json,
+            "data_source": data_src,
+            "train_docs": split.train_docs if split is not None else None,
+            "val_docs": split.val_docs if split is not None else None,
+            "split_seed": split.seed if split is not None else None,
+            "train_rows": (
+                packed_manifest["metadata"]["counts"]["train_rows"]
+                if packed_manifest is not None else None
+            ),
+            "val_rows": (
+                packed_manifest["metadata"]["counts"]["val_rows"]
+                if packed_manifest is not None else None
+            ),
+            "resumed_from": os.path.abspath(resume_path) if args.resume else None,
+            "epochs": [asdict(r) for r in history.rows],
+            "final_train_loss": last.train_loss if last else None,
+            "final_val_loss": last.val_loss if last else None,
+            "tokens_processed": history.tokens_processed,
+            # token-budget accounting (DELIVERABLE 2) — budget, consumed, steps:
+            "token_budget": token_budget,
+            "tokens_consumed": history.tokens_processed,
+            "steps": history.attempts,
+            "budget_reached": history.budget_reached,
+            "lr_schedule": TokenSchedule(
+                lr=args.lr, warmup_tokens=warmup_tokens, decay=lr_decay,
+                budget=token_budget,
+            ).to_dict(),
+            "wall_s": round(time.monotonic() - t0, 3),
+            "peak_rss_mb": round(
+                resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, 1
+            ),
+            "device": str(device),
+            "checkpoint": last.checkpoint if last else None,
+            "tokenizer_path": tokenizer_path,
+            "run_metadata_file": RUN_METADATA_FILENAME,
+            # --- numerical-stability records (hardening pass) ---
+            #: the --grad-clip setting actually in force (None = off).
+            "grad_clip_max_norm": (float(grad_clip) if grad_clip > 0 else None),
+            "nan_inf_detection": True,
+            "max_consecutive_bad_steps": max_consecutive_bad_steps,
+            "save_every_tokens": save_every_tokens,
+            #: pre-clip total grad norm of the most recent clipped step.
+            "last_grad_norm": history.last_grad_norm,
+            #: loss of the most recent GOOD step (None if no good step yet).
+            "last_good_loss": history.last_good_loss,
+            #: every skipped NaN/Inf step, structured (step, tokens, tensor,
+            #: stat, safety checkpoint), in execution order.
+            "bad_steps": [dict(e) for e in history.bad_step_events],
+            "total_bad_steps": history.total_bad_steps,
+            "consecutive_bad_steps": history.consecutive_bad_steps,
+            #: None on a clean finish; {reason, last_checkpoint} on a BadStepsAbort.
+            "aborted": (
+                {
+                    "reason": history.abort_reason,
+                    "last_checkpoint": (
+                        history.bad_step_events[-1]["checkpoint"]
+                        if history.bad_step_events else None
+                    ),
+                }
+                if history.aborted else None
+            ),
+            #: most recent intra-epoch (--save-every-tokens) checkpoint, if any.
+            "periodic_checkpoint": history.last_periodic_checkpoint,
+        }
+
+    try:
+        history = train_epochs(
+            model, train_ds, val_ds,
+            out_dir=out_dir,
+            tokenizer_path=tokenizer_path,
+            lr=args.lr,
+            epochs=args.epochs,
+            device=device,
+            seed=args.seed,
+            max_steps_per_epoch=args.max_steps_per_epoch,
+            val_max_steps=args.val_max_steps,
+            resume_from=resume_ckpt,
+            token_budget=token_budget,
+            warmup_tokens=warmup_tokens,
+            lr_decay=lr_decay,
+            run_metadata=run_metadata,
+            save_every_tokens=save_every_tokens,
+            grad_clip=grad_clip,
+            max_consecutive_bad_steps=max_consecutive_bad_steps,
+        )
+    except BadStepsAbort as exc:
+        # The abort is a DELIBERATE stop: write the same artifacts a clean
+        # finish would (metrics + finish-stamped sidecar, now including the
+        # bad-step events + abort reason), then propagate so the process exits
+        # non-zero and the operator sees the loud abort line.
+        history = exc.history if exc.history is not None else TrainingHistory()
+        metrics = _assemble_metrics(history)
+        _write_final_artifacts(out_dir, run_metadata, metrics)
+        print(
+            f"\n  ABORTED after {history.consecutive_bad_steps} consecutive "
+            f"NaN/Inf steps: {exc}\n  metrics + recoverable checkpoint "
+            f"written to {out_dir}",
+            file=sys.stderr,
+        )
+        raise
 
     # ---- 6) metrics ---------------------------------------------------------
-    steps_taken = sum(r.steps for r in history.rows)
+    metrics = _assemble_metrics(history)
+    _write_final_artifacts(out_dir, run_metadata, metrics)
     last = history.rows[-1] if history.rows else None
-    metrics = {
-        "format": "talos-oasst1-training-metrics-v1",
-        "params": n_params,
-        "vocab_size": cfg.vocab_size,
-        "tokenizer_vocab_size": tokenizer_meta["vocab_size"],
-        "tokenizer_merges": tokenizer_meta["merges"],
-        #: content identity of the tokenizer that produced/owns the tokens
-        #: (sha256 of out_dir/tokenizer.json, or the packed manifest's record).
-        "tokenizer_sha256": tokenizer_meta["sha256"],
-        "tokenizer_origin": tokenizer_origin,
-        "tokenizer_json_arg": tokenizer_json,
-        "data_source": data_src,
-        "train_docs": split.train_docs if split is not None else None,
-        "val_docs": split.val_docs if split is not None else None,
-        "split_seed": split.seed if split is not None else None,
-        "train_rows": (
-            packed_manifest["metadata"]["counts"]["train_rows"]
-            if packed_manifest is not None else None
-        ),
-        "val_rows": (
-            packed_manifest["metadata"]["counts"]["val_rows"]
-            if packed_manifest is not None else None
-        ),
-        "resumed_from": os.path.abspath(resume_path) if args.resume else None,
-        "epochs": [asdict(r) for r in history.rows],
-        "final_train_loss": last.train_loss if last else None,
-        "final_val_loss": last.val_loss if last else None,
-        "tokens_processed": history.tokens_processed,
-        # token-budget accounting (DELIVERABLE 2) — budget, consumed, steps:
-        "token_budget": token_budget,
-        "tokens_consumed": history.tokens_processed,
-        "steps": steps_taken,
-        "budget_reached": history.budget_reached,
-        "lr_schedule": TokenSchedule(
-            lr=args.lr, warmup_tokens=warmup_tokens, decay=lr_decay,
-            budget=token_budget,
-        ).to_dict(),
-        "wall_s": round(time.monotonic() - t0, 3),
-        "peak_rss_mb": round(
-            resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, 1
-        ),
-        "device": str(device),
-        "checkpoint": last.checkpoint if last else None,
-        "tokenizer_path": tokenizer_path,
-        "run_metadata_file": RUN_METADATA_FILENAME,
-    }
-    # Stamp the finish time into the sidecar (checkpoints carry the start-time
-    # dict — same payload, only "finished" is filled in after training).
-    run_metadata.setdefault("timestamps", {})["finished"] = (
-        datetime.now(timezone.utc).isoformat()
-    )
-    write_run_metadata(out_dir, run_metadata)
-    with open(os.path.join(out_dir, "metrics.json"), "w", encoding="utf-8") as fh:
-        json.dump(metrics, fh, indent=2)
-        fh.write("\n")
     print(f"\n  final train loss  : {last.train_loss if last else 'n/a'}")
     print(f"  final val loss    : {last.val_loss if last and last.val_loss is not None else 'n/a'}")
     print(f"  tokens            : {history.tokens_processed:,} consumed"
           + (f" / budget {token_budget:,} (REACHED)" if history.budget_reached else ""))
+    if history.total_bad_steps:
+        print(f"  bad steps         : {history.total_bad_steps} total "
+              f"({history.consecutive_bad_steps} consecutive at finish) — "
+              f"see metrics.json 'bad_steps'")
+    if grad_clip > 0:
+        print(f"  grad clip         : max_norm {grad_clip:g} "
+              f"(last pre-clip norm {history.last_grad_norm})")
     print(f"  wall time         : {metrics['wall_s']} s")
     print(f"  peak RSS          : {metrics['peak_rss_mb']} MiB")
     print(f"  checkpoint        : {metrics['checkpoint']}")
@@ -1500,6 +1824,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = make_arg_parser().parse_args(argv)
     try:
         train_run(args)
+    except BadStepsAbort as exc:
+        # Deliberate post-K-consecutive-bad-steps stop; metrics.json + the
+        # recoverable safety checkpoint were already written by train_run.
+        print(f"error: {exc}", file=sys.stderr)
+        return 3
     except (FileNotFoundError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

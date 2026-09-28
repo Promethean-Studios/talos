@@ -40,11 +40,11 @@ script. Those are stated as MISSING and specified, not implied to exist.**
 | 19 | Validation per epoch (held-out val loss; mean CE → perplexity via eval harness) | CURRENT | `scripts/train_oasst1.py:588-625`, `evaluation/harness.py:80-99` |
 | 20 | Eval CLI (`scripts/eval_checkpoint.py`) + generation CLI (`scripts/generate.py`) | CURRENT | `scripts/eval_checkpoint.py:47-85`, `scripts/generate.py:265-291` |
 | 21 | Safetensors release export for the 100M preset | CURRENT | `scripts/export_safetensors.py:309-312` (+ tests `tests/test_safetensors_io.py`) |
-| 22 | Grad clipping / NaN-Inf detection in the trainer loop | **MISSING** — trainer metadata explicitly records `gradient_clip_type: None`, `nan_inf_detection: False`; a code comment claims the guards "live notebook-side", but the current shared Colab generator (`shared/colab/gen_notebook.py`) contains neither | `scripts/train_oasst1.py:1330-1334`, `:738-739` |
-| 23 | Super-save / intra-epoch checkpointing | **MISSING** — checkpoints are written once per epoch end only; no `--super-save-every` flag anywhere in the repo or notebook generator | `scripts/train_oasst1.py:842-867` |
+| 22 | Grad clipping / NaN-Inf detection in the trainer loop | **CURRENT** (hardening pass) — loss finiteness checked before `backward`, gradient finiteness after, on EVERY step; a bad step skips the optimizer update, logs a structured event into `metrics.json`, writes a safety checkpoint, and aborts after `--max-consecutive-bad-steps` (default 3). `--grad-clip` bounds the total grad norm and records the pre-clip norm | `scripts/train_oasst1.py:979-1018` (loop guards), `:895-950` (`handle_bad_step`), `:606-620` (`BadStepsAbort`), metadata `:1573-1582` |
+| 23 | Super-save / intra-epoch checkpointing | **CURRENT** — `--save-every-tokens N` writes an atomic v1 checkpoint at every absolute multiple of N tokens since run start (restored on resume), through the same single checkpoint writer; epoch-end checkpoints unchanged | `scripts/train_oasst1.py:1015-1039` (periodic), `:661-734` (single writer + atomic `os.replace`), flag `:1162-1170` |
 | 24 | Benchmark mode (s/step, tok/s, peak VRAM) | **MISSING** — no trainer-side benchmark flag (spec in §17) | n/a |
 | 25 | Preflight gate script (`scripts/preflight.py`) | **MISSING** — proposed in §16 | n/a |
-| 26 | GPU-memory / ETA logging in the trainer | **MISSING** — only host peak RSS and wall time are recorded | `scripts/train_oasst1.py:1478-1479` |
+| 26 | GPU-memory / ETA logging in the trainer | **MISSING (partially improved)** — still no VRAM/ETA sampling, ONLY host peak RSS + wall time; the hardening pass DID add grad-norm / bad-step / abort records to `metrics.json` (see §15.2) | `scripts/train_oasst1.py:1704-1739` (stability metrics) — GPU/ETA itself remains n/a |
 | 27 | FP16/AMP training | **MISSING + FORBIDDEN** — owner-reported fp16 failure (see §11, §28); BF16 unsupported on T4; FP32 is the only mode | n/a |
 | 28 | Google Drive layout / Drive storage preflight | **PROPOSED** — a deployment convention, not code (§14) | n/a |
 | 29 | Colab T4 tool / path (platform) | PARTIAL — lead-side Colab tool registered but connection times out (re-tested 2026-09-27); manual notebooks at `shared/colab/` are the working fallback | `shared/colab/README.md` |
@@ -144,24 +144,19 @@ Two hard constraints from the plan:
 ---
 
 ## 3. Current Implementation Status
-
 Everything an uninterrupted (or resumed) pretraining run needs end-to-end is **CURRENT**:
-
-- preset → model → parameter-count guard (fail-fast) → packed data → token-budget schedule →
-  per-epoch train/val → checkpoint (v1, resume-capable) → metadata → metrics → resume; plus
-  eval and generation entrypoints for the finished run.
-
-Everything that protects a **long unattended Colab campaign** is **MISSING and specified** here:
-
-- gradient clipping, NaN/Inf loss+grad detection and abort-with-checkpoint semantics (§12);
-- super-save / intra-epoch checkpoints (§13);
+- preset -> model -> parameter-count guard (fail-fast) -> packed data -> token-budget schedule ->
+  per-epoch train/val -> checkpoint (v1, resume-capable, atomic, three cadences: epoch-end /
+  `--save-every-tokens` / NaN-safety) -> metadata -> metrics -> resume; plus eval and generation
+  entrypoints for the finished run.
+- **Numerical stability is CURRENT (hardening pass 2026-09-27):** NaN/Inf loss+grad detection
+  always-on in the loop; bad steps skipped + safety-checkpointed + logged to `metrics.json`;
+  abort after 3 consecutive bad steps with a recoverable checkpoint; `--grad-clip` with pre-clip
+  norm recording; atomic `.pt` writes (§12, §13).
+Still **MISSING and specified** here (unchanged by the hardening pass):
 - a benchmark mode and GPU-memory/ETA logging (§15, §17);
-- a preflight gate script (§16).
-
-These are honest gaps: the trainer's own metadata names them (`gradient_clip_type: None`,
-`nan_inf_detection: False`, `scripts/train_oasst1.py:1330-1334`), and no wrapper in the repo or the
-shared Colab notebooks provides them either (verified by grep on 2026-09-27).
-
+- a preflight gate script (§16);
+- the 100M Colab notebook and packed-aware eval path (§29).
 ---
 
 ## 4. Hardware / Runtime
@@ -428,7 +423,7 @@ Only `lr` is configurable. **Everything else is torch AdamW default**:
 | `betas` | `(0.9, 0.999)` | **NEEDS IMPLEMENTATION** (not exposed) |
 | `eps` | `1e-8` | **NEEDS IMPLEMENTATION** (not exposed) |
 | `weight_decay` | `0.01` (AdamW default) | **NEEDS IMPLEMENTATION** (not exposed) |
-| gradient clipping | none | **MISSING** — see §12 |
+| gradient clipping | `--grad-clip N` default **0 = off** (§12) | **CURRENT** — `torch.nn.utils.clip_grad_norm_` after backward; pre-clip norm recorded |
 | gradient accumulation | none (batch == micro-batch == optimizer step) | **MISSING** if ever needed |
 
 ### 10.2 LR schedule (CURRENT; `TokenSchedule`, `:127-198`)
@@ -452,10 +447,10 @@ Only `lr` is configurable. **Everything else is torch AdamW default**:
 
 | Event | Frequency | Where |
 |---|---|---|
-| validation pass | **once per epoch end** (`:844-847`) | no intra-epoch val; an epoch on the packed path = one pass over the whole packed train stream |
-| checkpoint (`step-<N>.pt`) | **once per epoch end** (`:842-868`) | the ONLY checkpoint cadence; a long epoch ⇒ large unsaved window (see §13 super-save MISSING) |
-| `metrics.json` / metadata | written once at run end (`:1426-1494`) | per-epoch losses are inside `metrics.json → epochs[]` and the live stdout line |
-| budget stop | mid-epoch allowed: the partial epoch still gets val + a checkpoint (`:828-840`, `:853-856`) | budget break does NOT skip the epoch-end checkpoint |
+| validation pass | **once per epoch end** | no intra-epoch val; an epoch on the packed path = one pass over the whole packed train stream |
+| checkpoint (`step-<N>.pt`) | **epoch end** (always) + **`--save-every-tokens N`** (intra-epoch, at every absolute multiple of N tokens since run start — restored on resume) + **safety checkpoints** on every skipped NaN/Inf step (§12) | one shared atomic writer (`save_checkpoint`) |
+| `metrics.json` / metadata | written at run end — **and on a NaN-abort** (`BadStepsAbort` still writes metrics + finish-stamped sidecar) | shared `_write_final_artifacts` |
+| budget stop | mid-epoch allowed: the partial epoch still gets val + a checkpoint | budget break does NOT skip the epoch-end checkpoint |
 
 ---
 
@@ -507,63 +502,89 @@ budget to wall-clock: `budget / tok_s`.
 
 ---
 
-## 12. Numerical Stability (AUDITED — gaps are real)
+## 12. Numerical Stability (IMPLEMENTED — hardening pass 2026-09-27)
 
-Audit result (verified by reading `train_epochs` and grep on 2026-09-27):
+The guards below live **inside the trainer loop** (`train_epochs`,
+`scripts/train_oasst1.py:742-1079`) and are **always on** — no flag disables the
+detection. Verified by reading the loop + the tests in
+`tests/test_trainer_stability.py` (all green, synthetic tiny-preset runs).
 
-| Guard | Status in repo | Evidence |
+| Guard | Status | Where |
 |---|---|---|
-| NaN/Inf loss detection | **MISSING** — no `isfinite`/`isnan` check on loss in `train_epochs` | `scripts/train_oasst1.py:710-860`; grep for `isnan|isfinite` → only `float("nan")` fallback at `:842` |
-| NaN/Inf gradient detection | **MISSING** — no gradient post-check | same loop |
-| gradient clipping | **MISSING** — no `clip_grad_norm_` anywhere in the repo | grep `clip` → only the metadata comment |
-| failed-step behavior / abort semantics | **MISSING** — there is no failure path at all; an exception propagates and the process dies with no checkpoint of the last step | loop structure |
-| checkpoint-before-abort | **MISSING** — nothing saves a checkpoint on error | n/a |
-| Self-reporting of the gap | the run metadata **records the truth**: `"gradient_clip_type": None, "nan_inf_detection": False` | `:1330-1334`; a code comment claims these guards "live notebook-side… wrap the optimizer step unchanged" (`:738-739`) — **but they are absent from the current shared Colab notebooks too** (grep of `shared/colab/gen_notebook.py` + `.ipynb` → nothing on 2026-09-27) |
+| NaN/Inf **loss** detection (BEFORE `backward`) | **CURRENT** — `if not torch.isfinite(loss)` → bad step | `:978-985` |
+| NaN/Inf **gradient** detection (AFTER `backward`) | **CURRENT** — first param with a non-finite `.grad` is identified by name | `:986-1001` |
+| bad-step handling | skip the optimizer step **entirely** (no `backward` for a bad loss, no `opt.step()` for a bad grad — weights keep the last-good state) | `:895-950` (`handle_bad_step`) |
+| loud structured events | one dict per bad step in `history.bad_step_events` → `metrics.json["bad_steps"]`: `{step, tokens_consumed, tensor, stat (nan/inf), loss, consecutive_bad_steps, checkpoint}` + an `ERROR` log line | `:919-938` |
+| safety checkpoint | written IMMEDIATELY on every bad step, same v1 format/atomic writer, named `step-<N>.pt` (N = the attempted step), holding the **last-good** weights/optimizer/RNG + the pre-step `tokens_consumed` | `:907-918` |
+| abort after K consecutive | `--max-consecutive-bad-steps` (default 3; `0` = never abort): after K consecutive bad steps `train_epochs` raises `BadStepsAbort`; `train_run` still writes `metrics.json` + finish-stamps the sidecar, then exits non-zero (code 3). The last safety checkpoint is the recoverable state and passes every resume-validation rule | `:939-950`, `:1742-1776`, `main` `:1819-1831` |
+| consecutive counter | reset to 0 by every good step | `:1008` |
+| gradient clipping | `--grad-clip N` → `torch.nn.utils.clip_grad_norm_` after the finiteness check, BEFORE `opt.step()`; the **PRE-clip** total norm is recorded in `history.last_grad_norm`, every subsequent checkpoint (`last_grad_norm` payload key) and `metrics.json`; `0` (default) = off, step untouched | `:1002-1006`, payload `:727-730` |
+| metadata self-report | `training_config.gradient_clip_type` = `"max_grad_norm"` (or `None` when off), `grad_clip_max_norm` = the numeric value, `nan_inf_detection: True`, `max_consecutive_bad_steps`, `save_every_tokens` — the OLD `None`/`False` literal is gone | `:1573-1582` |
 
-**What must be added before a long unattended run (spec — mark as MISSING):**
+**Behavior on a bad step** (identical for a NaN/Inf loss and a non-finite
+gradient): the step is *attempted* (it consumes a step number, so checkpoint
+filenames stay unique and monotonic) but **no weight update and no
+tokens-consumed increment happen**. The pre-step state is persisted as the
+safety checkpoint; the event is logged; training continues. Only after
+`--max-consecutive-bad-steps` *consecutive* failures does the run abort —
+never silently continue into poisoned weights, and never with an unrecorded
+loss of state (the last-good checkpoint is on disk before the abort
+propagates).
 
-1. Per-step after `loss.backward()`: check `torch.isfinite(loss)` and, optionally,
-   `all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)`.
-2. On non-finite: **save a checkpoint of the current state first** (weights + optimizer as-is),
-   log a loud error, then abort (exit non-zero) — never silently continue into poisoned weights.
-3. Optionally `torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)` before `opt.step()`.
-4. These can live either in the trainer (new flags `--grad-clip` / a NaN-abort policy) or in a
-   notebook/CLI wrapper around the optimizer step **as long as the checkpoint-before-abort
-   requirement is met**. The current repo has neither; the wrapper claim in the trainer comment is
-   not backed by any file found in this repo or `shared/colab`.
+**Not implemented (unchanged):** GPU-memory/ETA logging (§15.3) and the
+preflight script (§16) remain MISSING; the FP16/AMP caveat of §11/§28 still
+holds (this pass adds no AMP — FP32 only).
 
 ---
 
 ## 13. Checkpointing
 
-### 13.1 v1 format (`talos-training-checkpoint-v1`) — fields, from `save_checkpoint` (`:626-683`)
+### 13.1 v1 format (`talos-training-checkpoint-v1`) — fields, from `save_checkpoint` (`:661-734`)
 
 | Field | Content |
 |---|---|
 | `format` | `"talos-training-checkpoint-v1"` |
-| `step` | global optimizer step (monotonic across resume) |
+| `step` | global optimizer step (monotonic across resume; bad steps still consume a number) |
 | `model_config` | `asdict(cfg)` (already derived) |
 | `n_params` | `model.num_parameters()` (checked on resume) |
 | `vocab_size` | `cfg.vocab_size` |
-| `train_loss` / `val_loss` | per-epoch losses |
+| `train_loss` / `val_loss` | epoch mean (epoch-end ckpts) or partial-epoch mean (periodic) / `None` (periodic + safety ckpts) / last-good loss (safety ckpts) |
 | `tokenizer_path` | absolute path of the sidecar `tokenizer.json` (None on manifest-only packed runs) |
 | `tokenizer_fingerprint` | sha256 of the serialized tokenizer (or manifest-recorded sha on packed runs without sidecar) |
-| `model_state_dict` | full weights |
+| `model_state_dict` | full weights — on a safety checkpoint these are the LAST-GOOD weights |
 | `optimizer_state_dict` | AdamW state (resume-enabling, additive; old v1 ckpts lack it → resume refuses) |
 | `rng_state` | torch CPU/GPU + numpy + python RNG snapshots (`capture_rng_state`, `:341-356`) |
-| `epoch` | last completed epoch |
-| `tokens_consumed` | **tokens since run start, including all prior resumed sessions** |
+| `epoch` | last completed epoch (`periodic`/safety ckpts record the epoch being trained) |
+| `tokens_consumed` | **tokens since run start, including all prior resumed sessions**; on safety ckpts the pre-bad-step count |
 | `run_metadata` | the SAME dict as `train_run_metadata.json` |
+| `last_grad_norm` | pre-clip total grad norm of the most recent clipped step (additive; `None` when `--grad-clip` is off) |
+
+**One writer, three cadences.** Epoch-end checkpoints (unchanged), periodic
+intra-epoch checkpoints (`--save-every-tokens`), and NaN/Inf safety checkpoints
+all call the SAME `save_checkpoint` — no duplicated save logic — and all writes
+are **atomic** (`<path>.tmp` + `os.replace`).
 
 ### 13.2 `tokens_consumed` accounting (CURRENT)
 
-- Incremented per step by `B*(S-1)` (`:826-830`); persisted in every checkpoint.
+- Incremented per GOOD step by `B*(S-1)` (a skipped bad step adds no tokens);
+  persisted in every checkpoint.
 - On resume, restored from the checkpoint; for **legacy** checkpoints without the counter the
-  trainer estimates `step × batch × (seq-1)` (exact for constant-shape legacy runs) and warns
-  (`:765-784`).
-- **Budget semantics**: `--token-budget` counts tokens since run start *including resumed ones*
-  (`--tokenizer…`/`--token-budget` help `:950-956`); if the budget is already consumed at resume,
-  the run finishes with no new steps (`:785-800`).
+  trainer estimates `step × batch × (seq-1)` (exact for constant-shape legacy runs) and warns.
+- **Budget semantics**: `--token-budget` counts tokens since run start *including resumed ones*;
+  if the budget is already consumed at resume, the run finishes with no new steps.
+- **Mid-epoch resume — exact limitation, stated plainly.** The packed
+  `PackedTokenDataset` (and the JSONL `StreamingTokenizedDataset`) is an
+  **IterableDataset with no intra-epoch position restore**: after a resume from
+  a mid-epoch checkpoint (periodic or safety), the **remainder of the partial
+  epoch is NOT re-trained** — the run continues at the next epoch, whose stream
+  re-starts from shard 0 (packed) / file start (JSONL). `tokens_consumed` is
+  exact on both sides of the resume (restored counter, incremented per executed
+  good step — a step is either fully trained or not counted), and checkpoint
+  step numbers stay monotonic, so the budget stop and the final accounting are
+  unaffected. The cost is data coverage: up to one epoch's tail can be skipped
+  per disconnect; periodic checkpoints bound the *untrained* window, not the
+  re-covering window. (Test-asserted:
+  `tests/test_trainer_stability.py::test_resume_from_mid_epoch_periodic_checkpoint_keeps_token_accounting`.)
 
 ### 13.3 Directory resume + corruption fallback (CURRENT)
 
@@ -572,24 +593,26 @@ Audit result (verified by reading `train_epochs` and grep on 2026-09-27):
   regression-guarded, `:206-221`).
 - Each candidate passes `validate_resume_checkpoint` (`:222-252`: format, preset resolution,
   exact `n_params`, optimizer presence); failing candidates are skipped with a warning and the
-  next-newest is tried; if all fail, the run refuses to start (`:993-1013`).
-- Resume also enforces: same data source (`:1060-1065`), same packed-corpus identity
-  (`manifest_identity` — seq/dtype/tokenizer/rows; `:1086-1105`), same tokenizer fingerprint
-  (`:1178-1208`), and `--epochs` is then the **target total** (`:741-747`), elapsing from resumed
-  epoch+1.
+  next-newest is tried; if all fail, the run refuses to start.
+- Resume also enforces: same data source, same packed-corpus identity
+  (`manifest_identity` — seq/dtype/tokenizer/rows), same tokenizer fingerprint,
+  and `--epochs` is then the **target total**, elapsing from resumed epoch+1.
+- **After a NaN-abort** (`BadStepsAbort`), `--resume <run_dir>` picks the last
+  safety checkpoint (numeric-newest VALID) and continues from the last-good
+  state — test-asserted end-to-end in
+  `tests/test_trainer_stability.py::test_train_run_abort_writes_metrics_metadata_and_is_recoverable`.
 
-### 13.4 Write atomicity — honest caveat
+### 13.4 Write atomicity (CURRENT — hardened 2026-09-27)
 
-- The **metadata JSON sidecars are atomic** (`tmp` + `os.replace`; `write_run_metadata:312-321`).
-- The **`.pt` checkpoint itself is a plain `torch.save` — NOT atomic**. A crash mid-save can leave
-  a truncated `step-N.pt`; on resume the corrupted candidate is detected by
-  `load_checkpoint`/validation and skipped (fallback to the next-newest) — this is exactly why the
-  corrupt-fallback scanner exists. Long-term hardening (temp-file + rename for `.pt`) is
-  **NEEDS IMPLEMENTATION**.
-- **Intra-epoch ("super-save") checkpointing: MISSING.** Staged 200–250M-token budgets at ~2K
-  tok/s mean epochs of many hours with no intermediate checkpoint; the only protection today is a
-  short epoch budget or the owner-reported B=1/B=4 cadence. A `--super-save-every N` flag is
-  specified in §29.
+- The **metadata JSON sidecars are atomic** (`tmp` + `os.replace`; `write_run_metadata`).
+- The **`.pt` checkpoint is NOW atomic too** — `save_checkpoint` serializes to `<path>.tmp` and
+  `os.replace`s it into place (`:732-734`), so a crash mid-save can never leave a truncated
+  `step-N.pt` for the resume scanner to trip over. The corrupt-fallback scanner stays as a second
+  line of defence for pre-hardening artifacts.
+- **Intra-epoch ("super-save") checkpointing: CURRENT.** `--save-every-tokens N` writes periodic
+  checkpoints at absolute multiples of N tokens since run start (restored on resume), so a
+  disconnect loses at most ~N newly-consumed tokens. For the staged T4 budget (~2K tok/s), N = one
+  epoch's tokens (or a few hours of wall time) is the natural choice; see §10.4 and §21.1.
 
 ### 13.5 Drive persistence (CURRENT as a manual step)
 
@@ -640,18 +663,26 @@ preflight gate §16 includes it as a NEEDS IMPLEMENTATION item.
 3. At end (`:1491-1498`): final train/val loss, tokens consumed (+ `(REACHED)` if budget hit), wall
    time (s), peak RSS (MiB), checkpoint path, metrics path.
 
-### 15.2 `metrics.json` fields (`:1426-1493`)
+### 15.2 `metrics.json` fields (`:1684-1816`)
 
 `format`, `params`, `vocab_size`, `tokenizer_vocab_size`, `tokenizer_merges`,
 `tokenizer_sha256`, `tokenizer_origin`, `tokenizer_json_arg`, `data_source`,
 `train_docs`/`val_docs`/`split_seed` (jsonl) or `train_rows`/`val_rows` (packed), `resumed_from`,
 `epochs[]` (`EpochRow`: epoch/steps/global_step/train_loss/val_loss/checkpoint/wall_s),
 `final_train_loss`, `final_val_loss`, `tokens_processed`, `token_budget`, `tokens_consumed`,
-`steps`, `budget_reached`, `lr_schedule` (`{type, warmup_tokens, token_budget, min_lr_ratio}`),
-`wall_s`, `peak_rss_mb` (**host RAM**, not GPU), `device`, `checkpoint`, `tokenizer_path`,
-`run_metadata_file`.
+`steps` (= attempted steps), `budget_reached`, `lr_schedule` (`{type, warmup_tokens, token_budget,
+min_lr_ratio}`), `wall_s`, `peak_rss_mb` (**host RAM**, not GPU), `device`, `checkpoint`,
+`tokenizer_path`, `run_metadata_file` —
 
-### 15.3 What is NOT logged (MISSING)
+**plus, from the hardening pass:** `grad_clip_max_norm` (the flag in force; `None` = off),
+`nan_inf_detection` (`True`), `max_consecutive_bad_steps`, `save_every_tokens`, `last_grad_norm`
+(pre-clip norm of the most recent clipped step; `None` when off), `last_good_loss`,
+`bad_steps[]` (every skipped NaN/Inf step: `{step, tokens_consumed, tensor, stat, loss,
+consecutive_bad_steps, checkpoint}`), `total_bad_steps`, `consecutive_bad_steps`,
+`aborted` (`null` or `{reason, last_checkpoint}`), `periodic_checkpoint` (most recent
+`--save-every-tokens` checkpoint path).
+
+### 15.3 What is NOT logged (MISSING — unchanged)
 
 - **GPU memory** (VRAM) — only host `peak_rss_mb` (RAM) is recorded; `torch.cuda.max_memory…` is
   never called.
@@ -829,7 +860,7 @@ and the packed corpus prepared (§8) either on Drive or in Colab scratch.
 |---|---|---|
 | Colab disconnect / runtime reset | last epoch's `step-*.pt` on Drive (+ in-checkpoint optimizer/RNG/counters) | `python -m scripts.train_oasst1 … --resume <run_dir> --epochs <SAME TOTAL>` (dir scan → numeric-newest valid) |
 | Session OOM / killed mid-epoch | all prior epoch checkpoints; current epoch lost | same as above (resume from last completed epoch's checkpoint) |
-| NaN/Inf loss (no auto-abort exists!) | whatever the last epoch wrote | manual: kill, inspect `metrics.json`, resume from the last good step, or restart with a lower LR (§12 — guard MISSING) |
+| NaN/Inf loss or gradient | **auto-handled** (§12): step skipped, safety checkpoint written immediately, `metrics.json` records the event; after 3 consecutive bad steps the run ABORTS (exit code 3) with the last-good checkpoint on disk | `--resume <run_dir>` continues from the abort (numeric-newest = the last safety checkpoint); inspect `metrics.json → bad_steps[]`; lower `--lr`/raise `--grad-clip`/`--max-consecutive-bad-steps 0` if it recurs |
 | Corrupt/truncated `step-N.pt` (crash mid-save, non-atomic `.pt`) | older valid checkpoints | `--resume <run_dir>` — the scanner skips the corrupt candidate with a warning and uses the next-newest (`:993-1013`) |
 | Tokenizer file missing on resume | none (refuses) | restore `tokenizer.json` to the recorded `tokenizer_path`, or unpacked-run: pass `--tokenizer-json` matching the recorded fingerprint (`:1178-1208`) |
 | Drive unavailable at resume | the run dir is unreachable | re-mount Drive; if checkpoints were staged on scratch they are gone — this is why per-epoch Drive copy matters |
@@ -878,10 +909,13 @@ and the packed corpus prepared (§8) either on Drive or in Colab scratch.
   `:993`.
 - `train_epochs(model, train_ds, val_ds, *, out_dir, tokenizer_path, lr, epochs, device, seed,
   max_steps_per_epoch=None, val_max_steps=None, resume_from=None, token_budget=None,
-  warmup_tokens=0, lr_decay="none", run_metadata=None) -> TrainingHistory` — `:689`.
+  warmup_tokens=0, lr_decay="none", run_metadata=None, save_every_tokens=0, grad_clip=0.0,
+  max_consecutive_bad_steps=3) -> TrainingHistory` — `:742`. Raises `BadStepsAbort` after K
+  consecutive NaN/Inf steps (carrying the partial `TrainingHistory`).
 - `save_checkpoint(path, model, step, train_loss, val_loss, tokenizer_path, *, optimizer=None,
-  rng_state=None, epoch=None, tokens_consumed=None, run_metadata=None, tokenizer_fingerprint=None)`
-  — `:626`. `load_checkpoint(path) -> dict` — `:684`.
+  rng_state=None, epoch=None, tokens_consumed=None, run_metadata=None, tokenizer_fingerprint=None,
+  last_grad_norm=None)` — `:661` (atomic write; the SINGLE writer for epoch-end, periodic and
+  safety checkpoints). `load_checkpoint(path) -> dict` — `:737`.
 - `list_checkpoint_candidates(checkpoint_dir) -> List[str]` — `:206`.
   `validate_resume_checkpoint(ckpt, preset) -> None` — `:222`.
 - `evaluate(model, dataset, device, *, max_steps=None) -> Optional[float]` — `:588`.
@@ -928,7 +962,7 @@ and the packed corpus prepared (§8) either on Drive or in Colab scratch.
 
 ## 21. CLI — every flag
 
-### 21.1 `scripts/train_oasst1.py` (`make_arg_parser`, `:886-969`)
+### 21.1 `scripts/train_oasst1.py` (`make_arg_parser`, `:1082-1194`)
 
 | Flag | Type | Default | Required | Valid values / notes |
 |---|---|---|---|---|
@@ -952,13 +986,17 @@ and the packed corpus prepared (§8) either on Drive or in Colab scratch.
 | `--token-budget` | int | None | no | PRIMARY stop target: tokens since run start incl. resumed |
 | `--warmup-tokens` | int | 0 | no | linear warmup span (must be < budget if budget set) |
 | `--lr-decay` | str | `"none"` | no | `none` \| `cosine` (cosine needs `--token-budget`) |
+| `--save-every-tokens` | int | 0 | no | **intra-epoch checkpoint cadence**: v1 checkpoint at every absolute multiple of N tokens since run start (restored on resume); 0 = epoch-end only (old behavior). At ~2K tok/s, N = one epoch's tokens is the natural T4 value (§13.4) |
+| `--grad-clip` | float | 0.0 | no | max_grad_norm for `clip_grad_norm_` after backward; 0 = off (old behavior, step untouched). Pre-clip norm recorded in metrics/checkpoints (§12) |
+| `--max-consecutive-bad-steps` | int | 3 | no | abort (exit 3) after K consecutive NaN/Inf steps; 0 = never abort (steps still skipped + safety-checkpointed). Detection is ALWAYS on (§12) |
 | `--max-steps-per-epoch` | int | None | no | CI/smoke cap |
 | `--val-max-steps` | int | None | no | CI/smoke cap on val batches |
 | `--device` | str | None (auto) | no | auto → `cuda` if available else `cpu` |
 
-**Missing options (NEEDS IMPLEMENTATION — do not try to pass them):** `--grad-clip`,
-`--nan-abort`, `--super-save-every`, `--benchmark`, `--fp16`/`--amp` (FORBIDDEN, §11), `--eta`,
-`--vit`… none of these exist.
+**Still missing (NEEDS IMPLEMENTATION — do not try to pass them):** `--benchmark`,
+`--fp16`/`--amp` (FORBIDDEN, §11), `--eta`, `--vit`… none of these exist. The three hardening
+flags above (`--save-every-tokens`, `--grad-clip`, `--max-consecutive-bad-steps`) are the ones
+this doc's earlier revisions listed as `--super-save-every`/`--nan-abort` (§29 pruned accordingly).
 
 ### 21.2 `scripts/prepare_corpus.py` — full table in §8.1 (11 flags; `--tokenizer-json`,
 `--target-tokens`, `--out-dir` required).
@@ -1151,8 +1189,8 @@ The CLI truncates long contexts correctly (audit §5; library guard fixed in PR 
 | Issue | Detail | Status |
 |---|---|---|
 | **FP16 AMP overflow (do NOT enable AMP)** | Owner-reported, verbatim: `RuntimeError: value cannot be converted to type c10::Half without overflow`. Code path: `model/attention.py:182-184` — `mask = torch.zeros_like(scores); mask.masked_fill(~allowed, NEG_INF)` under fp16 autocast overflows filling `-inf` in half precision. No AMP code exists in the repo; the plan forbids enabling it until the mask path is proven safe. BF16 is unavailable on T4 (SM7.5). | FORBIDDEN (plan) + not implemented |
-| No automatic NaN/Inf detection, no grad clipping, no abort-with-checkpoint | §12 — verified absent; the metadata records `nan_inf_detection: False, gradient_clip_type: None`. A code comment claims notebook-side guards that were not found in the current notebooks. | MISSING — must be added before a long unattended run |
-| Non-atomic `.pt` writes | `torch.save` writes directly; a crash mid-save truncates the file. Resume skips corrupt candidates (numeric fallback) — safe but loses the partial checkpoint. | PARTIAL (mitigated by resume scanner; atomic write NEEDS IMPLEMENTATION) |
+| NaN/Inf detection, grad clipping, abort-with-checkpoint | **FIXED (2026-09-27, hardening pass)** — detection always-on in `train_epochs`; bad steps skip the optimizer update, log structured events into `metrics.json`, write a safety checkpoint, abort after 3 consecutive failures; `--grad-clip` bounds the norm. Metadata now records `nan_inf_detection: True` + the real `gradient_clip_type`. | CURRENT (§12, `tests/test_trainer_stability.py`) |
+| Non-atomic `.pt` writes | **FIXED (2026-09-27)** — `save_checkpoint` writes `<path>.tmp` + `os.replace` for every cadence (epoch-end, periodic, safety); the corrupt-fallback scanner remains for pre-hardening artifacts. | CURRENT (§13.4) |
 | Local-box memory limits (dev box, not Colab) | The build box is memory-starved (~3.9 GB total, <2.2 GB usable); `tests/conftest.py` skips 100M-scale tests under ~900 MB MemAvailable. CI runners (7 GB) run everything. Not a Colab-T4 concern. | documented in `.github/workflows/tests.yml` |
 | `PyGILState_Release` shutdown error | Cosmetic interpreter-shutdown message after `datasets` streaming on this box (research memo §7). Harmless; may appear in Colab too. | cosmetic |
 | No measured T4 tok/s recorded anywhere | Owner's published T4 run has config + losses only; all repo throughput records are CPU. Every T4 number in §11/§26 is estimate or owner-reported. | gap (benchmark §17 fixes it) |
@@ -1163,32 +1201,28 @@ The CLI truncates long contexts correctly (audit §5; library guard fixed in PR 
 
 ## 29. Missing / Required Implementation (consolidated)
 
-Ordered by criticality for a long unattended T4 run:
+Ordered by criticality for a long unattended T4 run. **Items 1–4 of the previous
+revision (NaN/Inf detection + checkpoint-before-abort, gradient clipping,
+super-save checkpoints, atomic `.pt` writes) are DONE** — see §12/§13; the list
+below is what remains.
 
-1. **NaN/Inf loss+grad detection + checkpoint-before-abort** (§12) — new trainer logic (or a
-   wrapping driver): after `loss.backward()`, check finiteness; on non-finite save the current
-   state (weights+optimizer) to `step-<N>.pt` (or `step-<N>.nan.pt`), log loudly, exit non-zero.
-2. **Gradient clipping** (§12) — `--grad-clip <max_norm>` flag calling
-   `torch.nn.utils.clip_grad_norm_` before `opt.step()`.
-3. **Super-save / intra-epoch checkpoints** (§13.4) — `--super-save-every N` (steps) writing
-   `step-<N>.pt` inside epochs at the same cadence as epoch-end checkpoints.
-4. **Atomic `.pt` writes** (§13.4) — write `step-<N>.pt.tmp` then `os.replace`.
-5. **Benchmark mode** (§17) — `--benchmark-steps N` (or a sibling script) measuring s/step, tok/s,
+1. **Benchmark mode** (§17) — `--benchmark-steps N` (or a sibling script) measuring s/step, tok/s,
    `torch.cuda.max_memory_allocated()` VRAM peak, loss stability, printed + saved (e.g.
    `benchmarks/t4-tiny100m-benchmark-<shape>.json`).
-6. **`scripts/preflight.py`** (§16) — the 32-point gate as a runnable script; must add: disk-free
+2. **`scripts/preflight.py`** (§16) — the 32-point gate as a runnable script; must add: disk-free
    check (Drive + scratch), out-dir clobber guard, GPU probe, cargo-cult the repo's existing
    guards (param count, vocab, manifest validation, tokenizer sha, resume validity).
-7. **GPU-memory + ETA logging** (§15.3) — per-epoch `torch.cuda.max_memory_allocated()` + live
+3. **GPU-memory + ETA logging** (§15.3) — per-epoch `torch.cuda.max_memory_allocated()` + live
    tok/s/ETA line in stdout and `metrics.json`.
-8. **100M Colab notebook** — a `shared/colab/talos_100m_colab.ipynb` (pattern exists for
-   tiny_1m/tiny_10m; 100M does not) with per-epoch Drive copy and the §12 wrapper until the trainer
-   grows the guards.
-9. **Packed→JSONL eval adapter or a packed-aware eval path** (§27.1) — so
+4. **100M Colab notebook** — a `shared/colab/talos_100m_colab.ipynb` (pattern exists for
+   tiny_1m/tiny_10m; 100M does not) with per-epoch Drive copy. The §12 guards are now
+   trainer-side, so the notebook only needs the standard flags
+   (`--save-every-tokens`, `--grad-clip`, `--max-consecutive-bad-steps`).
+5. **Packed→JSONL eval adapter or a packed-aware eval path** (§27.1) — so
    `scripts/eval_checkpoint` can score the packed val shards directly (currently harness reads
    JSONL; the packed val loss comes from the trainer's per-epoch `val_loss`).
-10. **Expose AdamW knobs** (`--weight-decay`, `--betas`, `--eps`) if a non-default optimizer config
-    is ever wanted (§10.1 — currently not configurable).
+6. **Expose AdamW knobs** (`--weight-decay`, `--betas`, `--eps`) if a non-default optimizer config
+   is ever wanted (§10.1 — currently not configurable).
 
 Not required for the run itself: FP16/AMP (forbidden), gradient accumulation (not needed at these
 shapes), FlashAttention (plain backend suffices; Flash backend exists but neither is required on
@@ -1209,8 +1243,9 @@ T4 at S=512).
 - [ ] Training report delivered to the owner: dataset, token count, token budget, batch/seq,
   LR config, checkpoint schedule, expected T4 runtime, dataset passes (§16 row 32).
 - [ ] Owner approval recorded (the gate — the run must not start before it).
-- [ ] NaN/clip/abort guard present — either trainer-side (MISSING, §29.1-2) or the operator wrapper
-  described in §12.4 (do NOT rely on the trainer alone; it has none).
+- [ ] NaN/clip/abort guard ON: `--grad-clip 1.0 --save-every-tokens <N> --max-consecutive-bad-steps 3`
+  (trainer-side, CURRENT — §12/§13; the operator wrapper of the old §12.4 is no longer needed and
+  must NOT be relied on instead of the trainer's own guards).
 - [ ] Drive free space ≥ corpus + checkpoints budget + margin (§14); per-epoch copy planned.
 - [ ] FP32 only: no AMP anywhere; no `--fp16` flag exists to pass.
 
@@ -1231,7 +1266,4 @@ T4 at S=512).
 
 ---
 
-*Generated 2026-09-27 by senior-ml-engineer, delegated session. Base repo: `main` @ `d8bfbdd`
-(`docs/trainer.md` added on branch `docs/trainer-100m`). All file:line references verified by
-reading the code on that date; live checks: presets/trainer/data/tokenizer import + param-count +
-forward. Anything marked MISSING/PROPOSED is not implemented and must not be described as existing.*
+*Generated 2026-09-27 by senior-ml-engineer (rev. 2, 2026-09-27): the trainer hardening pass PR — this revision updates the status table rows 22/23/26, rewrites §12 (now IMPLEMENTED), prunes §29 items 1-4 (done), and adds the three new flags to §10/§21. Base repo: `main` @ `46f9858`. All file:line references verified by reading the code + the green synthetic suites (`tests/test_trainer_stability.py`, trainer suites) on that date. Anything marked MISSING/PROPOSED is not implemented and must not be described as existing.*
