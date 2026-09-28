@@ -1064,3 +1064,174 @@ metadata (`args` echo) — so a post-hoc audit can always tell which precedence 
   constant-shape runs) with a warning (`:765-784`).
 - LR schedule is token-indexed: warmup spans `[0, W)`, cosine decays over `[W, budget)` to
   10 % — both computed from `tokens_consumed` pre-step (`TokenSchedule.lr_at`, `:137-153`).
+
+---
+
+## 26. 100M Scale Recommendation (heuristics vs. measured — labeled)
+
+**This is NOT a proven optimum.** No tiny_100m training result exists yet; every number below is an
+estimate or an extrapolation of smaller-model measurements. Use it to size the run, not to justify
+a specific budget as optimal.
+
+| Milestone | Tokens | Approx. wall-clock on T4 (ESTIMATE) | Basis |
+|---|---|---|---|
+| Staged first milestone (plan's suggestion) | 200–250 M | **~20–40 T4-h fp32** | audit §13: "a 100K-step, B=32, S=64 run = 204.8M tokens ≈ 20-40 GPU-hours on a T4 fp32" (`shared/talos-100m-audit.md` §13) — heuristic FLOP model, not measured |
+| Chinchilla-anchored (20 tok/param) | ~1.93 B | **~90–380 T4-h** | research memo §6: derived from audit's 2.0–6.1K tok/s range at B=32/S=64 ("1–3 steps/s realistic") × 1.93 B |
+| "More tokens than Chinchilla" | 4–6 B | ~180–1,100 T4-h (linear from above) | memo §6 — not one free-session material; requires merged-`--resume` multi-session |
+
+Sources of the underlying throughput range (all clearly labeled, none measured on a T4):
+- **No measured T4 tok/s exists anywhere** (audit + research memo both state this). The 2.0–6.1K
+  tok/s range is the audit's *theoretical* estimate; the owner-reported B=4/S=512 numbers in §11
+  imply ~3.7K tok/s at that shape, which is within the estimate band.
+- CPU reference points (real measurements, different hardware): 254K ≈ 12.5K tok/s;
+  tiny_1m b32 ≈ 14.5K tok/s (`docs/SCALING.md:35,137`).
+
+**Ladder evidence (measured, from the merged runs) — read carefully:**
+- tiny_1m needed **≥ ~15.5M tokens** to beat tiny (254K) at all: the full-budget A/B gave
+  val 1.8697 (1M) vs 1.9275 (254K); at smaller budgets the bigger model lost
+  (`benchmarks/phase-b/metrics-tiny-1m-15m.json`, `metrics-tiny-15m.json`).
+- **Do not judge tiny_100m at tiny budgets.** The same crossover logic says a 96.5M model trained
+  on 15M tokens is expected to be *worse* than the smaller models were at that budget; the staged
+  200–250M first milestone is the smallest budget at which a widening is plausible, and a serious
+  verdict needs the Chinchilla-scale budget.
+- Recommendation for the training-report gate (§16 row 32): propose the **staged 200–250M milestone
+  first**, run the T4 benchmark to convert it to wall-clock, and let the owner decide whether to
+  extend toward 1.93 B in resumed sessions.
+
+---
+
+## 27. Evaluation
+
+### 27.1 `scripts/eval_checkpoint.py` (CURRENT)
+
+```bash
+python -m scripts.eval_checkpoint --checkpoint <run_dir> \
+    --data <data_dir>/val.jsonl_or_shard_path_equivalent \
+    [--train-data ...] [--seq 512] [--batch 32] [--keep-partial] \
+    [--max-steps N] [--seed 0] [--device cuda] [--out-metrics <path>]
+```
+
+Important nuances (from `scripts/eval_checkpoint.py:18-85` + `evaluation/harness.py`):
+- **`--checkpoint`** accepts a file or a directory (newest `step-<N>.pt` wins).
+- **Data**: for the packed path the trainer's val shards are consumed via `PackedTokenDataset`
+  inside a *training-side* val pass; the eval harness reads **JSONL**. For a packed-corpus run the
+  official per-checkpoint loss is the trainer's recorded `val_loss` (per-epoch, §15.2); to re-eval
+  on the held-out slice with the harness, materialize the val region as JSONL or write a small
+  packed→jsonl adapter (NEEDS IMPLEMENTATION if exact harness parity on packed data is required).
+- **Default batch(4)/seq(64) match the training defaults** so recomputed loss matches the recorded
+  `val_loss`; for a B=32/S=512 run pass `--batch 32 --seq 512`. The tiny_10m notebook convention
+  requires `--batch 32` for bit-exactness of comparisons (shared/colab README) — same applies here.
+- Reported (from `EvalResult`, `evaluation/harness.py:80-99`): `val_loss`, **`val_perplexity`**
+  (= exp(val_loss)), `val_accuracy`, optional `train_loss`, `tokens_processed`, `eval_wall_s`,
+  `throughput_tok_per_s`, `peak_rss_mb`, checkpoint identity fields (`params`, `vocab_size`,
+  `tokenizer_vocab_size/merges`, `checkpoint_format`, `checkpoint_step`). Same checkpoint + split +
+  seed → identical numbers (test-asserted).
+
+### 27.2 Generation samples (CURRENT)
+
+```bash
+python -m scripts.generate --checkpoint <run_dir> --prompt "The capital of France is" \
+    [--max-new-tokens 32] [--temperature 0.8 --seed 0] [--device cuda]
+```
+
+Greedy (no `--temperature`) is deterministic and RNG-free; temperature sampling requires `--seed`.
+The CLI truncates long contexts correctly (audit §5; library guard fixed in PR #25).
+
+### 27.3 What is NOT claimed
+
+- **No benchmark-suite scores** (MMLU/HELM/etc.) are computed or claimed anywhere for this preset —
+  none exist. Held-out val loss/perplexity on the disjoint val slice is the only objective number;
+  generation samples are qualitative. `data/contamination.py` exists but is not wired into anything
+  for this run.
+
+---
+
+## 28. Known Issues
+
+| Issue | Detail | Status |
+|---|---|---|
+| **FP16 AMP overflow (do NOT enable AMP)** | Owner-reported, verbatim: `RuntimeError: value cannot be converted to type c10::Half without overflow`. Code path: `model/attention.py:182-184` — `mask = torch.zeros_like(scores); mask.masked_fill(~allowed, NEG_INF)` under fp16 autocast overflows filling `-inf` in half precision. No AMP code exists in the repo; the plan forbids enabling it until the mask path is proven safe. BF16 is unavailable on T4 (SM7.5). | FORBIDDEN (plan) + not implemented |
+| No automatic NaN/Inf detection, no grad clipping, no abort-with-checkpoint | §12 — verified absent; the metadata records `nan_inf_detection: False, gradient_clip_type: None`. A code comment claims notebook-side guards that were not found in the current notebooks. | MISSING — must be added before a long unattended run |
+| Non-atomic `.pt` writes | `torch.save` writes directly; a crash mid-save truncates the file. Resume skips corrupt candidates (numeric fallback) — safe but loses the partial checkpoint. | PARTIAL (mitigated by resume scanner; atomic write NEEDS IMPLEMENTATION) |
+| Local-box memory limits (dev box, not Colab) | The build box is memory-starved (~3.9 GB total, <2.2 GB usable); `tests/conftest.py` skips 100M-scale tests under ~900 MB MemAvailable. CI runners (7 GB) run everything. Not a Colab-T4 concern. | documented in `.github/workflows/tests.yml` |
+| `PyGILState_Release` shutdown error | Cosmetic interpreter-shutdown message after `datasets` streaming on this box (research memo §7). Harmless; may appear in Colab too. | cosmetic |
+| No measured T4 tok/s recorded anywhere | Owner's published T4 run has config + losses only; all repo throughput records are CPU. Every T4 number in §11/§26 is estimate or owner-reported. | gap (benchmark §17 fixes it) |
+| Owner's 10M-run artifacts unreachable | The audit (2026-09-25) found no repo/artifact backing the owner-described 10M run (val 1.1524, safetensors release, 100K steps); decision to request publishing pending (business plan "owner decisions pending"). Unrelated to this doc's correctness — relevant when publishing claims. | pending owner decision |
+| Owner's 32-point preflight list not in repo | §16 — reconstructed from repo guards; original wording unavailable. | gap documented in §16 |
+
+---
+
+## 29. Missing / Required Implementation (consolidated)
+
+Ordered by criticality for a long unattended T4 run:
+
+1. **NaN/Inf loss+grad detection + checkpoint-before-abort** (§12) — new trainer logic (or a
+   wrapping driver): after `loss.backward()`, check finiteness; on non-finite save the current
+   state (weights+optimizer) to `step-<N>.pt` (or `step-<N>.nan.pt`), log loudly, exit non-zero.
+2. **Gradient clipping** (§12) — `--grad-clip <max_norm>` flag calling
+   `torch.nn.utils.clip_grad_norm_` before `opt.step()`.
+3. **Super-save / intra-epoch checkpoints** (§13.4) — `--super-save-every N` (steps) writing
+   `step-<N>.pt` inside epochs at the same cadence as epoch-end checkpoints.
+4. **Atomic `.pt` writes** (§13.4) — write `step-<N>.pt.tmp` then `os.replace`.
+5. **Benchmark mode** (§17) — `--benchmark-steps N` (or a sibling script) measuring s/step, tok/s,
+   `torch.cuda.max_memory_allocated()` VRAM peak, loss stability, printed + saved (e.g.
+   `benchmarks/t4-tiny100m-benchmark-<shape>.json`).
+6. **`scripts/preflight.py`** (§16) — the 32-point gate as a runnable script; must add: disk-free
+   check (Drive + scratch), out-dir clobber guard, GPU probe, cargo-cult the repo's existing
+   guards (param count, vocab, manifest validation, tokenizer sha, resume validity).
+7. **GPU-memory + ETA logging** (§15.3) — per-epoch `torch.cuda.max_memory_allocated()` + live
+   tok/s/ETA line in stdout and `metrics.json`.
+8. **100M Colab notebook** — a `shared/colab/talos_100m_colab.ipynb` (pattern exists for
+   tiny_1m/tiny_10m; 100M does not) with per-epoch Drive copy and the §12 wrapper until the trainer
+   grows the guards.
+9. **Packed→JSONL eval adapter or a packed-aware eval path** (§27.1) — so
+   `scripts/eval_checkpoint` can score the packed val shards directly (currently harness reads
+   JSONL; the packed val loss comes from the trainer's per-epoch `val_loss`).
+10. **Expose AdamW knobs** (`--weight-decay`, `--betas`, `--eps`) if a non-default optimizer config
+    is ever wanted (§10.1 — currently not configurable).
+
+Not required for the run itself: FP16/AMP (forbidden), gradient accumulation (not needed at these
+shapes), FlashAttention (plain backend suffices; Flash backend exists but neither is required on
+T4 at S=512).
+
+---
+
+## 30. Final Execution Checklist
+
+**Before the run (owner gate required for the real budget):**
+- [ ] Repo at `d8bfbdd`, clean tree; `git_repo_state` will record it.
+- [ ] `tokenizer.json` present, sha256 == `58e4ad40…` (§6).
+- [ ] Packed corpus prepared: `manifest.json` seq=512, dtype int32/uint16, tokenizer sha matches,
+  val region disjoint (prepare_corpus logs) (§8).
+- [ ] Model+guard sanity: `python -c` build → 96,482,304 params; trainer smoke (20 steps) prints
+  `expected: EXACTLY 96,482,304 params, vocab_size 1024` (§5.1, §18.11).
+- [ ] T4 benchmark done; wall-clock for the budget accepted (§17, §26).
+- [ ] Training report delivered to the owner: dataset, token count, token budget, batch/seq,
+  LR config, checkpoint schedule, expected T4 runtime, dataset passes (§16 row 32).
+- [ ] Owner approval recorded (the gate — the run must not start before it).
+- [ ] NaN/clip/abort guard present — either trainer-side (MISSING, §29.1-2) or the operator wrapper
+  described in §12.4 (do NOT rely on the trainer alone; it has none).
+- [ ] Drive free space ≥ corpus + checkpoints budget + margin (§14); per-epoch copy planned.
+- [ ] FP32 only: no AMP anywhere; no `--fp16` flag exists to pass.
+
+**During the run:**
+- [ ] Watch per-epoch stdout line (§15.1); verify loss finite + directionally decreasing.
+- [ ] Confirm each epoch writes `step-<N>.pt` + metadata on Drive (§13.5).
+- [ ] On disconnect: resume with the SAME flags + `--resume <run_dir>` + same `--epochs` (§19).
+
+**After the budget stop (`(REACHED)` printed):**
+- [ ] Final `metrics.json` + `train_run_metadata.json` captured.
+- [ ] `scripts/eval_checkpoint` on the final checkpoint (batch/seq matching the run) → val loss,
+  perplexity, throughput (§27.1); generation samples (`scripts/generate.py`).
+- [ ] Consistency guard: `format==talos-training-checkpoint-v1`, `n_params==96_482_304`,
+  `vocab_size==1024`, `tokens_consumed==budget` (§18.21).
+- [ ] Safetensors release export (§18.22) if publishing.
+- [ ] Report to owner: milestone achieved (token budget consumed), measured tok/s, val perplexity,
+  samples, recommendation for SFT (OASST1, §24) or budget extension — no invented scores (§27.3).
+
+---
+
+*Generated 2026-09-27 by senior-ml-engineer, delegated session. Base repo: `main` @ `d8bfbdd`
+(`docs/trainer.md` added on branch `docs/trainer-100m`). All file:line references verified by
+reading the code on that date; live checks: presets/trainer/data/tokenizer import + param-count +
+forward. Anything marked MISSING/PROPOSED is not implemented and must not be described as existing.*
