@@ -1162,7 +1162,7 @@ def make_arg_parser() -> argparse.ArgumentParser:
                         "(default 0 = no warmup, fixed LR)")
     p.add_argument("--lr-decay", choices=LR_DECAY_CHOICES, default="none",
                    help="LR decay after warmup: 'none' (default, fixed LR) or "
-                        "'cosine' — cosine from --lr down to 10% of it over "
+                        "'cosine' — cosine from --lr down to 10%% of it over "
                         "--token-budget (requires --token-budget).")
     p.add_argument("--save-every-tokens", type=int, default=0, metavar="N",
                    help="write an intra-epoch checkpoint every N consumed "
