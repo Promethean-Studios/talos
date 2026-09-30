@@ -1072,7 +1072,8 @@ metadata (`args` echo) — so a post-hoc audit can always tell which precedence 
 ## 24. Data Preservation (OASST1 → SFT later)
 
 - **OASST1 is preserved untouched for the SFT stage** (owner directive 2026-09-27): the existing
-  OASST1-derived ~20.6M-token subset and its JSONL pipeline (`--data` path, `split_jsonl`, BPE
+  OASST1-derived subset (2,000 docs, 1,137,265-byte JSONL ≈ ~1.1M Talos tokens at the
+  measured ~1 tok/char) and its JSONL pipeline (`--data` path, `split_jsonl`, BPE
   training, `StreamingTokenizedDataset`) remain intact and are NOT consumed by the pretraining
   pipeline. `--packed-dir` and `--data` are exclusive inputs; nothing mixes them.
 - The canonical OASST1 subset identity for the SFT phase: rows 0-1999, content-sha
