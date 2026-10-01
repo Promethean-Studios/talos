@@ -13,7 +13,11 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
-from model.attention import AttentionInterface, build_attention_backend
+from model.attention import (
+    AttentionInterface,
+    PlainAttentionBackend,
+    build_attention_backend,
+)
 from model.block import DecoderLayer
 from model.cache import KVCache
 from model.config import ModelConfig
@@ -36,9 +40,7 @@ class TalosGPT(nn.Module):
         else:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-        backend = attention_backend or build_attention_backend(
-            backend="auto", chunk_size=config.attention_chunk_size
-        )
+        backend = attention_backend or self._auto_backend(config)
         self.backend = backend
         self.layers = nn.ModuleList(
             [DecoderLayer(config, backend) for _ in range(config.num_layers)]
@@ -52,6 +54,20 @@ class TalosGPT(nn.Module):
         if self.lm_head is not None:
             # Include the lm_head in weight init for consistency.
             self._init_weights(self.lm_head)
+
+    @staticmethod
+    def _auto_backend(config: ModelConfig) -> "AttentionInterface":
+        """Pick the default execution backend for ``config``.
+
+        ``attention_chunk_size > 0`` (the long-context 128K-style configs)
+        requires the bounded-memory chunked functional path: SDPA would
+        materialize ``O(seq^2)`` scores, so those configs keep the plain
+        backend. Everything else uses ``build_attention_backend("auto")`` —
+        flash-attn when installed, else SDPA (the T4 default).
+        """
+        if config.attention_chunk_size > 0:
+            return PlainAttentionBackend(chunk_size=config.attention_chunk_size)
+        return build_attention_backend(backend="auto")
 
     def _init_weights(self, module: nn.Module) -> None:
         std = self.config.initializer_range

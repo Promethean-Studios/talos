@@ -2,7 +2,12 @@
 import torch
 import torch.nn.functional as F
 
-from model.attention import PlainAttentionBackend, build_attention_backend
+from model.attention import (
+    FlashAttentionBackend,
+    PlainAttentionBackend,
+    SDPAAttentionBackend,
+    build_attention_backend,
+)
 from model.block import SelfAttention
 from model.config import ModelConfig
 
@@ -96,5 +101,8 @@ def test_plain_requires_4d():
 
 def test_build_attention_backend():
     assert isinstance(build_attention_backend("plain"), PlainAttentionBackend)
-    # 'auto' should fall back to plain when flash-attn is absent.
-    assert isinstance(build_attention_backend("auto"), PlainAttentionBackend)
+    assert isinstance(build_attention_backend("sdpa"), SDPAAttentionBackend)
+    # 'auto' prefers flash-attn when installed, else SDPA (T4 engine pass).
+    from model.attention import FlashAttentionBackend
+    expected = FlashAttentionBackend if FlashAttentionBackend.available() else SDPAAttentionBackend
+    assert isinstance(build_attention_backend("auto"), expected)

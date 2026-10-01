@@ -67,17 +67,19 @@ import argparse
 import json
 import math
 import os
+import queue
 import random
 import re
 import resource
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -99,6 +101,7 @@ from data.packed import (  # noqa: E402
 )
 from data.tokenized import StreamingTokenizedDataset  # noqa: E402
 from model import ModelConfig, TalosGPT  # noqa: E402
+from model.attention import build_attention_backend  # noqa: E402
 from model.utils import get_logger, set_seed, validate_token_ids  # noqa: E402
 from tokenizer.corpus import iter_text_documents  # noqa: E402
 from tokenizer.tokenizer import (  # noqa: E402
@@ -118,6 +121,217 @@ RUN_METADATA_SCHEMA = "talos-training-run-metadata-v1"
 LR_DECAY_CHOICES = ("none", "cosine")
 #: Cosine decays to this fraction of ``--lr`` over the token budget.
 MIN_LR_RATIO = 0.1
+
+ATTENTION_BACKEND_CHOICES = ("auto", "plain", "sdpa", "flash")
+AMP_CHOICES = ("none", "fp16")
+
+
+# ---------------------------------------------------------------------------
+# T4 training-engine helpers (P1: throughput; additive, defaults = old path)
+# ---------------------------------------------------------------------------
+def make_amp_autocast(amp: str, device: torch.device) -> torch.autocast:
+    """Autocast context for ``--amp``.
+
+    ``"fp16"`` wraps the train forward/backward in fp16 autocast (CUDA or CPU;
+    CPU is supported for logic tests but pointless in production). Validation
+    and the loss accumulation stay OUT of the context, so val loss is always
+    computed fp32 — loss comparability across AMP modes (P1b/P3).
+    """
+    if amp not in AMP_CHOICES:
+        raise ValueError(f"--amp must be one of {AMP_CHOICES}, got {amp!r}")
+    enabled = amp == "fp16" and device.type in ("cuda", "cpu")
+    return torch.autocast(device_type=device.type, dtype=torch.float16,
+                          enabled=enabled)
+
+
+def make_grad_scaler(amp: str, device: torch.device) -> "torch.amp.GradScaler":
+    """GradScaler for ``--amp fp16``.
+
+    ``enabled=False`` on every non-AMP path and on CPU (GradScaler requires
+    CUDA): all scaler calls become transparent no-ops, which keeps the AMP
+    integration code the one code path (and CPU-testable).
+    """
+    enabled = amp == "fp16" and device.type == "cuda"
+    try:
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    except TypeError:  # pragma: no cover - older torch
+        return torch.cuda.amp.GradScaler(enabled=enabled)  # type: ignore[attr-defined]
+
+
+def build_optimizer(
+    model: torch.nn.Module,
+    lr: float,
+    *,
+    fused: bool,
+    device: torch.device,
+) -> torch.optim.Optimizer:
+    """AdamW with an optional fused CUDA kernel (P1c).
+
+    Default (``fused=False``) constructs exactly the pre-upgrade optimizer
+    (``torch.optim.AdamW(model.parameters(), lr=lr)``) — resume bit-exactness
+    for existing runs is untouched. ``fused=True`` requests the CUDA-only
+    fused AdamW when the installed torch advertises it; a non-CUDA device is a
+    loud error (fused is unavailable on CPU), never a silent fallback.
+    """
+    if not fused:
+        return torch.optim.AdamW(model.parameters(), lr=lr)
+    if device.type != "cuda":
+        raise ValueError(
+            "--fused-optim requires a CUDA device (fused AdamW is a CUDA-only "
+            f"kernel; device is {device})"
+        )
+    import inspect
+
+    fused_supported = "fused" in inspect.signature(
+        torch.optim.AdamW.__init__
+    ).parameters
+    if not fused_supported:  # pragma: no cover - torch >= 2.0 always has it
+        raise ValueError(
+            "this torch build's AdamW does not support fused=True — "
+            "remove --fused-optim or upgrade torch"
+        )
+    log.info("using fused AdamW (CUDA multi-tensor kernel).")
+    return torch.optim.AdamW(model.parameters(), lr=lr, fused=True, foreach=False)
+
+
+@dataclass
+class IntervalStats:
+    """Per-log-interval accumulators (P4 observability)."""
+
+    steps: int = 0
+    tokens: int = 0
+    data_s: float = 0.0
+    fwd_s: float = 0.0
+    bwd_s: float = 0.0
+    optim_s: float = 0.0
+    ckpt_s: float = 0.0
+    total_s: float = 0.0
+    loss: Optional[float] = None
+    grad_norm: Optional[float] = None
+    vram_peak_mb: Optional[float] = None
+    vram_used_mb: Optional[float] = None
+
+    def asdict(self) -> Dict[str, Any]:
+        return {
+            "steps": self.steps,
+            "tokens": self.tokens,
+            "loss": self.loss,
+            "grad_norm": self.grad_norm,
+            "data_s": round(self.data_s, 4),
+            "fwd_s": round(self.fwd_s, 4),
+            "bwd_s": round(self.bwd_s, 4),
+            "optim_s": round(self.optim_s, 4),
+            "ckpt_s": round(self.ckpt_s, 4),
+            "total_s": round(self.total_s, 4),
+            "tok_s": round(self.tokens / self.total_s, 3) if self.total_s > 0 else None,
+            "steps_s": round(self.steps / self.total_s, 4) if self.total_s > 0 else None,
+            "vram_peak_mb": self.vram_peak_mb,
+            "vram_used_mb": self.vram_used_mb,
+        }
+
+
+class CheckpointStager:
+    """Local-then-copy checkpoint persistence (P5, Drive-aware).
+
+    The trainer writes every checkpoint into **local** staging storage first
+    (atomic tmp+fsync+rename on the local FS — never Drive's eventual
+    consistency), then a single daemon thread copies finished files to the
+    final ``out_dir`` (which may be a Colab Drive mount). Training never waits
+    for the Drive copy: the thread queue is bounded, and :meth:`drain` (called
+    at run end) joins the thread so a clean finish has flushed everything.
+
+    ``staging_dir=None`` (default) preserves the old direct-write behavior —
+    the stager is inert and saves go straight to ``out_dir``.
+    """
+
+    def __init__(self, staging_dir: Optional[str], out_dir: str) -> None:
+        self.staging_dir = staging_dir
+        self.out_dir = out_dir
+        self._q: "queue.Queue[Optional[str]]" = queue.Queue()
+        self._thread: Optional[threading.Thread] = None
+        if staging_dir:
+            os.makedirs(staging_dir, exist_ok=True)
+            self._thread = threading.Thread(
+                target=self._copier, name="talos-ckpt-copier", daemon=True
+            )
+            self._thread.start()
+
+    def _copier(self) -> None:
+        while True:
+            src = self._q.get()
+            if src is None:
+                self._q.task_done()
+                return
+            try:
+                dst = os.path.join(self.out_dir, os.path.basename(src))
+                shutil.copyfile(src, dst)
+            except Exception as exc:  # never kill training on a copy failure
+                log.error(
+                    "checkpoint copy to %s failed: %s — the checkpoint remains "
+                    "in staging %s", self.out_dir, exc, src,
+                )
+            finally:
+                self._q.task_done()
+
+    def enqueue(self, final_path: str) -> None:
+        """Register ``final_path`` as staged; the thread copies it to out_dir."""
+        if self._thread is None:
+            return  # staging disabled — nothing to do
+        self._q.put(final_path)
+
+    def drain(self, timeout: float = 3600.0) -> bool:
+        """Wait for pending Drive copies (run-end flush). True on success."""
+        if self._thread is None:
+            return True
+        self._q.put(None)
+        self._thread.join(timeout=timeout)
+        if self._thread.is_alive():  # pragma: no cover - pathological Drive stall
+            log.error("checkpoint copier did not finish within %ss", timeout)
+            return False
+        return self._q.empty()
+
+
+def expected_state_dict_shapes(cfg: "ModelConfig") -> Dict[str, torch.Size]:
+    """The exact ``state_dict`` key->shape map a fresh model of ``cfg`` has.
+
+    Derived from the config arithmetic alone (no model materialization), so
+    resume-time tensor-head validation can run on a CPU-only T4 host without
+    allocating a second ~386 MiB model. Every parameter a model would create
+    must appear here — a key missing on either side fails the check.
+    ``tests/test_trainer_engine.py`` pins this map against a real model's
+    ``state_dict``, so an architecture drift fails the suite, not a resume.
+    """
+    d = cfg.derive() if cfg.head_dim is None else cfg
+    shapes: Dict[str, torch.Size] = {}
+    hs, v = d.hidden_size, d.vocab_size
+    nq, nkv, hd = d.num_attention_heads, d.num_kv_heads, d.head_dim
+    shapes["embed_tokens.weight"] = torch.Size((v, hs))
+    if not d.tie_word_embeddings:
+        shapes["lm_head.weight"] = torch.Size((v, hs))
+    if d.ffn_type != "dense":
+        raise ValueError(
+            "expected_state_dict_shapes supports dense FFN configs only "
+            f"(got ffn_type={d.ffn_type!r}) — canonical presets are dense"
+        )
+    for i in range(d.num_layers):
+        p = f"layers.{i}."
+        shapes[p + "input_layernorm.weight"] = torch.Size((hs,))
+        shapes[p + "post_attention_layernorm.weight"] = torch.Size((hs,))
+        shapes[p + "attention.q_proj.weight"] = torch.Size((nq * hd, hs))
+        shapes[p + "attention.k_proj.weight"] = torch.Size((nkv * hd, hs))
+        shapes[p + "attention.v_proj.weight"] = torch.Size((nkv * hd, hs))
+        shapes[p + "attention.o_proj.weight"] = torch.Size((hs, nq * hd))
+        shapes[p + "ffn.swiglu.gate_proj.weight"] = torch.Size(
+            (d.intermediate_size, hs)
+        )
+        shapes[p + "ffn.swiglu.up_proj.weight"] = torch.Size(
+            (d.intermediate_size, hs)
+        )
+        shapes[p + "ffn.swiglu.down_proj.weight"] = torch.Size(
+            (hs, d.intermediate_size)
+        )
+    shapes["final_norm.weight"] = torch.Size((hs,))
+    return shapes
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +436,17 @@ def list_checkpoint_candidates(checkpoint_dir: str) -> List[str]:
 def validate_resume_checkpoint(ckpt: dict, preset: str) -> None:
     """Sanity checks a checkpoint must pass to resume from (shared by the
     explicit-file and directory-scan paths). Raises ``ValueError`` naming the
-    failing contract — reused verbatim by the corrupt-fallback scanner."""
+    failing contract — reused verbatim by the corrupt-fallback scanner.
+
+    P5 (T4 engine pass): in addition to the pre-existing format/preset/param
+    checks, the **tensor head** of the state dict is validated against the
+    exact shapes a fresh model of the recorded config would have — a checkpoint
+    whose tensors were truncated or length-mismatched (e.g. brain-damaged by an
+    interrupted Drive upload) is rejected with a clear error BEFORE any
+    ~386 MiB load/compare, and the directory scanner falls back to the previous
+    valid checkpoint. Full tensor *values* are still verified implicitly by
+    ``load_state_dict`` inside :func:`train_epochs`.
+    """
     if ckpt.get("format") != CHECKPOINT_FORMAT:
         raise ValueError(
             f"checkpoint has unsupported format {ckpt.get('format')!r}: "
@@ -248,6 +472,27 @@ def validate_resume_checkpoint(ckpt: dict, preset: str) -> None:
             "support (old v1 format); use a checkpoint written by the current "
             "script"
         )
+    # ---- P5 tensor-head validation (shape-level state-dict sanity) ----
+    state = ckpt.get("model_state_dict")
+    if not isinstance(state, dict) or not state:
+        raise ValueError("checkpoint model_state_dict is empty or unreadable")
+    expected = expected_state_dict_shapes(ckpt_cfg)
+    if set(state.keys()) != set(expected.keys()):
+        missing = sorted(set(expected) - set(state))
+        extra = sorted(set(state) - set(expected))
+        raise ValueError(
+            "checkpoint state_dict keys do not match the recorded model "
+            f"config: missing={missing} extra={extra} \u2014 corrupted or "
+            "config-drifted checkpoint"
+        )
+    for key, exp_shape in expected.items():
+        actual = tuple(state[key].shape)
+        if actual != tuple(exp_shape):
+            raise ValueError(
+                f"checkpoint tensor {key} has shape {actual}, expected "
+                f"{tuple(exp_shape)} \u2014 truncated or mismatched state dict "
+                "(e.g. an interrupted Drive upload); refusing to resume"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -543,10 +788,26 @@ def check_tiny_compat(cfg, n_params: int) -> None:
     check_preset_compat("tiny", cfg, n_params)
 
 
-def build_preset_model(preset: str) -> TalosGPT:
-    """Build a canonical preset model and assert its exact-param contract."""
+def build_preset_model(preset: str, attention_backend: str = "auto") -> TalosGPT:
+    """Build a canonical preset model and assert its exact-param contract.
+
+    ``attention_backend`` (T4 engine pass P1a): "auto" keeps the model factory's
+    own routing (flash-attn if installed, else SDPA; the chunked plain path for
+    ``attention_chunk_size > 0`` configs); any explicit choice builds that
+    backend in-place and passes it to :class:`TalosGPT`.
+    """
+    if attention_backend not in ATTENTION_BACKEND_CHOICES:
+        raise ValueError(
+            f"--attention-backend must be one of {ATTENTION_BACKEND_CHOICES}, "
+            f"got {attention_backend!r}"
+        )
     cfg = ALL_PRESETS[preset]().derive()
-    model = TalosGPT(cfg)
+    backend = (
+        None
+        if attention_backend == "auto"
+        else build_attention_backend(attention_backend, chunk_size=cfg.attention_chunk_size)
+    )
+    model = TalosGPT(cfg, attention_backend=backend)
     check_preset_compat(preset, cfg, model.num_parameters())
     return model
 
@@ -602,6 +863,11 @@ class TrainingHistory:
     #: step count on healthy runs; on aborts it is the honest "how far did the
     #: loop get" number (executed = attempts - total_bad_steps).
     attempts: int = 0
+    #: T4 engine pass (P4): per-interval performance records (see
+    #: :class:`IntervalStats`), oldest first.
+    interval_logs: List[Dict[str, Any]] = field(default_factory=list)
+    #: cumulative wall time spent inside save_checkpoint (P4/P5).
+    checkpoint_save_s: float = 0.0
 
     def row(self, epoch: int) -> EpochRow:
         return next(r for r in self.rows if r.epoch == epoch)
@@ -662,6 +928,29 @@ def evaluate(
     return (total / count) if count else None
 
 
+def _fsync_file(path: str) -> None:
+    """fsync a file, degrading gracefully on filesystems that refuse (Drive).
+
+    Best-effort durability: the pre-existing writer was atomic (tmp+rename)
+    but never flushed the page cache — on a Colab Drive mount a power/link
+    loss could expose a rename whose data was never flushed. fsync closes
+    that gap; an unsupported FS (e.g. Drive FUSE returning EINVAL/ENOTSUP)
+    logs once and continues — durability degrades to the old behavior, never
+    an error that kills training.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        log.warning(
+            "fsync unsupported on this filesystem (%s) — checkpoint "
+            "durability falls back to atomic rename only", path,
+        )
+
+
 def save_checkpoint(
     path: str,
     model: TalosGPT,
@@ -677,6 +966,9 @@ def save_checkpoint(
     run_metadata: Optional[dict] = None,
     tokenizer_fingerprint: Optional[str] = None,
     last_grad_norm: Optional[float] = None,
+    # T4 engine pass (P5): staging + fsync
+    stager: Optional["CheckpointStager"] = None,
+    fsync: bool = True,
 ) -> None:
     """One checkpoint artifact: weights + config + step + losses + tokenizer info.
 
@@ -733,9 +1025,20 @@ def save_checkpoint(
         #: run_metadata.training_config; this is the dynamic value.
         "last_grad_norm": None if last_grad_norm is None else float(last_grad_norm),
     }
+    # P5 (atomic + durable, Drive-aware). When a local staging dir is
+    # configured the write goes to the LOCAL filesystem (tmp + fsync +
+    # rename), and a background thread copies the finished file to the final
+    # out_dir (possibly Drive) — Drive latency never blocks training.
+    final_path = path
+    if stager is not None and stager.staging_dir:
+        path = os.path.join(stager.staging_dir, os.path.basename(path))
     tmp_path = path + ".tmp"
     torch.save(payload, tmp_path)
+    if fsync:
+        _fsync_file(tmp_path)
     os.replace(tmp_path, path)
+    if stager is not None and os.path.abspath(path) != os.path.abspath(final_path):
+        stager.enqueue(path)
 
 
 def load_checkpoint(path: str) -> dict:
@@ -764,69 +1067,50 @@ def train_epochs(
     save_every_tokens: int = 0,
     grad_clip: float = 0.0,
     max_consecutive_bad_steps: int = 3,
+    # --- T4 training-engine pass (additive; defaults reproduce old behavior) ---
+    amp: str = "none",
+    fused_optim: bool = False,
+    log_every_steps: int = 50,
+    ckpt_stager: Optional[CheckpointStager] = None,
+    ckpt_fsync: bool = True,
 ) -> TrainingHistory:
     """Train the model on the streamed train split, epoch by epoch.
 
-    Per epoch: one pass over the train stream (deterministic order — same
-    ``seed`` reproduces the same run), mean train loss, validation loss over a
-    *separate* stream (no token-level leakage), and a checkpoint saved with
-    weights + config + step + losses (+ optimizer/RNG state, see
-    :func:`save_checkpoint`). AdamW + CrossEntropyLoss on
-    ``x[:, :-1] -> x[:, 1:]`` — the identical objective examples/tiny_train.py
-    uses.
+    (The pre-existing docstring — resume semantics, token budget, LR schedule,
+    numerical-stability guards — is unchanged; see the module docstring and
+    docs/trainer.md. Added by the T4 engine pass:
 
-    Resume: when ``resume_from`` (a checkpoint dict from
-    :func:`load_checkpoint`) is given, the model/optimizer/RNG state and the
-    step/epoch counters are restored *before* the loop, and training continues
-    from ``resume_step + 1``. ``--epochs`` is the **target total**: the loop
-    runs from ``resume.epoch + 1`` to ``epochs``. Because the pipeline is
-    fully deterministic (fixed seed, no RNG in the data path, no dropout),
-    a resumed run is bit-identical to an uninterrupted run that never stopped
-    — asserted by ``tests/test_training.py::test_resume_bit_exact``. See
-    §13.2 of docs/trainer.md for the exact mid-epoch resume semantics (the
-    remainder of a partially-completed epoch is NOT re-trained; the next epoch
-    re-streams from its start, and ``tokens_consumed`` is exact either way).
-
-    Token budget (DELIVERABLE 2): with ``token_budget`` set, training stops as
-    soon as tokens consumed SINCE RUN START (restored from the checkpoint on
-    resume — ``tokens_consumed`` is recorded in every checkpoint) reaches the
-    budget. The partial epoch still gets validation + a checkpoint, then the
-    outer loop stops. ``history.tokens_processed`` is the cumulative counter
-    (budget accounting); ``history.budget_reached`` reports the stop reason.
-
-    LR schedule (DELIVERABLE 3, additive): ``warmup_tokens`` > 0 ramps ``lr``
-    linearly over the first W tokens; ``lr_decay="cosine"`` decays ``lr`` to
-    ``MIN_LR_RATIO * lr`` over the budget after warmup. Defaults reproduce the
-    fixed-LR trainer exactly (``lr_at`` == ``lr`` at every step). The schedule
-    only sets ``param_groups[0]["lr"]`` per step.
-
-    Numerical-stability guards (hardening pass — detection is ALWAYS on):
-
-    * **Loss finiteness** is checked *before* ``backward`` and **gradient
-      finiteness** *after* it. On a bad step (NaN/Inf loss or any non-finite
-      gradient): the optimizer step is skipped entirely, a loud structured
-      event is recorded (``history.bad_step_events`` → ``metrics.json``: step,
-      tokens consumed, tensor, stat), a **safety checkpoint** of the last-good
-      state is written immediately (`step-<N>.pt`, see :func:`save_checkpoint`),
-      and after ``max_consecutive_bad_steps`` consecutive bad steps the run
-      aborts with :class:`BadStepsAbort` (the last safety checkpoint is the
-      recoverable state). A good step resets the consecutive counter.
-    * **Gradient clipping** with ``grad_clip`` > 0 runs
-      ``torch.nn.utils.clip_grad_norm_`` after the finiteness check; the
-      PRE-clip total norm is recorded in ``history.last_grad_norm`` and written
-      into every subsequent checkpoint + ``metrics.json``. ``grad_clip == 0``
-      (default) leaves the optimizer step untouched.
-    * **Intra-epoch checkpoints** with ``save_every_tokens`` > 0 write a
-      regular v1 checkpoint (same writer, atomic) every N consumed tokens,
-      keyed to absolute multiples of N since run start (restored on resume).
+    * **AMP** (``amp="fp16"``): the train forward/backward run under fp16
+      autocast with a GradScaler; ``scaler.unscale_(opt)`` runs BEFORE the
+      gradient-finiteness guard and before ``--grad-clip`` so the pre-clip
+      total norm is the **unscaled** norm, and a scaling-overflow step (inf
+      surfaced by unscale_) is caught by the SAME guard and counts toward
+      ``--max-consecutive-bad-steps``. Validation always runs fp32 (loss
+      comparability). With ``amp="none"`` the loop is numerically identical to
+      the pre-upgrade trainer (asserted by the AMP tests).
+    * **Logging hygiene** (``log_every_steps``): per-step loss is accumulated
+      on device and synced only at interval boundaries; the interval line
+      reports step, loss, lr, pre-clip grad norm, tokens, tok/s, steps/s,
+      elapsed, phase timers (data/fwd/bwd/optim), checkpoint save duration,
+      effective batch and VRAM. The only retained per-step syncs are the
+      always-on safety guards (loss/grad finiteness), which the hardening pass
+      depends on.
+    * **Checkpoint staging** (``ckpt_stager``/``ckpt_fsync``): see
+      :class:`CheckpointStager` — local tmp+fsync+rename first, background
+      copy to the final out_dir (Drive) with a run-end drain.
     """
     set_seed(seed)
     schedule = TokenSchedule(lr=lr, warmup_tokens=warmup_tokens, decay=lr_decay,
                              budget=token_budget)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    opt = build_optimizer(model, lr, fused=fused_optim, device=device)
     loss_fn = torch.nn.CrossEntropyLoss()
     vocab = model.config.vocab_size
     history = TrainingHistory(token_budget=token_budget)
+    # AMP machinery (P1b). make_grad_scaler enables only on CUDA; on CPU every
+    # scaler call is a transparent no-op so the integration is one code path.
+    amp_autocast = make_amp_autocast(amp, device)
+    scaler = make_grad_scaler(amp, device)
+    amp_fp16 = scaler.is_enabled()
     start_epoch, global_step = 1, 0
     tokens_consumed = 0
     if resume_from is not None:
@@ -896,6 +1180,49 @@ def train_epochs(
         tokens_consumed // save_every_tokens if save_every_tokens > 0 else 0
     )
 
+    # --- P4 observability state (interval accumulators) ---
+    interval = IntervalStats()
+    interval.t0 = time.monotonic()
+    # device-side loss accumulators: synced only at interval/epoch/checkpoint.
+    epoch_acc: Optional[torch.Tensor] = None
+    epoch_count: int = 0
+    interval_acc: Optional[torch.Tensor] = None
+    interval_count: int = 0
+    last_eff_batch: int = 0
+
+    def _vram_mb() -> Tuple[Optional[float], Optional[float]]:
+        if device.type != "cuda":
+            return None, None
+        try:
+            return (
+                torch.cuda.max_memory_allocated(device) / 2**20,
+                torch.cuda.memory_allocated(device) / 2**20,
+            )
+        except Exception:  # pragma: no cover - defensive
+            return None, None
+
+    def _save_ckpt(
+        ckpt_path: str, step_no: int, ckpt_loss: float,
+        ckpt_val: Optional[float], *,
+        rng: Optional[dict] = None,
+        ckpt_epoch: Optional[int] = None,
+        ckpt_tokens: Optional[int] = None,
+        ckpt_norm: Optional[float] = None,
+    ) -> None:
+        """One save through the shared writer with wall-time capture (P4/P5)."""
+        nonlocal interval
+        t0_ck = time.monotonic()
+        save_checkpoint(
+            ckpt_path, model, step_no, ckpt_loss, ckpt_val, tokenizer_path,
+            optimizer=opt, rng_state=rng, epoch=ckpt_epoch,
+            tokens_consumed=ckpt_tokens, run_metadata=run_metadata,
+            tokenizer_fingerprint=ckpt_fp, last_grad_norm=ckpt_norm,
+            stager=ckpt_stager, fsync=ckpt_fsync,
+        )
+        dt = time.monotonic() - t0_ck
+        interval.ckpt_s += dt
+        history.checkpoint_save_s += dt
+
     def handle_bad_step(
         step_no: int,
         tokens_before: int,
@@ -906,6 +1233,7 @@ def train_epochs(
         """One NaN/Inf step: skip the optimizer step entirely, persist the
         last-good state as a safety checkpoint, record the event, and abort
         once ``max_consecutive_bad_steps`` consecutive bad steps accumulate."""
+        nonlocal interval
         history.consecutive_bad_steps += 1
         history.total_bad_steps += 1
         ckpt_path = os.path.join(out_dir, f"step-{step_no}.pt")
@@ -914,11 +1242,10 @@ def train_epochs(
             if history.last_good_loss is not None
             else float("nan")
         )
-        save_checkpoint(
-            ckpt_path, model, step_no, ckpt_loss, None, tokenizer_path,
-            optimizer=opt, rng_state=capture_rng_state(), epoch=epoch,
-            tokens_consumed=tokens_before, run_metadata=run_metadata,
-            tokenizer_fingerprint=ckpt_fp, last_grad_norm=history.last_grad_norm,
+        _save_ckpt(
+            ckpt_path, step_no, ckpt_loss, None,
+            rng=capture_rng_state(), ckpt_epoch=epoch, ckpt_tokens=tokens_before,
+            ckpt_norm=history.last_grad_norm,
         )
         event = {
             "step": step_no,
@@ -953,20 +1280,70 @@ def train_epochs(
             )
             raise BadStepsAbort(history.abort_reason, history=history)
 
+    def flush_interval(force: bool = False) -> None:
+        """Sync the device accumulators once and emit the interval line (P4)."""
+        nonlocal interval, interval_acc, interval_count
+        if interval.steps <= 0 or not (force or log_every_steps <= 0
+                                       or interval.steps >= log_every_steps):
+            return
+        total_s = time.monotonic() - interval.t0
+        interval.total_s = total_s
+        if interval_count > 0 and interval_acc is not None:
+            interval.loss = float(interval_acc / interval_count)
+        else:
+            interval.loss = None
+        if grad_clip > 0:
+            interval.grad_norm = history.last_grad_norm
+        interval.vram_peak_mb, interval.vram_used_mb = _vram_mb()
+        record = interval.asdict()
+        history.interval_logs.append(record)
+        tok_s = record["tok_s"]
+        steps_s = record["steps_s"]
+        log.info(
+            "step %d loss %.4f lr %.2e grad_norm %s tokens %d tok/s %s steps/s %s "
+            "elapsed %.1fs | data %.1fms fwd %.1fms bwd %.1fms optim %.1fms "
+            "ckpt %.1fms | vram_peak %sMiB vram_used %sMiB eff_batch %d",
+            global_step, interval.loss if interval.loss is not None else float("nan"),
+            opt.param_groups[0]["lr"],
+            "n/a" if interval.grad_norm is None else f"{interval.grad_norm:.4g}",
+            tokens_consumed,
+            "n/a" if tok_s is None else f"{tok_s:.0f}",
+            "n/a" if steps_s is None else f"{steps_s:.3f}",
+            total_s,
+            record["data_s"] * 1e3 / max(1, interval.steps),
+            record["fwd_s"] * 1e3 / max(1, interval.steps),
+            record["bwd_s"] * 1e3 / max(1, interval.steps),
+            record["optim_s"] * 1e3 / max(1, interval.steps),
+            record["ckpt_s"] * 1e3 / max(1, interval.steps),
+            "n/a" if interval.vram_peak_mb is None else f"{interval.vram_peak_mb:.0f}",
+            "n/a" if interval.vram_used_mb is None else f"{interval.vram_used_mb:.0f}",
+            last_eff_batch,
+        )
+        interval = IntervalStats()
+        interval.t0 = time.monotonic()
+        interval_acc = None
+        interval_count = 0
+
     t_run = time.monotonic()
     for epoch in range(start_epoch, epochs + 1):
         if history.budget_reached:
             break
         model.train()
-        epoch_losses: List[float] = []
         steps = 0
         t_epoch = time.monotonic()
         for batch in train_ds:
+            t_iter0 = time.monotonic()
             if max_steps_per_epoch is not None and steps >= max_steps_per_epoch:
                 break
             if history.budget_reached:
                 break
-            x = batch.to(device).long()
+            # P1d: pinned H2D handoff (non_blocking) — no-op on CPU paths.
+            if device.type == "cuda" and batch.is_pinned():
+                x = batch.to(device, non_blocking=True)
+                if x.dtype != torch.long:
+                    x = x.long()
+            else:
+                x = batch.to(device).long()
             validate_token_ids(x, vocab, where="train batch")
             # Every ATTEMPT consumes a step number (a bad step is an attempted
             # step: it gets an event + a safety checkpoint but no weight update
@@ -978,8 +1355,13 @@ def train_epochs(
             # far (pre-step). Fixed-LR runs (no warmup, decay "none") always
             # resolve to the caller's lr — bit-identical to the old trainer.
             opt.param_groups[0]["lr"] = schedule.lr_at(tokens_consumed)
-            logits, _ = model(x[:, :-1])
-            loss = loss_fn(logits.reshape(-1, vocab), x[:, 1:].reshape(-1))
+            interval.data_s += time.monotonic() - t_iter0
+            # ---- forward + loss under the AMP context (P1b) ----
+            t_fwd = time.monotonic()
+            with amp_autocast:
+                logits, _ = model(x[:, :-1])
+                loss = loss_fn(logits.reshape(-1, vocab), x[:, 1:].reshape(-1))
+            interval.fwd_s += time.monotonic() - t_fwd
             # ---- loss finiteness BEFORE backward (always on) ----
             if not torch.isfinite(loss):
                 stat = "nan" if torch.isnan(loss.detach()) else "inf"
@@ -988,8 +1370,20 @@ def train_epochs(
                     float(loss.detach()),
                 )
                 continue
-            opt.zero_grad()
-            loss.backward()
+            opt.zero_grad(set_to_none=True)
+            # ---- backward (scaled under AMP) ----
+            t_bwd = time.monotonic()
+            if amp_fp16:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            interval.bwd_s += time.monotonic() - t_bwd
+            # ---- AMP unscale BEFORE the guard and BEFORE clip ----
+            # unscale_ surfaces scaling overflows as inf in the grads, so the
+            # always-on finiteness guard below also catches overflow steps and
+            # counts them toward --max-consecutive-bad-steps (P1b/P3).
+            if amp_fp16:
+                scaler.unscale_(opt)
             # ---- gradient finiteness AFTER backward (always on) ----
             bad_param: Optional[str] = None
             bad_grad: Optional[torch.Tensor] = None
@@ -998,25 +1392,42 @@ def train_epochs(
                     bad_param, bad_grad = pname, p.grad
                     break
             if bad_param is not None:
-                assert bad_grad is not None
                 stat = "nan" if torch.isnan(bad_grad).any() else "inf"
                 handle_bad_step(
                     global_step, tokens_consumed, f"grad:{bad_param}", stat, None
                 )
+                if amp_fp16:
+                    scaler.update()  # overflow adjust even though step skipped
                 continue
             # ---- gradient clipping (records the PRE-clip total norm) ----
             if grad_clip > 0:
                 history.last_grad_norm = float(
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 )
-            opt.step()
+            # ---- optimizer step (AMP-aware: skips on found_inf) ----
+            t_opt = time.monotonic()
+            if amp_fp16:
+                scaler.step(opt)
+                scaler.update()
+            else:
+                opt.step()
+            interval.optim_s += time.monotonic() - t_opt
             history.consecutive_bad_steps = 0
-            step_loss = float(loss.detach())
-            epoch_losses.append(step_loss)
-            history.last_good_loss = step_loss
+            # ---- device-side loss accumulation (no per-step .item()) ----
+            loss_det = loss.detach()
+            epoch_acc = loss_det.clone() if epoch_acc is None else epoch_acc + loss_det
+            epoch_count += 1
+            interval_acc = (
+                loss_det.clone() if interval_acc is None else interval_acc + loss_det
+            )
+            interval_count += 1
+            history.last_good_loss = float(loss_det)
             step_tokens = int(x[:, 1:].numel())
+            last_eff_batch = step_tokens
             tokens_consumed += step_tokens
             history.tokens_processed = tokens_consumed
+            interval.steps += 1
+            interval.tokens += step_tokens
             # ---- intra-epoch periodic checkpoint (--save-every-tokens) ----
             if save_every_tokens > 0:
                 multiple = tokens_consumed // save_every_tokens
@@ -1025,15 +1436,16 @@ def train_epochs(
                     pckpt_path = os.path.join(
                         out_dir, f"step-{global_step}.pt"
                     )
-                    save_checkpoint(
-                        pckpt_path, model, global_step,
-                        sum(epoch_losses) / len(epoch_losses), None,
-                        tokenizer_path, optimizer=opt,
-                        rng_state=capture_rng_state(), epoch=epoch,
-                        tokens_consumed=tokens_consumed,
-                        run_metadata=run_metadata,
-                        tokenizer_fingerprint=ckpt_fp,
-                        last_grad_norm=history.last_grad_norm,
+                    mean = (
+                        float(epoch_acc / epoch_count)
+                        if epoch_acc is not None and epoch_count > 0
+                        else float("nan")
+                    )
+                    _save_ckpt(
+                        pckpt_path, global_step, mean, None,
+                        rng=capture_rng_state(), ckpt_epoch=epoch,
+                        ckpt_tokens=tokens_consumed,
+                        ckpt_norm=history.last_grad_norm,
                     )
                     history.last_periodic_checkpoint = pckpt_path
                     log.info(
@@ -1042,15 +1454,19 @@ def train_epochs(
                         os.path.basename(pckpt_path), epoch, global_step,
                         tokens_consumed,
                     )
+            flush_interval()
             if token_budget is not None and tokens_consumed >= token_budget:
                 history.budget_reached = True
                 break
+        flush_interval(force=True)
         if steps == 0 and history.budget_reached:
             # Budget was already exhausted before this epoch (resume case):
             # nothing new was trained — no val pass, no checkpoint overwrite.
             break
         train_loss = (
-            sum(epoch_losses) / len(epoch_losses) if epoch_losses else float("nan")
+            float(epoch_acc / epoch_count)
+            if epoch_acc is not None and epoch_count > 0
+            else float("nan")
         )
         val_loss = (
             evaluate(model, val_ds, device=device, max_steps=val_max_steps)
@@ -1058,11 +1474,10 @@ def train_epochs(
             else None
         )
         ckpt_path = os.path.join(out_dir, f"step-{global_step}.pt")
-        save_checkpoint(
-            ckpt_path, model, global_step, train_loss, val_loss, tokenizer_path,
-            optimizer=opt, rng_state=capture_rng_state(), epoch=epoch,
-            tokens_consumed=tokens_consumed, run_metadata=run_metadata,
-            tokenizer_fingerprint=ckpt_fp, last_grad_norm=history.last_grad_norm,
+        _save_ckpt(
+            ckpt_path, global_step, train_loss, val_loss,
+            rng=capture_rng_state(), ckpt_epoch=epoch,
+            ckpt_tokens=tokens_consumed, ckpt_norm=history.last_grad_norm,
         )
         row = EpochRow(
             epoch=epoch,
@@ -1080,6 +1495,8 @@ def train_epochs(
             "n/a" if val_loss is None else f"{val_loss:.4f}",
             ckpt_path,
         )
+        epoch_acc = None
+        epoch_count = 0
     history.run_wall_s = time.monotonic() - t_run
     return history
 
@@ -1196,6 +1613,58 @@ def make_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--val-max-steps", type=int, default=None,
                    help="cap validation batches (CI / smoke runs)")
     p.add_argument("--device", default=None, help="compute device (default: auto)")
+    # T4 training-engine flags (P1; additive — defaults reproduce old behavior)
+    p.add_argument(
+        "--attention-backend", choices=ATTENTION_BACKEND_CHOICES, default="auto",
+        help="attention execution backend: 'auto' (default) prefers flash-attn "
+             "when installed, else SDPA (torch scaled_dot_product_attention — "
+             "the full-causal path materializes NO -inf mask, which removes the "
+             "fp16 overflow root cause); 'plain' = the legacy functional path "
+             "(the T4 A/B 'old' lane); 'sdpa' / 'flash' force a specific engine.",
+    )
+    p.add_argument(
+        "--amp", choices=AMP_CHOICES, default="none",
+        help="mixed precision: 'none' (fp32, default) or 'fp16' (autocast + "
+             "GradScaler; requires the SDPA attention backend to avoid the "
+             "recorded -inf Half overflow). Validation always runs fp32.",
+    )
+    p.add_argument(
+        "--fused-optim", action="store_true",
+        help="use the fused CUDA AdamW kernel (P1c). CUDA-only; errors on CPU.",
+    )
+    p.add_argument(
+        "--pin-memory", action="store_true",
+        help="pin the packed-batch pool and hand batches to the device with "
+             "non_blocking H2D (P1d).",
+    )
+    p.add_argument(
+        "--prefetch", type=int, default=0, metavar="N",
+        help="prefetch N batches on a background thread (P1e); 0 = the classic "
+             "synchronous data path. Enables cached shard mmaps + reusable "
+             "batch buffers.",
+    )
+    p.add_argument(
+        "--compile", action="store_true",
+        help="torch.compile() the model (P1f). Default off; changes numerics "
+             "slightly — never combine with bit-exact resume expectations.",
+    )
+    p.add_argument(
+        "--log-every-steps", type=int, default=50, metavar="N",
+        help="per-interval observability: accumulate losses/timers on device "
+             "and emit one LINE + sidecar record every N steps (P4; 0 = "
+             "epoch-end only).",
+    )
+    p.add_argument(
+        "--ckpt-staging-dir", default=None, metavar="DIR",
+        help="write checkpoints to this LOCAL directory first (atomic "
+             "tmp+fsync+rename on the local FS); a background thread copies "
+             "them to --out-dir, so Drive latency never blocks training (P5).",
+    )
+    p.add_argument(
+        "--no-ckpt-fsync", action="store_true",
+        help="disable the per-checkpoint fsync (P5). Default: fsync on, with "
+             "graceful degradation on filesystems that do not support it.",
+    )
     return p
 
 
@@ -1240,6 +1709,60 @@ def _write_final_artifacts(
         fh.write("\n")
 
 
+def _assemble_performance(history: TrainingHistory) -> Dict[str, Any]:
+    """Steady-state throughput + phase-time split from the last interval (P4).
+
+    The last full log interval is the best single-lane estimate of maintained
+    throughput (warm-up/checkpoint-skewed steps are excluded); run-wide totals
+    are reported alongside.
+    """
+    last = history.interval_logs[-1] if history.interval_logs else None
+    run_tokens = history.tokens_processed
+    run_s = history.run_wall_s
+    intervals = history.interval_logs
+    return {
+        "last_interval": last,
+        "num_intervals": len(intervals),
+        "steady_state_tok_s": (
+            last["tok_s"] if last is not None and last.get("tok_s") else None
+        ),
+        "steady_state_steps_s": (
+            last["steps_s"] if last is not None and last.get("steps_s") else None
+        ),
+        "run_wide_tok_s": round(run_tokens / run_s, 3) if run_s > 0 else None,
+        "run_wide_steps_s": (
+            round(history.attempts / run_s, 4) if run_s > 0 else None
+        ),
+        "phase_mean_ms_per_step": (
+            {
+                "data": round(
+                    1000 * sum(i["data_s"] for i in intervals)
+                    / max(1, sum(i["steps"] for i in intervals)), 3,
+                ),
+                "fwd": round(
+                    1000 * sum(i["fwd_s"] for i in intervals)
+                    / max(1, sum(i["steps"] for i in intervals)), 3,
+                ),
+                "bwd": round(
+                    1000 * sum(i["bwd_s"] for i in intervals)
+                    / max(1, sum(i["steps"] for i in intervals)), 3,
+                ),
+                "optim": round(
+                    1000 * sum(i["optim_s"] for i in intervals)
+                    / max(1, sum(i["steps"] for i in intervals)), 3,
+                ),
+                "ckpt": round(
+                    1000 * sum(i["ckpt_s"] for i in intervals)
+                    / max(1, sum(i["steps"] for i in intervals)), 3,
+                ),
+            }
+            if intervals
+            else None
+        ),
+        "checkpoint_save_total_s": round(history.checkpoint_save_s, 3),
+    }
+
+
 def train_run(args: argparse.Namespace) -> dict:
     """Run the full chain; returns the metrics dict (also saved to metrics.json).
 
@@ -1280,6 +1803,36 @@ def train_run(args: argparse.Namespace) -> dict:
     max_consecutive_bad_steps = getattr(args, "max_consecutive_bad_steps", 3)
     if max_consecutive_bad_steps is None:
         max_consecutive_bad_steps = 3
+    # --- T4 engine-pass flags (P1; additive, defaults reproduce old behavior) --
+    attention_backend = getattr(args, "attention_backend", "auto") or "auto"
+    amp = getattr(args, "amp", "none") or "none"
+    fused_optim = bool(getattr(args, "fused_optim", False))
+    pin_memory = bool(getattr(args, "pin_memory", False))
+    prefetch = getattr(args, "prefetch", 0) or 0
+    compile_enabled = bool(getattr(args, "compile", False))
+    log_every_steps = getattr(args, "log_every_steps", 50)
+    ckpt_staging_dir = getattr(args, "ckpt_staging_dir", None)
+    ckpt_fsync = not bool(getattr(args, "no_ckpt_fsync", False))
+    if attention_backend not in ATTENTION_BACKEND_CHOICES:
+        raise ValueError(
+            f"--attention-backend must be one of {ATTENTION_BACKEND_CHOICES}, "
+            f"got {attention_backend!r}"
+        )
+    if amp not in AMP_CHOICES:
+        raise ValueError(f"--amp must be one of {AMP_CHOICES}, got {amp!r}")
+    if prefetch < 0:
+        raise ValueError(f"--prefetch must be >= 0, got {prefetch}")
+    if log_every_steps < 0:
+        raise ValueError(f"--log-every-steps must be >= 0, got {log_every_steps}")
+    if amp == "fp16" and attention_backend == "plain":
+        # The recorded fp16 failure (c10::Half overflow) is root-caused to the
+        # plain path's -inf mask materialization; refuse the known-bad combo.
+        raise ValueError(
+            "--amp fp16 requires the SDPA attention backend "
+            "(--attention-backend sdpa or auto without flash-attn): the plain "
+            "path's -inf mask materialization overflowed half; SDPA removes it "
+            "by construction. Use --attention-backend sdpa for fp16."
+        )
     if save_every_tokens < 0:
         raise ValueError(
             f"--save-every-tokens must be >= 0, got {save_every_tokens}"
@@ -1548,9 +2101,20 @@ def train_run(args: argparse.Namespace) -> dict:
         )
 
     # ---- 2) canonical preset model + hard param-count guard (fail fast) ---
-    model = build_preset_model(preset).to(device)
+    model = build_preset_model(preset, attention_backend=attention_backend).to(device)
     n_params = model.num_parameters()
-    print(f"  model: {n_params:,} params (vocab {model.config.vocab_size}) — config guard OK")
+    print(f"  model: {n_params:,} params (vocab {model.config.vocab_size}) — "
+          f"config guard OK | attention backend: "
+          f"{type(model.backend).__name__} | amp: {amp}")
+    if compile_enabled:
+        try:
+            model = torch.compile(model)
+        except Exception as exc:  # pragma: no cover - env dependent
+            raise ValueError(f"--compile failed: {exc}") from exc
+        print("  model      : torch.compile() enabled")
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.empty_cache()
 
     # ---- 3) streamed token batches -----------------------------------------
     # max_id=cfg.vocab_size: a tokenizer/model vocab mismatch fails at the data
@@ -1558,14 +2122,21 @@ def train_run(args: argparse.Namespace) -> dict:
     if packed_manifest is not None:
         train_paths = packed_phase_shard_paths(packed_manifest, packed_dir, "train")
         val_paths = packed_phase_shard_paths(packed_manifest, packed_dir, "val")
+        fast_data = dict(
+            cache_mmaps=(prefetch > 0) or pin_memory,
+            pin_memory=pin_memory,
+            prefetch=prefetch,
+        )
         train_ds: Iterable = PackedTokenDataset(
             train_paths, seq_len=effective_seq, batch_size=args.batch,
             expected_dtype=packed_manifest["dtype"], max_id=cfg.vocab_size,
+            **fast_data,
         )
         val_ds: Optional[Iterable] = (
             PackedTokenDataset(
                 val_paths, seq_len=effective_seq, batch_size=args.batch,
                 expected_dtype=packed_manifest["dtype"], max_id=cfg.vocab_size,
+                **fast_data,
             )
             if val_paths
             else None
@@ -1605,6 +2176,16 @@ def train_run(args: argparse.Namespace) -> dict:
         "max_consecutive_bad_steps": max_consecutive_bad_steps,
         "save_every_tokens": save_every_tokens,
         "device": str(device),
+        # T4 engine pass (P1/P4): execution-engine + observability settings.
+        "attention_backend": attention_backend,
+        "amp": amp,
+        "fused_optim": fused_optim,
+        "pin_memory": pin_memory,
+        "prefetch": prefetch,
+        "compile": compile_enabled,
+        "log_every_steps": log_every_steps,
+        "ckpt_staging_dir": ckpt_staging_dir,
+        "ckpt_fsync": ckpt_fsync,
     }
     tokenizer_meta = {
         "sha256": (
@@ -1760,8 +2341,30 @@ def train_run(args: argparse.Namespace) -> dict:
             ),
             #: most recent intra-epoch (--save-every-tokens) checkpoint, if any.
             "periodic_checkpoint": history.last_periodic_checkpoint,
+            # --- T4 engine pass (P4/P5): engine config + performance ---
+            "attention_backend": attention_backend,
+            "engine": {
+                "attention_backend": attention_backend,
+                "amp": amp,
+                "fused_optim": fused_optim,
+                "pin_memory": pin_memory,
+                "prefetch": prefetch,
+                "compile": compile_enabled,
+                "log_every_steps": log_every_steps,
+                "ckpt_staging_dir": ckpt_staging_dir,
+                "ckpt_fsync": ckpt_fsync,
+            },
+            "checkpoint_save_total_s": round(history.checkpoint_save_s, 3),
+            "vram_peak_mb": (
+                round(torch.cuda.max_memory_allocated(device) / 2**20, 1)
+                if device.type == "cuda" else None
+            ),
+            "interval_logs": [dict(e) for e in history.interval_logs],
+            "performance": _assemble_performance(history),
         }
 
+    # P5: local-then-copy checkpoint staging (Drive latency off the hot path).
+    ckpt_stager = CheckpointStager(ckpt_staging_dir, out_dir)
     try:
         history = train_epochs(
             model, train_ds, val_ds,
@@ -1781,6 +2384,11 @@ def train_run(args: argparse.Namespace) -> dict:
             save_every_tokens=save_every_tokens,
             grad_clip=grad_clip,
             max_consecutive_bad_steps=max_consecutive_bad_steps,
+            amp=amp,
+            fused_optim=fused_optim,
+            log_every_steps=log_every_steps,
+            ckpt_stager=ckpt_stager,
+            ckpt_fsync=ckpt_fsync,
         )
     except BadStepsAbort as exc:
         # The abort is a DELIBERATE stop: write the same artifacts a clean
@@ -1790,6 +2398,7 @@ def train_run(args: argparse.Namespace) -> dict:
         history = exc.history if exc.history is not None else TrainingHistory()
         metrics = _assemble_metrics(history)
         _write_final_artifacts(out_dir, run_metadata, metrics)
+        ckpt_stager.drain()
         print(
             f"\n  ABORTED after {history.consecutive_bad_steps} consecutive "
             f"NaN/Inf steps: {exc}\n  metrics + recoverable checkpoint "
@@ -1801,6 +2410,7 @@ def train_run(args: argparse.Namespace) -> dict:
     # ---- 6) metrics ---------------------------------------------------------
     metrics = _assemble_metrics(history)
     _write_final_artifacts(out_dir, run_metadata, metrics)
+    ckpt_stager.drain()
     last = history.rows[-1] if history.rows else None
     print(f"\n  final train loss  : {last.train_loss if last else 'n/a'}")
     print(f"  final val loss    : {last.val_loss if last and last.val_loss is not None else 'n/a'}")
