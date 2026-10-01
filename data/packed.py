@@ -318,22 +318,30 @@ class _PrefetchIterator:
 
 
 class _FastBatchIterator:
-    """Zero-per-batch-allocation iterator over packed shards.
+    """mmap-cached, prefetch-friendly iterator over packed shards.
 
     * mmap views of each shard are cached (``cache_mmaps``) so the header
       parse + full-shard id min/max validation runs ONCE per dataset lifetime
       instead of once per epoch (a real cost when shards live on a slow/remote
       filesystem like Colab Drive);
-    * output batches are copied into a small pool of reusable (optionally
-      pinned) int64 buffers — no per-batch ``np.empty`` / ``from_numpy``
-      allocation. The trainer's ``.to(device, non_blocking=True)`` handoff can
-      then overlap H2D with compute (the caller must not mutate/reuse a
-      yielded buffer before consuming it; pool depth ``prefetch + 2`` keeps the
-      round-robin ahead of the consumer, so in-flight H2D copies are never
-      overwritten);
-    * with ``prefetch > 0`` the pool-filling is fronted by
+    * every batch is assembled into a FRESH (optionally pinned) int64 tensor.
+      A fixed round-robin pool of reusable buffers was tried first and is
+      deliberately NOT used: a pooled iterator hands the consumer a *view* of
+      shared memory, so the pool slot is silently overwritten by a later batch
+      whenever the consumer retains the yielded tensor (materializing a list,
+      holding the batch across an async pinned H2D copy, or keeping the
+      previous batch alive while fetching the next). That violates the
+      dataset's stream-equality contract (``fast == classic`` for the full
+      stream, at any batch_size/prefetch/pin_memory combination), so the pool
+      is replaced by fresh per-batch buffers — the same allocation semantics
+      as the classic path, at the same cost, with the mmap-cache and prefetch
+      wins kept. torch's CPU caching allocator reuses the freed buffers once
+      the consumer is done, so the steady-state allocation rate is still low;
+    * with ``prefetch > 0`` batch assembly is fronted by
       :class:`_PrefetchIterator` (bounded queue throttles the worker to at
-      most ``prefetch`` batches ahead — the pool depth guarantee above).
+      most ``prefetch`` batches ahead; each queued tensor is an independent
+      buffer, so the prefetcher's writes can never race an in-flight
+      ``.to(device, non_blocking=True)`` copy of an earlier batch).
     """
 
     def __init__(
@@ -346,7 +354,6 @@ class _FastBatchIterator:
         self._ds = dataset
         self._cache = mmap_cache
         self._prefetch = int(prefetch)
-        nbufs = max(2, self._prefetch + 2)
         # pin_memory=True without CUDA raises (no pinned allocator on a
         # CPU-only build) — degrade to regular host buffers, flagging it once.
         self._pinned = bool(dataset.pin_memory) and torch.cuda.is_available()
@@ -356,16 +363,6 @@ class _FastBatchIterator:
                 "available (torch built without CUDA?) — using regular host "
                 "buffers; non_blocking H2D is a no-op"
             )
-        self._pool = [
-            torch.empty(
-                (dataset.batch_size, dataset.seq_len),
-                dtype=torch.int64,
-                pin_memory=self._pinned,
-            )
-            for _ in range(nbufs)
-        ]
-        # numpy views of the pool (np.copyto casts int32/uint16 -> int64).
-        self._views = [b.numpy() for b in self._pool]
 
     def _mmap(self, path: str) -> np.ndarray:
         if self._cache is not None and path in self._cache:
@@ -379,22 +376,18 @@ class _FastBatchIterator:
         return self
 
     def __next__(self) -> "torch.Tensor":
-        ds = self._ds
         if self._state is None:
             self._state = iter(self._enumerate())
         try:
-            buf, n = next(self._state)
+            return next(self._state)
         except StopIteration:
             self._state = None
             raise
-        return buf[:n]
 
     next = __next__
 
-    def _enumerate(self) -> Iterator[tuple]:
-        """Yield ``(pooled_tensor, batch_size)`` per packed row group."""
-        nbufs = len(self._pool)
-        k = 0
+    def _enumerate(self) -> Iterator["torch.Tensor"]:
+        """Yield one fresh ``torch.Tensor`` batch per packed row group."""
         for path in self._ds.paths:
             arr = self._mmap(path)
             if arr.dtype != _NP_DTYPES[self._ds.expected_dtype]:
@@ -421,12 +414,19 @@ class _FastBatchIterator:
                 n = min(self._ds.batch_size, len(arr) - start)
                 if n < self._ds.batch_size and self._ds.drop_last:
                     continue
-                buf = self._pool[k % nbufs]
-                np.copyto(self._views[k % nbufs][:n], arr[start : start + n])
-                yield buf, n
-                k += 1
+                # Fresh (optionally pinned) int64 buffer per batch — never a
+                # view of shared memory, so the consumer may retain, reorder
+                # or asynchronously copy the yielded tensor freely (the exact
+                # classic-path allocation semantics). np.copyto casts
+                # int32/uint16 -> int64 in one pass.
+                buf = torch.empty(
+                    (n, self._ds.seq_len), dtype=torch.int64,
+                    pin_memory=self._pinned,
+                )
+                np.copyto(buf.numpy(), arr[start : start + n])
+                yield buf
 
-    _state: Optional[Iterator[tuple]] = None
+    _state: Optional[Iterator["torch.Tensor"]] = None
 
 
 class PackedTokenDataset(IterableDataset):
@@ -455,14 +455,14 @@ class PackedTokenDataset(IterableDataset):
             every shard per epoch. Safe because shards are immutable by
             convention (the corpus-preparation contract); deterministic — the
             token stream is unchanged.
-        pin_memory: allocate the reusable batch pool as pinned host memory so
-            the trainer's ``.to(device, non_blocking=True)`` handoff can
-            overlap H2D with compute (CUDA only; harmless elsewhere).
+        pin_memory: allocate every batch as pinned host memory so the
+            trainer's ``.to(device, non_blocking=True)`` handoff can overlap
+            H2D with compute (CUDA only; harmless elsewhere).
         prefetch: > 0 fills batches on a bounded prefetch thread up to
             ``prefetch`` batches ahead of the consumer (default 0 = the
             classic synchronous iterator). Output dtype is ``torch.int64``
-            when any fast-path option is enabled (the pooled buffers are
-            int64; the trainer's ``.long()`` cast then becomes a no-op).
+            when any fast-path option is enabled (the int64 buffers mean the
+            trainer's ``.long()`` cast is a no-op).
     """
 
     def __init__(

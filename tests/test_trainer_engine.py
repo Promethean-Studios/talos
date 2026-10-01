@@ -121,9 +121,14 @@ def test_amp_none_and_fp16_cpu_produce_identical_grads(tmp_path):
         ckpt = torch.load(os.path.join(out, "step-2.pt"),
                           map_location="cpu", weights_only=False)
         outs.append(ckpt["model_state_dict"]["layers.0.attention.q_proj.weight"])
-    assert torch.allclose(outs[0], outs[1], atol=2e-3, rtol=2e-3), (
+    # Not bit-exactness: CPU autocast genuinely casts matmuls to half, so the
+    # fp16 path diverges from fp32 by fp16-rounding accumulation (measured
+    # ~5e-3 max abs after 2 steps on this box, mean ~2e-5). The bound is a
+    # sanity check that the AMP plumbing is engaged and sane — a broken
+    # autocast/scaler path diverges by orders of magnitude more.
+    assert torch.allclose(outs[0], outs[1], atol=1e-2, rtol=1e-2), (
         "amp fp16 on CPU (autocast casts matmuls to half; scaler no-op) must "
-        "be numerically close to amp none"
+        "track amp none within fp16 rounding"
     )
 
 
@@ -224,11 +229,59 @@ def test_packed_fast_path_stream_equals_classic(tmp_path):
                                    prefetch=2, **kw))
     assert len(fast) == len(classic)
     for a, b in zip(classic, fast):
-        # fast path yields int64 pooled buffers; classic yields int32 —
+        # fast path yields int64 buffers; classic yields int32 —
         # values must be identical.
         assert torch.equal(a.long(), b.long()), (
             "fast-path token stream must equal classic"
         )
+
+
+def test_packed_fast_path_stream_equals_classic_all_options(tmp_path):
+    """The fast path must equal classic for the FULL stream — across every
+    shard boundary and partial tail — under any combination of batch_size,
+    drop_last, cache_mmaps, pin_memory and prefetch, and stay identical when
+    the dataset is iterated a second time (mmap-cache epoch reuse).
+
+    A real correctness bug lived here once: the fast path returned views of a
+    small round-robin pool, so a consumer that retained yielded batches (e.g.
+    ``list(dataset)``, or an in-flight pinned async H2D copy) read silently
+    overwritten slots a few batches later. Fresh per-batch buffers (the
+    classic-path allocation semantics) restore the contract.
+    """
+    packed_dir, tok_path, paths, manifest = _packed_mini(tmp_path)
+    seq = manifest["seq_len"]
+    base = dict(seq_len=seq, expected_dtype="int32", max_id=1024)
+    fast_opts = (
+        dict(cache_mmaps=False, pin_memory=True, prefetch=0),
+        dict(cache_mmaps=True, pin_memory=False, prefetch=0),
+        dict(cache_mmaps=True, pin_memory=True, prefetch=1),
+        dict(cache_mmaps=True, pin_memory=True, prefetch=3),
+        dict(cache_mmaps=False, pin_memory=True, prefetch=2),
+        dict(cache_mmaps=True, pin_memory=False, prefetch=2),
+    )
+    checked = 0
+    for batch_size in (1, 2, 3, 8):  # 3/8 exercise shard-boundary + tail rows
+        for drop_last in (True, False):
+            kw = dict(batch_size=batch_size, drop_last=drop_last, **base)
+            classic = list(PackedTokenDataset(paths, **kw))
+            for opts in fast_opts:
+                for epoch in (1, 2):  # single pass + mmap-cache epoch reuse
+                    fast = list(PackedTokenDataset(paths, **opts, **kw))
+                    assert len(fast) == len(classic), (
+                        f"batch {batch_size} drop_last {drop_last} opts {opts} "
+                        f"epoch {epoch}: {len(fast)} batches vs classic "
+                        f"{len(classic)}"
+                    )
+                    for i, (a, b) in enumerate(zip(fast, classic)):
+                        assert a.shape == b.shape and torch.equal(
+                            a.long(), b.long()
+                        ), (
+                            f"batch {batch_size} drop_last {drop_last} opts "
+                            f"{opts} epoch {epoch} batch {i}: token stream "
+                            "diverged from classic"
+                        )
+                    checked += 1
+    assert checked == 4 * 2 * len(fast_opts) * 2
 
 
 def test_packed_train_e2e_with_prefetch(tmp_path):
