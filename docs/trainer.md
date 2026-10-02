@@ -1087,6 +1087,56 @@ metadata (`args` echo) — so a post-hoc audit can always tell which precedence 
 
 ---
 
+### 24.1 Manifest recovery when `manifest.json` is lost (`scripts/recover_manifest.py`)
+If a packed corpus directory has intact `*.npy` shards but a missing/corrupt `manifest.json`
+(owner's Drive-sync scenario, 2026-10-01), **recover the manifest FROM the shards — never
+regenerate the corpus**. `scripts/recover_manifest.py` is corpus-METADATA recovery:
+- **Discovery mirrors the writer exactly** (`shard-{phase}-{index:04d}.npy`, index order, val
+  entries first — shard order is load-bearing for the training stream and is never reordered;
+  `--train-glob`/`--val-glob` exist for custom layouts and the order rule is printed, never silent).
+- **Per-shard integrity first** (mmap load, dtype `uint16`/`int32`, shape `(rows, 512)`, ids in
+  `[0, vocab)`, file size == header + rows*cols*itemsize, sha256 recomputed). ANY failure prints a
+  per-shard report and STOPS (exit 3, nothing written) — regenerating after an integrity failure
+  is the OWNER's decision.
+- **Every field `prepare_corpus.py` writes is reproduced**; fields not derivable from the shards
+  (dataset identity, HF revision/sha, original timestamps, `args`, ...) are `null` and listed in
+  the `recovery` block. `eos_id`/`pad_id`/tokenizer-sha come from `--tokenizer-json` (preferred:
+  the real tokenizer file recomputes sha256/vocab/merges so the resume identity matches), a
+  `--checkpoint` of the run (its recorded `manifest_identity` + original metadata verify every
+  recovered value), the sibling `run_metadata.json` (auto-discovered when present), or explicit
+  `--eos-id`/`--pad-id`. Sources must AGREE or recovery refuses; values are never guessed.
+- Counts are recomputed from the bytes: rows exact; real tokens = rows*seq minus the pad tail
+  (the pad id is verified to occur only as the final-row suffix of each region's last shard).
+- `--expected-tokens-train`/`--expected-tokens-val` cross-check the owner-known counts; a
+  mismatch beyond `--expected-token-tolerance` (default 0) blocks the write without `--force`.
+- Writes atomically (tmp+fsync+rename); refuses to overwrite an existing manifest without
+  `--force`; `--dry-run` prints the full report without writing.
+
+**Exact commands (owner, Colab):**
+
+    # 1) recovery (tokenizer-json is REQUIRED for a resume-safe manifest)
+    python -m scripts.recover_manifest \
+        --packed-dir Talos/Styx_100M/data/fw-edu-250m \
+        --tokenizer-json <tokenizer.json used to pack the corpus> \
+        --checkpoint <run dir>/step-30000.pt \
+        --expected-tokens-train 205002065 --expected-tokens-val 15001394
+
+    # 2) resume the run from the valid step-30000 checkpoint
+    #    (SAME flags as the original run EXCEPT --resume; --epochs = same TOTAL)
+    python -m scripts.train_oasst1 \
+        --preset tiny_100m --packed-dir Talos/Styx_100M/data/fw-edu-250m \
+        --tokenizer-json <same tokenizer.json> \
+        --out-dir <same run dir> --resume <same run dir> \
+        --epochs <SAME TOTAL> --token-budget <same budget> [all other flags as before]
+
+**What to verify in the recovery report before resuming:** `dtype`/`seq` (uint16/512), row and
+token counts per phase (val ~15,001,394 / train ~205,002,065 real tokens), the `eos_id`/`pad_id`
+sources, the tokenizer sha256 match, all 46 shards `OK`, and the expected-tokens cross-check
+passing. The trainer then validates the recovered manifest through
+`data.packed.load_packed_manifest` and the resume identity-compare automatically — a mismatch
+with the checkpoint refuses loudly (this includes the tokens-consumed-vs-corpus-capacity guard,
+`train_oasst1.py` §17.3 / Del. 6 of the recovery pass).
+
 ## 25. Token-Budget Training
 
 - **`--token-budget` is the PRIMARY stop target.** The trainer stops mid-epoch as soon as

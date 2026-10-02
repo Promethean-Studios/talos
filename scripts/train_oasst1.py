@@ -1960,6 +1960,31 @@ def train_run(args: argparse.Namespace) -> dict:
                     "recorded corpus identity (seq/dtype/tokenizer/rows differ)"
                     " — refusing to continue training on different data"
                 )
+            # Manifest-recovery guard (minimal, additive): the resume counter
+            # must be consistent with the corpus the manifest describes.
+            # tokens_consumed accrues batch*(seq-1) per step and each step
+            # consumes one row-batch, so a single epoch can consume at most
+            # train_rows*(seq-1) tokens and the whole run at most --epochs
+            # times that. A counter beyond that capacity is impossible for
+            # this corpus (corrupted counter, or a manifest for different
+            # data) — fail loudly instead of silently continuing. Token
+            # accounting semantics are untouched.
+            ckpt_tokens = resume_ckpt.get("tokens_consumed")
+            if (
+                isinstance(ckpt_tokens, int) and ckpt_tokens > 0
+                and args.epochs and args.epochs > 0
+            ):
+                epoch_capacity = counts["train_rows"] * (m_seq - 1)
+                if ckpt_tokens > epoch_capacity * args.epochs:
+                    raise ValueError(
+                        f"resume checkpoint records {ckpt_tokens:,} tokens "
+                        f"consumed but the packed corpus (train "
+                        f"{counts['train_rows']:,} rows x {m_seq - 1} label "
+                        f"tokens) can supply at most "
+                        f"{epoch_capacity * args.epochs:,} across {args.epochs} "
+                        f"epoch(s) — corrupted counter or a manifest for "
+                        "different data; refusing to resume"
+                    )
     else:
         effective_seq = args.seq if args.seq is not None else 64
         split = split_jsonl(
