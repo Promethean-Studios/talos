@@ -1008,11 +1008,32 @@ this doc's earlier revisions listed as `--super-save-every`/`--nan-abort` (§29 
 `--keep-partial` (flag) · `--max-steps` (None) · `--seed` (0) · `--device` (auto) ·
 `--out-metrics` (default `<ckpt dir>/eval-metrics.json`).
 
-### 21.4 `scripts/generate.py` (`:265-291`)
-
+### 21.4 `scripts/generate.py`
 `--checkpoint` (file or dir; required) · `--prompt` (required) · `--max-new-tokens` (32) ·
 `--temperature` (None = greedy argmax, deterministic) · `--seed` (None; mandatory with
-`--temperature`) · `--device` (auto).
+`--temperature`) · `--top-k` (0 = off) · `--top-p` (1.0 = off) ·
+`--repetition-penalty` (1.0 = off; CTRL-style, works with greedy) ·
+`--penalize-prompt` (flag; include the prompt ids in the penalty) ·
+`--eos-token-id` (None = the tokenizer's EOS token, when it defines one) ·
+`--device` (auto).
+
+Anti-repetition decoding (remedy R1 of the Styx generation diagnosis): the controls
+compose per step as repetition penalty → temperature → top-k → top-p → softmax/sample
+(greedy = argmax after penalty/top-k/top-p filtering). `--repetition-penalty` combined
+with greedy (no `--temperature`) is valid and deterministic (RNG-free).
+
+```bash
+# repetition penalty + nucleus sampling against greedy byte-loops
+python -m scripts.generate --checkpoint <run_dir> --prompt "The capital of France is" \
+    --max-new-tokens 128 --repetition-penalty 1.15 --top-p 0.92 \
+    --temperature 0.85 --seed 0
+# deterministic anti-repetition: penalty + greedy (no --seed needed)
+python -m scripts.generate --checkpoint <run_dir> --prompt "The capital of France is" \
+    --max-new-tokens 64 --repetition-penalty 1.2
+```
+
+When generation stops on the EOS token the report prints `stop: eos` and the EOS id is
+never part of the generated text.
 
 ### 21.5 `scripts/export_safetensors.py`
 
@@ -1220,11 +1241,14 @@ Important nuances (from `scripts/eval_checkpoint.py:18-85` + `evaluation/harness
 
 ```bash
 python -m scripts.generate --checkpoint <run_dir> --prompt "The capital of France is" \
-    [--max-new-tokens 32] [--temperature 0.8 --seed 0] [--device cuda]
+    [--max-new-tokens 32] [--temperature 0.8 --seed 0] \
+    [--top-k K] [--top-p P] [--repetition-penalty R] [--eos-token-id ID] [--device cuda]
 ```
 
 Greedy (no `--temperature`) is deterministic and RNG-free; temperature sampling requires `--seed`.
-The CLI truncates long contexts correctly (audit §5; library guard fixed in PR #25).
+Anti-repetition controls (`--repetition-penalty`, `--top-k`, `--top-p`) compose per step; the
+penalty also works with greedy (see §21.4). The CLI truncates long contexts correctly (audit §5;
+library guard fixed in PR #25).
 
 ### 27.3 What is NOT claimed
 
