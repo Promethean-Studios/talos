@@ -386,8 +386,8 @@ def test_train_run_abort_writes_metrics_metadata_and_is_recoverable(
     real_build = train_mod.build_preset_model
     calls = {"n": 0}
 
-    def build_with_nan_injector(preset):
-        model = real_build(preset)
+    def build_with_nan_injector(preset, **kw):
+        model = real_build(preset, **kw)
         orig_forward = model.forward
 
         def forward(self, x, *a, **kw):
