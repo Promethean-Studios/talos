@@ -20,6 +20,9 @@ __all__ = [
     "prefill",
     "decode_step",
     "generate",
+    "apply_repetition_penalty",
+    "top_k_filter",
+    "top_p_filter",
     "prefill_decode_max_abs_diff",
     "EquivalenceReport",
 ]
@@ -79,17 +82,120 @@ def decode_step(
     return logits
 
 
+def apply_repetition_penalty(
+    logits: torch.Tensor,
+    token_ids: List[int],
+    penalty: float = 1.2,
+) -> torch.Tensor:
+    """CTRL-style repetition penalty over ``token_ids`` (non-mutating).
+
+    For every distinct id in ``token_ids`` its logit is pushed away from
+    sampling: positive logits are divided by ``penalty`` (demoted), negative
+    logits are multiplied by ``penalty`` (pushed further negative), so a
+    repeatedly-emitted token is less likely to be chosen again. ``penalty ==
+    1.0`` (or an empty ``token_ids``) is the identity.
+
+    Args:
+        logits: ``(batch, vocab)`` raw logits.
+        token_ids: token ids seen so far in this sample (may include prompt
+            ids when prompt-penalization is wanted).
+        penalty: ``> 0``; ``1.0`` disables. Values ``> 1`` penalize repetition,
+            values ``< 1`` encourage it.
+
+    Returns:
+        A new tensor with the penalized logits (input is never modified).
+    """
+    if penalty == 1.0 or not token_ids:
+        return logits
+    out = logits.clone()
+    vocab = out.size(-1)
+    for t in set(token_ids):
+        if 0 <= t < vocab:
+            lt = out[:, t]
+            out[:, t] = torch.where(lt > 0, lt / penalty, lt * penalty)
+    return out
+
+
+def top_k_filter(logits: torch.Tensor, k: int) -> torch.Tensor:
+    """Truncate to the ``k`` highest-scoring tokens; set the rest to ``-inf``.
+
+    Non-mutating. ``k <= 0`` or ``k >= vocab`` is the identity (top-k off).
+
+    Args:
+        logits: ``(batch, vocab)`` logits.
+        k: how many tokens to keep (by score, ties broken by index).
+
+    Returns:
+        A new tensor where only the top-``k`` positions keep their logits
+        (all others ``-inf``, i.e. zero probability after softmax).
+    """
+    if k <= 0 or k >= logits.size(-1):
+        return logits
+    topk = torch.topk(logits, k, dim=-1)
+    keep = torch.zeros_like(logits, dtype=torch.bool)
+    keep.scatter_(-1, topk.indices, True)
+    return logits.masked_fill(~keep, float("-inf"))
+
+
+def top_p_filter(logits: torch.Tensor, p: float) -> torch.Tensor:
+    """Nucleus (top-p) truncation: keep the smallest set with mass ``>= p``.
+
+    Called on raw logits: the softmax distribution is computed internally to
+    find the cutoff, then every token outside the nucleus is set to ``-inf``
+    (zero probability after the caller's softmax, which renormalizes the
+    nucleus to mass 1). Non-mutating. ``p >= 1.0`` is the identity (top-p off).
+
+    Args:
+        logits: ``(batch, vocab)`` logits.
+        p: cumulative-probability cutoff in ``(0, 1]``; the single highest-mass
+            token is always kept, so the filtered set is never empty.
+
+    Returns:
+        A new tensor with all non-nucleus logits set to ``-inf``.
+    """
+    if p >= 1.0 or p <= 0.0:
+        return logits
+    sorted_logits, sorted_indices = torch.sort(logits, dim=-1, descending=True)
+    cumulative = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+    remove = cumulative > p
+    remove[..., 1:] = remove[..., :-1].clone()  # keep the token that crosses p
+    remove[..., 0] = False  # ... and the single most probable token
+    remove = remove.scatter(-1, sorted_indices, remove)
+    return logits.masked_fill(remove, float("-inf"))
+
+
 def generate(
     model: TalosGPT,
     prompt: torch.Tensor,
     max_new_tokens: int,
     greedy: bool = True,
     temperature: float = 1.0,
+    top_k: int = 0,
+    top_p: float = 1.0,
+    repetition_penalty: float = 1.0,
+    penalize_prompt: bool = False,
+    eos_token_id: Optional[int] = None,
 ) -> List[int]:
     """Greedy- (or temperature-sampled-) decode ``max_new_tokens`` tokens.
 
     Prefills ``prompt`` once, then decodes incrementally. The first generated
     token is the argmax of the prefill's final position.
+
+    Decoding controls compose in a fixed order, applied per step: repetition
+    penalty on the raw logits first, then temperature, then top-k, then top-p,
+    then softmax/sampling (greedy = argmax after penalty/top-k/top-p
+    filtering). ``greedy`` + ``repetition_penalty`` is valid and useful: the
+    penalty can demote an already-emitted token below the runner-up, so greedy
+    decoding escapes byte-loops while staying deterministic and RNG-free.
+    (top-k/top-p never remove the argmax, so in greedy mode they cannot change
+    the *choice* — they only matter for sampling.) When all controls are at
+    their defaults the decode is bit-identical to the pre-upgrade greedy /
+    temperature path (regression-tested).
+
+    ``eos_token_id`` enables early stopping: when the sampled token is EOS the
+    loop stops **before** emitting it, so the returned list never contains EOS
+    and may be shorter than ``max_new_tokens`` (``len < max_new_tokens`` ==
+    EOS stop; ``max_new_tokens`` tokens == length stop).
 
     Sequence-length policy (mirrors the CLI in ``scripts/generate.py``): the
     model's ``max_seq_len`` bounds absolute positions, so ``prompt_len +
@@ -110,9 +216,22 @@ def generate(
         greedy: If True pick argmax; otherwise sample from the softmax at
             ``temperature``.
         temperature: Sampling temperature (ignored when ``greedy``).
+        top_k: Keep only the ``top_k`` highest-scoring tokens before softmax/
+            argmax; ``0`` (default) disables.
+        top_p: Nucleus cutoff in ``(0, 1]`` — keep the smallest set with
+            probability mass ``>= top_p``; ``1.0`` (default) disables.
+        repetition_penalty: CTRL-style penalty ``> 0`` applied to every id
+            emitted so far in this sample (``> 1`` discourages repetition,
+            ``1.0`` (default) disables, ``< 1`` encourages it).
+        penalize_prompt: Also apply the repetition penalty to the prompt's
+            token ids (default False — only tokens generated in this sample
+            are penalized).
+        eos_token_id: Stop (without emitting) when this id is sampled;
+            ``None`` (default) never stops early.
 
     Returns:
-        The list of generated token ids (length ``max_new_tokens``).
+        The list of generated token ids (length ``max_new_tokens``, or shorter
+        when ``eos_token_id`` is set and EOS was sampled).
     """
     if prompt.shape[0] != 1:
         raise ValueError("generate() supports batch size 1 (got batch %d)" % prompt.shape[0])
@@ -124,6 +243,19 @@ def generate(
             f"max_new_tokens={max_new_tokens} leaves no room for a prompt "
             f"within max_seq_len={max_seq_len} (need max_new_tokens < max_seq_len)"
         )
+    if top_k < 0:
+        raise ValueError(f"top_k must be >= 0 (0 = off), got {top_k}")
+    if not 0.0 < top_p <= 1.0:
+        raise ValueError(f"top_p must be in (0, 1] (1.0 = off), got {top_p}")
+    if repetition_penalty <= 0:
+        raise ValueError(
+            f"repetition_penalty must be > 0 (1.0 = off), got {repetition_penalty}"
+        )
+    if eos_token_id is not None and not 0 <= eos_token_id < model.config.vocab_size:
+        raise ValueError(
+            f"eos_token_id={eos_token_id} out of range for vocab "
+            f"{model.config.vocab_size}"
+        )
     prompt_len = prompt.shape[1]
     if prompt_len + max_new_tokens > max_seq_len:
         keep = max_seq_len - max_new_tokens
@@ -132,13 +264,28 @@ def generate(
         logits, cache = prefill(model, prompt)
         tok = logits[:, -1:, :]  # (1, 1, vocab): last position's distribution
         generated: List[int] = []
+        penalized: List[int] = prompt[0].tolist() if penalize_prompt else []
         for step in range(max_new_tokens):
+            logits_v = tok[:, -1, :]  # (1, vocab)
+            if repetition_penalty != 1.0:
+                logits_v = apply_repetition_penalty(
+                    logits_v, penalized + generated, repetition_penalty
+                )
+            if not greedy:
+                logits_v = logits_v / temperature
+            if top_k:
+                logits_v = top_k_filter(logits_v, top_k)
+            if top_p < 1.0:
+                logits_v = top_p_filter(logits_v, top_p)
             if greedy:
-                nxt = tok.argmax(dim=-1)  # (1, 1) token ids
+                nxt = logits_v.argmax(dim=-1, keepdim=True)  # (1, 1) token ids
             else:
-                probs = torch.softmax(tok[:, -1] / temperature, dim=-1)  # (1, vocab)
+                probs = torch.softmax(logits_v, dim=-1)  # (1, vocab)
                 nxt = torch.multinomial(probs, num_samples=1)  # (1, 1)
-            generated.append(int(nxt[0, 0]))
+            token_id = int(nxt[0, 0])
+            if eos_token_id is not None and token_id == eos_token_id:
+                break  # stop before emitting EOS (caller sees len < max_new_tokens)
+            generated.append(token_id)
             if step + 1 < max_new_tokens:
                 tok = decode_step(model, cache, nxt, cache.length)
     return generated
