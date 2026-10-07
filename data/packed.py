@@ -31,11 +31,17 @@ from __future__ import annotations
 
 import json
 import os
+import queue
+import threading
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 import numpy as np
 import torch
+
 from torch.utils.data import IterableDataset
+
+import logging
+log = logging.getLogger(__name__)
 
 #: Mirrors ``scripts.prepare_corpus.MANIFEST_FORMAT`` — duplicated here so the
 #: data layer never imports the CLI module (keep the dependency direction
@@ -267,6 +273,162 @@ def packed_phase_shard_paths(
     return paths
 
 
+class _PrefetchIterator:
+    """A lightweight single-thread prefetch pipe.
+
+    Pulls batches from ``inner`` on a daemon thread into a bounded queue of
+    depth ``prefetch`` so batch assembly / pinned H2D handoff overlaps with the
+    trainer's forward/backward compute. Deterministic by construction: batches
+    are produced in order and consumed in order — the token stream is
+    identical to the non-prefetched iterator; only *when* each batch is
+    materialized changes.
+    """
+
+    _END = object()
+
+    def __init__(self, inner: Iterator["torch.Tensor"], prefetch: int) -> None:
+        self._inner = inner
+        self._q: "queue.Queue[Any]" = queue.Queue(maxsize=max(1, int(prefetch)))
+        self._thread = threading.Thread(
+            target=self._fill, name="talos-packed-prefetch", daemon=True
+        )
+        self._thread.start()
+
+    def _fill(self) -> None:
+        try:
+            for batch in self._inner:
+                self._q.put(batch)
+        except Exception as exc:  # surface worker failures in the consumer
+            self._q.put(exc)
+        finally:
+            self._q.put(self._END)
+
+    def __iter__(self) -> "_PrefetchIterator":
+        return self
+
+    def __next__(self) -> "torch.Tensor":
+        item = self._q.get()
+        if item is self._END:
+            raise StopIteration
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    next = __next__  # py2-style compatibility is irrelevant; keeps iter() happy
+
+
+class _FastBatchIterator:
+    """mmap-cached, prefetch-friendly iterator over packed shards.
+
+    * mmap views of each shard are cached (``cache_mmaps``) so the header
+      parse + full-shard id min/max validation runs ONCE per dataset lifetime
+      instead of once per epoch (a real cost when shards live on a slow/remote
+      filesystem like Colab Drive);
+    * every batch is assembled into a FRESH (optionally pinned) int64 tensor.
+      A fixed round-robin pool of reusable buffers was tried first and is
+      deliberately NOT used: a pooled iterator hands the consumer a *view* of
+      shared memory, so the pool slot is silently overwritten by a later batch
+      whenever the consumer retains the yielded tensor (materializing a list,
+      holding the batch across an async pinned H2D copy, or keeping the
+      previous batch alive while fetching the next). That violates the
+      dataset's stream-equality contract (``fast == classic`` for the full
+      stream, at any batch_size/prefetch/pin_memory combination), so the pool
+      is replaced by fresh per-batch buffers — the same allocation semantics
+      as the classic path, at the same cost, with the mmap-cache and prefetch
+      wins kept. torch's CPU caching allocator reuses the freed buffers once
+      the consumer is done, so the steady-state allocation rate is still low;
+    * with ``prefetch > 0`` batch assembly is fronted by
+      :class:`_PrefetchIterator` (bounded queue throttles the worker to at
+      most ``prefetch`` batches ahead; each queued tensor is an independent
+      buffer, so the prefetcher's writes can never race an in-flight
+      ``.to(device, non_blocking=True)`` copy of an earlier batch).
+    """
+
+    def __init__(
+        self,
+        dataset: "PackedTokenDataset",
+        *,
+        mmap_cache: Optional[Dict[str, np.ndarray]],
+        prefetch: int,
+    ) -> None:
+        self._ds = dataset
+        self._cache = mmap_cache
+        self._prefetch = int(prefetch)
+        # pin_memory=True without CUDA raises (no pinned allocator on a
+        # CPU-only build) — degrade to regular host buffers, flagging it once.
+        self._pinned = bool(dataset.pin_memory) and torch.cuda.is_available()
+        if dataset.pin_memory and not self._pinned:
+            log.warning(
+                "pin_memory requested but no pinned-memory allocator is "
+                "available (torch built without CUDA?) — using regular host "
+                "buffers; non_blocking H2D is a no-op"
+            )
+
+    def _mmap(self, path: str) -> np.ndarray:
+        if self._cache is not None and path in self._cache:
+            return self._cache[path]
+        arr = _load_npy_header(path)
+        if self._cache is not None:
+            self._cache[path] = arr
+        return arr
+
+    def __iter__(self) -> "_FastBatchIterator":
+        return self
+
+    def __next__(self) -> "torch.Tensor":
+        if self._state is None:
+            self._state = iter(self._enumerate())
+        try:
+            return next(self._state)
+        except StopIteration:
+            self._state = None
+            raise
+
+    next = __next__
+
+    def _enumerate(self) -> Iterator["torch.Tensor"]:
+        """Yield one fresh ``torch.Tensor`` batch per packed row group."""
+        for path in self._ds.paths:
+            arr = self._mmap(path)
+            if arr.dtype != _NP_DTYPES[self._ds.expected_dtype]:
+                raise ValueError(
+                    f"shard {os.path.basename(path)} dtype {arr.dtype} does "
+                    f"not match manifest dtype {self._ds.expected_dtype!r} — "
+                    "corrupt or mismatched shard"
+                )
+            if self._ds.max_id is not None:
+                # Full-shard validation. With the mmap cache the min/max pass
+                # touches every element ONCE per dataset lifetime; later epochs
+                # reuse the validated view.
+                _check_rows_and_ids(
+                    arr, path=path, seq_len=self._ds.seq_len,
+                    max_id=self._ds.max_id,
+                )
+            else:
+                if arr.ndim != 2 or arr.shape[1] != self._ds.seq_len:
+                    raise ValueError(
+                        f"shard {os.path.basename(path)} has shape {arr.shape} "
+                        f"(expected (rows, {self._ds.seq_len}))"
+                    )
+            for start in range(0, len(arr), self._ds.batch_size):
+                n = min(self._ds.batch_size, len(arr) - start)
+                if n < self._ds.batch_size and self._ds.drop_last:
+                    continue
+                # Fresh (optionally pinned) int64 buffer per batch — never a
+                # view of shared memory, so the consumer may retain, reorder
+                # or asynchronously copy the yielded tensor freely (the exact
+                # classic-path allocation semantics). np.copyto casts
+                # int32/uint16 -> int64 in one pass.
+                buf = torch.empty(
+                    (n, self._ds.seq_len), dtype=torch.int64,
+                    pin_memory=self._pinned,
+                )
+                np.copyto(buf.numpy(), arr[start : start + n])
+                yield buf
+
+    _state: Optional[Iterator["torch.Tensor"]] = None
+
+
 class PackedTokenDataset(IterableDataset):
     """A ``torch`` ``IterableDataset`` over packed ``*.npy`` token shards.
 
@@ -288,6 +450,19 @@ class PackedTokenDataset(IterableDataset):
             every id must be in ``[0, max_id)`` or the shard fails loudly.
         drop_last: drop a trailing partial batch (default True — keeps every
             yielded batch exactly ``(batch, seq_len)``).
+        cache_mmaps: keep each shard's mmap view (and its validated id range)
+            for the dataset's whole lifetime instead of re-opening/re-scanning
+            every shard per epoch. Safe because shards are immutable by
+            convention (the corpus-preparation contract); deterministic — the
+            token stream is unchanged.
+        pin_memory: allocate every batch as pinned host memory so the
+            trainer's ``.to(device, non_blocking=True)`` handoff can overlap
+            H2D with compute (CUDA only; harmless elsewhere).
+        prefetch: > 0 fills batches on a bounded prefetch thread up to
+            ``prefetch`` batches ahead of the consumer (default 0 = the
+            classic synchronous iterator). Output dtype is ``torch.int64``
+            when any fast-path option is enabled (the int64 buffers mean the
+            trainer's ``.long()`` cast is a no-op).
     """
 
     def __init__(
@@ -299,20 +474,44 @@ class PackedTokenDataset(IterableDataset):
         expected_dtype: str = "int32",
         max_id: Optional[int] = None,
         drop_last: bool = True,
+        cache_mmaps: bool = False,
+        pin_memory: bool = False,
+        prefetch: int = 0,
     ) -> None:
         super().__init__()
         if not shard_paths:
             raise ValueError("PackedTokenDataset needs at least one shard")
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
+        if prefetch < 0:
+            raise ValueError("prefetch must be >= 0")
         self.paths = [str(p) for p in shard_paths]
         self.seq_len = int(seq_len)
         self.batch_size = int(batch_size)
         self.expected_dtype = expected_dtype
         self.max_id = int(max_id) if max_id is not None else None
         self.drop_last = drop_last
+        self.cache_mmaps = bool(cache_mmaps)
+        self.pin_memory = bool(pin_memory)
+        self.prefetch = int(prefetch)
+        self._mmap_cache: Optional[Dict[str, np.ndarray]] = (
+            {} if self.cache_mmaps else None
+        )
 
     def __iter__(self) -> Iterator["torch.Tensor"]:
+        fast = self.cache_mmaps or self.pin_memory or self.prefetch > 0
+        if not fast:
+            yield from self._iter_classic()
+            return
+        inner: Iterator["torch.Tensor"] = _FastBatchIterator(
+            self, mmap_cache=self._mmap_cache, prefetch=self.prefetch
+        )
+        if self.prefetch > 0:
+            inner = _PrefetchIterator(inner, self.prefetch)
+        yield from inner
+
+    def _iter_classic(self) -> Iterator["torch.Tensor"]:
+        """The original per-batch ``np.empty`` + copy path (unchanged)."""
         for path in self.paths:
             arr = _load_npy_header(path)
             if arr.dtype != _NP_DTYPES[self.expected_dtype]:

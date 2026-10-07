@@ -191,6 +191,87 @@ class PlainAttentionBackend(AttentionInterface):
 
 
 # ------------------------------------------------------------------------------
+# SDPA backend (torch.nn.functional.scaled_dot_product_attention)
+# ------------------------------------------------------------------------------
+
+class SDPAAttentionBackend(AttentionInterface):
+    """Attention executed by ``F.scaled_dot_product_attention``.
+
+    The T4 training-engine path (P1a): for **full causal attention** (no
+    explicit mask, no sliding window) the kernel is called with
+    ``is_causal=True`` and **no mask tensor is materialized at all** — the
+    ``0/-inf`` additive-mask construction of :class:`PlainAttentionBackend`
+    (``masked_fill(~allowed, NEG_INF)`` at
+    ``model/attention.py:131-137``) disappears entirely. That is the root-cause
+    removal of the recorded fp16 failure: under AMP the plain path's
+    ``scores + mask`` fp16 add overflowed ``c10::Half``; SDPA folds the mask
+    into the kernel with fp32 accumulation and never performs that add.
+
+    For windowed or explicit-mask attention a ``0/-inf`` additive mask is
+    passed as ``attn_mask`` (SDPA requires float additive masks for masking,
+    which it applies internally with fp32 accumulation). The mask is built in
+    the *query* compute dtype exactly like the plain path, so results agree
+    with it to tight tolerance (verified by the equivalence tests).
+
+    On SM75 (T4) PyTorch selects the memory-efficient kernel for these shapes;
+    on CPU it falls back to the math implementation — identical semantics, so
+    the equivalence tests run anywhere.
+    """
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        window_size: int = 0,
+        causal: bool = True,
+        scale: Optional[float] = None,
+    ) -> torch.Tensor:
+        if query.dim() != 4:
+            raise ValueError(f"query must be 4D (B,H,T,D), got {query.shape}")
+        head_dim = query.shape[-1]
+        scale = scale if scale is not None else head_dim ** -0.5
+
+        if (
+            mask is None
+            and causal
+            and window_size == 0
+            and query.shape[-2] == key.shape[-2]
+        ):
+            # Exact full-causal prefill case: no mask object exists at all.
+            # (``is_causal=True`` with unequal q/k lengths uses a *prefix*
+            #  convention — a decode query would only see the first key — so
+            #  non-square causal calls go through the explicit mask below.)
+            return F.scaled_dot_product_attention(
+                query, key, value, scale=scale, is_causal=True
+            )
+
+        # Sliding-window or explicit-mask attention: build (or reuse) a
+        # 0/-inf additive mask with the plain backend's exact convention
+        # (queries are a suffix of keys — decode is a single query at the end).
+        nq, ns = query.shape[-2], key.shape[-2]
+        device = query.device
+        if mask is None:
+            q_global = torch.arange(ns - nq, ns, device=device).unsqueeze(1)
+            k_global = torch.arange(ns, device=device).unsqueeze(0)
+            allowed = k_global <= q_global  # causal
+            if window_size > 0:
+                allowed = allowed & (q_global - k_global < window_size)
+            mask = torch.zeros(nq, ns, dtype=query.dtype, device=device)
+            mask = mask.masked_fill(~allowed, NEG_INF)
+        attn_mask = mask
+        if attn_mask.dim() == 2:
+            attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # (1,1,T,S)
+        return F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attn_mask, scale=scale
+        )
+
+    def __repr__(self) -> str:
+        return "SDPAAttentionBackend()"
+
+
+# ------------------------------------------------------------------------------
 # FlashAttention backend (guarded import)
 # ------------------------------------------------------------------------------
 
@@ -255,12 +336,28 @@ def build_attention_backend(backend: str = "auto", chunk_size: int = 0) -> Atten
     """Return an attention backend per strategy.
 
     ``backend`` is one of:
-      * ``"auto"`` — prefer FlashAttention when installed, else plain;
-      * ``"plain"`` — always the functional backend;
+      * ``"auto"`` — prefer FlashAttention when installed; else
+        :class:`SDPAAttentionBackend` (torch >= 2.0 ``F.scaled_dot_product_attention``,
+        no mask materialization on the full-causal path); if SDPA is somehow
+        unavailable the functional :class:`PlainAttentionBackend` is used.
+        Callers needing the bounded-memory *chunked* plain path (very long
+        contexts) must request ``"plain"`` explicitly or guard on
+        ``attention_chunk_size > 0`` (the model factory does the latter — see
+        ``model/gpt.py``);
+      * ``"plain"`` — always the functional backend (the pre-SDPA path,
+        selectable for the T4 A/B);
+      * ``"sdpa"`` — always the SDPA backend (raises if unavailable);
       * ``"flash"`` — the FlashAttention backend (raises if unavailable).
     """
     if backend == "plain":
         return PlainAttentionBackend(chunk_size=chunk_size)
+    if backend == "sdpa":
+        if not hasattr(F, "scaled_dot_product_attention"):  # pragma: no cover
+            raise RuntimeError(
+                "sdpa backend requested but torch.nn.functional."
+                "scaled_dot_product_attention is unavailable (torch < 2.0)"
+            )
+        return SDPAAttentionBackend()
     if backend == "flash":
         if FlashAttentionBackend.available():
             return FlashAttentionBackend()
@@ -269,6 +366,9 @@ def build_attention_backend(backend: str = "auto", chunk_size: int = 0) -> Atten
         if FlashAttentionBackend.available():
             logger.info("Using FlashAttention backend (flash-attn installed).")
             return FlashAttentionBackend()
-        logger.info("flash-attn not installed; using plain functional backend.")
-        return PlainAttentionBackend(chunk_size=chunk_size)
+        logger.info(
+            "flash-attn not installed; using SDPA backend "
+            "(torch scaled_dot_product_attention)."
+        )
+        return SDPAAttentionBackend()
     raise ValueError(f"unknown attention backend: {backend!r}")
