@@ -1342,3 +1342,33 @@ T4 at S=512).
 ---
 
 *Generated 2026-09-27 by senior-ml-engineer (rev. 2, 2026-09-27): the trainer hardening pass PR — this revision updates the status table rows 22/23/26, rewrites §12 (now IMPLEMENTED), prunes §29 items 1-4 (done), and adds the three new flags to §10/§21. Base repo: `main` @ `46f9858`. All file:line references verified by reading the code + the green synthetic suites (`tests/test_trainer_stability.py`, trainer suites) on that date. Anything marked MISSING/PROPOSED is not implemented and must not be described as existing.*
+
+---
+
+## 30. The Talos 1B presets are NOT a T4 training target (added with the 1B-preset PR)
+
+The owner-directed 1B presets (``talos_1b`` 995,973,120 params / 21 layers,
+``talos_1b_spec16`` 774,440,960 params / 16 layers — vocab 32,000, seq 2,048,
+hidden 2,048, 16/4 GQA heads, head_dim 128, SwiGLU 5,504, no biases, TIED
+embeddings) exist as registered, meta-device-validated configs from 2026-10.
+This document's T4/Colab reference does **not** apply to them:
+
+* **Training: out of reach on a 16 GB T4.** Mixed-precision AdamW state alone
+  is ≈16.7 GiB for ``talos_1b`` and ≈13.0 GiB for ``talos_1b_spec16``
+  (18 B/param layout: fp32 master + fp32 m/v + fp16 working copy + fp32
+  grads), before activations (≈1.4 / 1.1 GiB at batch 1 × seq 2048) and CUDA
+  overhead. Minimum class: ≈24 GB (A10G/3090/A100) / ≈20 GB.
+* **Inference on the T4 at fp16 is feasible**: ≈1.86 / 1.44 GiB weights +
+  84.0 / 64.0 MiB KV cache at the full 2,048-token sequence (§7.2 of
+  docs/SCALING.md).
+* The team CPU box cannot instantiate a 1B fp32 model (3.98 GB weights vs
+  3.9 GB RAM) — 1B validation uses the meta device + a small-dim functional
+  config (see ``tests/test_talos_1b.py`` and docs/SCALING.md §7 for the full
+  memory model and formulas).
+* Engine note: bf16-master weights, gradient checkpointing and gradient
+  accumulation are **not** in the engine yet and were deliberately not added
+  by the 1B-preset PR; the 18 B/param mixed-precision layout in docs/SCALING.md
+  §7.3 is the sizing assumption for the later engine delegation.
+
+All other sections of this document continue to describe the ``tiny_100m``
+T4/Colab reference only.

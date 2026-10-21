@@ -202,14 +202,169 @@ def tiny_100m_tokenizer_config() -> TokenizerConfig:
     return tiny_tokenizer_config()
 
 
-#: canonical preset name -> tokenizer-config builder (all reuse the sole
-#: vocab-1024 contract today; the registry exists so a future preset with a
-#: different vocab is a one-line deliberate change, not a silent re-wire).
+# ------------------------------------------------------------------------------
+# Talos 1B presets (owner-directed, 2026-10): a NEW architecture track.
+# ------------------------------------------------------------------------------
+# The 1B presets deliberately diverge from the tiny family on THREE knobs, each
+# an explicit owner decision: vocab_size 32,000 (the real tokenizer track), a
+# 4:1 GQA ratio (16/4 heads instead of 2:1), head_dim 128 instead of 16, and a
+# SwiGLU FFN at 2.6875x hidden (5504/2048 instead of 4x). The per-layer shape
+# is otherwise the classic small-LLM recipe: pre-norm RMSNorm, RoPE
+# (theta 1e4), dense SwiGLU, no biases, TIED input/output embeddings.
+
+#: The exact per-layer parameter arithmetic shared by both 1B presets
+#: (see the docstrings below for the full derivation).
+TALOS_1B_LAYER_PARAMS = 44_306_432  # attention + norms + SwiGLU FFN
+TALOS_1B_EMBEDDING_PARAMS = 32_000 * 2048  # tied: one 32000x2048 matrix
+TALOS_1B_FINAL_NORM_PARAMS = 2048
+
+
+def talos_1b_config() -> ModelConfig:
+    """The Talos ~1B preset — the owner's spec with depth adjusted to 21 layers.
+
+    Owner's target architecture (verbatim): decoder-only, vocab 32,000, seq
+    2,048, hidden 2,048, **16 heads / 4 KV heads (4:1 GQA), head_dim 128**,
+    SwiGLU FFN intermediate **5,504**, RMSNorm pre-norm, RoPE, no biases,
+    TIED input/output embeddings, standard stable init (``initializer_range``
+    0.02, ``rope_theta`` 1e4).
+
+    The owner pre-authorized adjusting dims to approach 1B; **depth is the
+    chosen adjustment axis** (``num_layers=21``) so the per-layer shape stays
+    exactly as specified. Parameter count, verified programmatically (see
+    ``tests/test_talos_1b.py`` and the meta-device construction in
+    docs/SCALING.md §7):
+
+    * embedding (tied, single copy) = ``V·H`` = 32,000·2,048 = **65,536,000**
+      (tied ⇒ no separate lm_head);
+    * per layer: attention = ``H·H + H·(H/4) + H·(H/4) + H·H`` =
+      2,048² + 2·2,048·512 + 2,048² = 4,194,304 + 2·1,048,576 + 4,194,304
+      = **10,485,760**; 2 RMSNorms = 2·2,048 = **4,096**; SwiGLU FFN =
+      3·H·I = 3·2,048·5,504 = **33,816,576**; per layer total
+      = **44,306,432**;
+    * 21 layers = 930,435,072; final norm = **2,048**;
+    * **total = 65,536,000 + 930,435,072 + 2,048 = 995,973,120** (≈996M —
+      the closest the owner's per-layer shape gets to 1B below the mark).
+
+    ``vocab_size=32_000`` ≠ the canonical 1024 constant deliberately — see
+    :func:`talos_1b_tokenizer_config` for the tokenizer pairing guard.
+    """
+    return ModelConfig(
+        vocab_size=32_000,
+        hidden_size=2048,
+        num_layers=21,
+        num_attention_heads=16,
+        num_kv_heads=4,
+        head_dim=128,
+        ffn_type="dense",
+        intermediate_size=5504,
+        max_seq_len=2048,
+        attention_type="full",
+        rope_theta=10000.0,
+        initializer_range=0.02,
+        tie_word_embeddings=True,
+        layer_norm_eps=1e-5,
+    )
+
+
+def talos_1b_spec16_config() -> ModelConfig:
+    """The literal 16-layer variant of the owner's 1B spec (no dim adjustments).
+
+    Same architecture and per-layer shape as :func:`talos_1b_config`
+    (vocab 32,000, hidden 2,048, 16/4 GQA heads, head_dim 128, SwiGLU
+    intermediate 5,504, no biases, tied embeddings, RoPE theta 1e4) with the
+    spec's **exact 16 layers**. Parameter count, verified programmatically:
+
+    * embedding (tied) = **65,536,000**;
+    * 16 layers × 44,306,432 = **708,902,912**;
+    * final norm = **2,048**;
+    * **total = 65,536,000 + 708,902,912 + 2,048 = 774,440,960** (≈774M).
+
+    The spec's literal shape lands ~23% under 1B; ``talos_1b`` (21 layers,
+    995,973,120) is the preset that actually approaches the 1B target with the
+    owner's per-layer shape untouched. This variant exists so a subsequent
+    16-layer reference run is one config away and the arithmetic is pinned by
+    tests either way.
+    """
+    return ModelConfig(
+        vocab_size=32_000,
+        hidden_size=2048,
+        num_layers=16,
+        num_attention_heads=16,
+        num_kv_heads=4,
+        head_dim=128,
+        ffn_type="dense",
+        intermediate_size=5504,
+        max_seq_len=2048,
+        attention_type="full",
+        rope_theta=10000.0,
+        initializer_range=0.02,
+        tie_word_embeddings=True,
+        layer_norm_eps=1e-5,
+    )
+
+
+def _assert_tokenizer_model_pairing(tok_config: TokenizerConfig, model: ModelConfig) -> None:
+    """Enforce the *intended* tokenizer↔model pairing, not just the ≤ bound.
+
+    ``tokenizer/model_compat.py`` enforces ``tokenizer_vocab_size <=
+    model_vocab_size`` generically, but that alone would let a stray vocab-1024
+    tokenizer config pair silently with a 1B model (1024 ≤ 32000 passes). Each
+    1B preset is defined together with its 32,000-vocab tokenizer config; this
+    guard makes the pairing **exact and loud**: the tokenizer config and its
+    paired model config must agree on the vocab size, or constructing the
+    tokenizer config raises. (The model keeps the standard ``<=`` contract for
+    the *trained asset*, which may use fewer merge slots.)
+    """
+    if tok_config.vocab_size != model.vocab_size:
+        raise ValueError(
+            f"tokenizer config vocab_size {tok_config.vocab_size} does not match "
+            f"its paired model config vocab_size {model.vocab_size} — a 1B preset "
+            "must never run with a mismatched (e.g. the canonical 1024) tokenizer "
+            "config; fix the pairing in configs/presets.py deliberately"
+        )
+
+
+def talos_1b_tokenizer_config() -> TokenizerConfig:
+    """Tokenizer config for ``talos_1b``: vocab 32,000, paired and guarded.
+
+    vocab 32,000 = 256 base bytes + 4 default specials + **31,740 merge slots**
+    (LLaMA-style specials at the top). This is a **deliberate divergence** from
+    the canonical 1024 contract (``configs.vocab.VOCAB_SIZE``) — the 1B track
+    uses its own 32,000-vocab tokenizer asset (a later delegation trains it);
+    :func:`_assert_tokenizer_model_pairing` refuses to construct this config
+    beside a model config with any other vocab, so a silent reuse of the
+    canonical 1024 tokenizer cannot happen at the config seam.
+    """
+    tok = TokenizerConfig(vocab_size=32_000)
+    _assert_tokenizer_model_pairing(tok, talos_1b_config())
+    return tok
+
+
+def talos_1b_spec16_tokenizer_config() -> TokenizerConfig:
+    """Tokenizer config for ``talos_1b_spec16``: identical (vocab 32,000).
+
+    ``talos_1b_spec16`` shares ``talos_1b``'s vocabulary exactly (the two
+    presets differ only in depth), so this reuses the same guarded 32,000-vocab
+    config via :func:`_assert_tokenizer_model_pairing`.
+    """
+    tok = TokenizerConfig(vocab_size=32_000)
+    _assert_tokenizer_model_pairing(tok, talos_1b_spec16_config())
+    return tok
+
+
+#: canonical preset name -> tokenizer-config builder. All four tiny-family
+#: presets reuse the sole vocab-1024 contract (their rows stay 1024); the two
+#: 1B presets deliberately register a 32,000-vocab contract. The registry
+#: exists so a future preset with a different vocab is a one-line deliberate
+#: change, not a silent re-wire — and ``tests/test_vocab_seam.py`` pins the
+#: exact membership.
 TOKENIZER_CONFIGS = {
     "tiny": tiny_tokenizer_config,
     "tiny_1m": tiny_1m_tokenizer_config,
     "tiny_10m": tiny_10m_tokenizer_config,
     "tiny_100m": tiny_100m_tokenizer_config,
+    "talos_1b": talos_1b_tokenizer_config,
+    "talos_1b_spec16": talos_1b_spec16_tokenizer_config,
 }
 
 
@@ -358,6 +513,8 @@ ALL_PRESETS = {
     "tiny_1m": tiny_1m_config,
     "tiny_10m": tiny_10m_config,
     "tiny_100m": tiny_100m_config,
+    "talos_1b": talos_1b_config,
+    "talos_1b_spec16": talos_1b_spec16_config,
     "small": small_config,
     "medium": medium_config,
     "large": large_config,
