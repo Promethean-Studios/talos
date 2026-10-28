@@ -123,7 +123,12 @@ LR_DECAY_CHOICES = ("none", "cosine")
 MIN_LR_RATIO = 0.1
 
 ATTENTION_BACKEND_CHOICES = ("auto", "plain", "sdpa", "flash")
-AMP_CHOICES = ("none", "fp16")
+AMP_CHOICES = ("none", "fp16", "bf16")
+#: W2: AMP mode -> autocast dtype (kept here so tests can pin the mapping).
+AMP_AUTOCAST_DTYPES: Dict[str, torch.dtype] = {
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -132,24 +137,31 @@ AMP_CHOICES = ("none", "fp16")
 def make_amp_autocast(amp: str, device: torch.device) -> torch.autocast:
     """Autocast context for ``--amp``.
 
-    ``"fp16"`` wraps the train forward/backward in fp16 autocast (CUDA or CPU;
-    CPU is supported for logic tests but pointless in production). Validation
-    and the loss accumulation stay OUT of the context, so val loss is always
+    ``"fp16"`` and ``"bf16"`` wrap the train forward/backward in autocast of
+    the matching dtype (CUDA or CPU; CPU is supported for logic tests but
+    pointless in production). ``"none"`` returns a disabled context — the
+    exact no-op object the pre-upgrade trainer ran with. Validation and the
+    loss accumulation stay OUT of the context, so val loss is always
     computed fp32 — loss comparability across AMP modes (P1b/P3).
+    ``"bf16"`` needs Ampere+ (SM80+); the T4/Turing (SM75) has NO bf16
+    tensor-core path — there, use ``fp16`` (or ``none``).
     """
     if amp not in AMP_CHOICES:
         raise ValueError(f"--amp must be one of {AMP_CHOICES}, got {amp!r}")
-    enabled = amp == "fp16" and device.type in ("cuda", "cpu")
-    return torch.autocast(device_type=device.type, dtype=torch.float16,
+    dtype = AMP_AUTOCAST_DTYPES.get(amp, torch.float16)
+    enabled = amp in AMP_AUTOCAST_DTYPES and device.type in ("cuda", "cpu")
+    return torch.autocast(device_type=device.type, dtype=dtype,
                           enabled=enabled)
 
 
 def make_grad_scaler(amp: str, device: torch.device) -> "torch.amp.GradScaler":
     """GradScaler for ``--amp fp16``.
 
-    ``enabled=False`` on every non-AMP path and on CPU (GradScaler requires
-    CUDA): all scaler calls become transparent no-ops, which keeps the AMP
-    integration code the one code path (and CPU-testable).
+    ``enabled=False`` on every non-AMP path, on ``--amp bf16`` and on CPU
+    (GradScaler requires CUDA): all scaler calls become transparent no-ops,
+    which keeps the AMP integration code the one code path (and CPU-testable).
+    bf16 needs NO scaling — its exponent range matches fp32 — so the scaler
+    stays disabled there and the loop backward/step run direct.
     """
     enabled = amp == "fp16" and device.type == "cuda"
     try:
@@ -1073,6 +1085,9 @@ def train_epochs(
     log_every_steps: int = 50,
     ckpt_stager: Optional[CheckpointStager] = None,
     ckpt_fsync: bool = True,
+    # --- W2 engine-pass flags (additive; defaults reproduce old behavior) ---
+    grad_accum: int = 1,
+    grad_checkpoint: bool = False,
 ) -> TrainingHistory:
     """Train the model on the streamed train split, epoch by epoch.
 
@@ -1098,8 +1113,29 @@ def train_epochs(
     * **Checkpoint staging** (``ckpt_stager``/``ckpt_fsync``): see
       :class:`CheckpointStager` — local tmp+fsync+rename first, background
       copy to the final out_dir (Drive) with a run-end drain.
+    * **Activation checkpointing** (``grad_checkpoint=True``): each decoder
+      block forward runs under ``torch.utils.checkpoint.checkpoint(
+      use_reentrant=False)`` — the backward recomputes activations instead of
+      saving them (K=4 -> K=1 live activation tensors per layer;
+      docs/SCALING.md §7.3). Training-only: the model flag is a no-op while
+      the model is in eval mode, so validation/eval/generation are never
+      checkpointed. Works inside the AMP autocast context.
+    * **Gradient accumulation** (``grad_accum=N>1``): the dataloader yields
+      micro-batches of ``--batch`` rows; each micro-batch loss is scaled by
+      ``1/N`` and gradients accumulate across N micro-batches before ONE
+      optimizer step (effective batch = ``--batch * N``). ``N=1`` (default)
+      is the legacy single-step path, executed byte-identically. A partial
+      window at an epoch end is dropped (no step, no token credit);
+      periodic/epoch checkpoints therefore always land on optimizer-step
+      boundaries. fp16 unscale + grad-clip apply once per window to the
+      accumulated gradient; a NaN/Inf micro-batch voids its whole window
+      (bad step -> safety checkpoint, no update, no token credit).
     """
     set_seed(seed)
+    if grad_checkpoint:
+        # Training-only: block forwards consult self.training, so eval/val/
+        # generation pass through untouched (TalosGPT.set_gradient_checkpointing).
+        model.set_gradient_checkpointing(True)
     schedule = TokenSchedule(lr=lr, warmup_tokens=warmup_tokens, decay=lr_decay,
                              budget=token_budget)
     opt = build_optimizer(model, lr, fused=fused_optim, device=device)
@@ -1330,11 +1366,17 @@ def train_epochs(
             break
         model.train()
         steps = 0
+        micro_step = 0  # W2: micro-batches accumulated in the current window
         t_epoch = time.monotonic()
         for batch in train_ds:
             t_iter0 = time.monotonic()
             if max_steps_per_epoch is not None and steps >= max_steps_per_epoch:
-                break
+                # W2: with grad accumulation, the cap counts COMPLETED optimizer
+                # steps (`steps` increments at window start, so a mid-window
+                # check would cut the window short and under-execute). For
+                # N=1 this is the legacy behavior verbatim.
+                if grad_accum <= 1 or micro_step == 0:
+                    break
             if history.budget_reached:
                 break
             # P1d: pinned H2D handoff (non_blocking) — no-op on CPU paths.
@@ -1345,6 +1387,150 @@ def train_epochs(
             else:
                 x = batch.to(device).long()
             validate_token_ids(x, vocab, where="train batch")
+            if grad_accum > 1:
+                # ---- W2: gradient-accumulation window (N micro-batches/step) ----
+                # ``--batch`` is the MICRO-batch size; N consecutive micro-batches
+                # form ONE optimizer step (effective batch = batch x N). Each
+                # micro-batch loss is scaled by 1/N so the accumulated gradient
+                # is the MEAN — equal (up to fp summation order) to one large
+                # batch of batch*N. A partial window at an epoch end / token
+                # budget / step cap is DROPPED (no step, no token credit), so
+                # periodic/epoch checkpoints always land on optimizer-step
+                # boundaries. A NaN/Inf micro-batch voids its whole window (bad
+                # step -> safety checkpoint, no update, no token credit); the
+                # next micro-batch starts a fresh window.
+                if micro_step == 0:
+                    global_step += 1
+                    steps += 1
+                    history.attempts += 1
+                    # LR: a function of tokens consumed pre-step — evaluated
+                    # once per optimizer step at window start.
+                    opt.param_groups[0]["lr"] = schedule.lr_at(tokens_consumed)
+                    opt.zero_grad(set_to_none=True)
+                    window_tokens = 0
+                    window_loss_sum: Optional[torch.Tensor] = None
+                interval.data_s += time.monotonic() - t_iter0
+                # ---- forward + loss under the AMP context (P1b/W2) ----
+                t_fwd = time.monotonic()
+                with amp_autocast:
+                    logits, _ = model(x[:, :-1])
+                    loss = loss_fn(logits.reshape(-1, vocab),
+                                   x[:, 1:].reshape(-1))
+                interval.fwd_s += time.monotonic() - t_fwd
+                # ---- loss finiteness BEFORE backward (always on) ----
+                if not torch.isfinite(loss):
+                    stat = "nan" if torch.isnan(loss.detach()) else "inf"
+                    handle_bad_step(
+                        global_step, tokens_consumed, "loss", stat,
+                        float(loss.detach()),
+                    )
+                    opt.zero_grad(set_to_none=True)  # drop the partial window
+                    micro_step = 0
+                    continue
+                # ---- backward: loss/N so accumulated grads are a mean ----
+                t_bwd = time.monotonic()
+                scale = 1.0 / grad_accum
+                if amp_fp16:
+                    scaler.scale(loss * scale).backward()
+                else:
+                    (loss * scale).backward()
+                interval.bwd_s += time.monotonic() - t_bwd
+                window_loss_sum = (
+                    loss.detach() if window_loss_sum is None
+                    else window_loss_sum + loss.detach()
+                )
+                window_tokens += int(x[:, 1:].numel())
+                micro_step += 1
+                if micro_step < grad_accum:
+                    continue
+                # ---- window end = ONE optimizer step ------------------------
+                # unscale BEFORE clip and BEFORE the finiteness guard (P1b
+                # order): a scaling overflow surfaces as an inf grad, and the
+                # guard below turns the whole window into a bad step.
+                if amp_fp16:
+                    scaler.unscale_(opt)
+                bad_param: Optional[str] = None
+                bad_grad: Optional[torch.Tensor] = None
+                for pname, p in model.named_parameters():
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        bad_param, bad_grad = pname, p.grad
+                        break
+                if bad_param is not None:
+                    stat = "nan" if torch.isnan(bad_grad).any() else "inf"
+                    handle_bad_step(
+                        global_step, tokens_consumed, f"grad:{bad_param}", stat,
+                        None,
+                    )
+                    if amp_fp16:
+                        scaler.update()  # overflow adjust even though skipped
+                    opt.zero_grad(set_to_none=True)
+                    micro_step = 0
+                    window_loss_sum = None
+                    continue
+                # ---- gradient clipping (PRE-clip total norm recorded) ----
+                if grad_clip > 0:
+                    history.last_grad_norm = float(
+                        torch.nn.utils.clip_grad_norm_(model.parameters(),
+                                                       grad_clip)
+                    )
+                # ---- optimizer step (AMP-aware: skips on found_inf) ----
+                t_opt = time.monotonic()
+                if amp_fp16:
+                    scaler.step(opt)
+                    scaler.update()
+                else:
+                    opt.step()
+                interval.optim_s += time.monotonic() - t_opt
+                history.consecutive_bad_steps = 0
+                # ---- bookkeeping: mean loss over the window's micro-batches ----
+                step_loss = window_loss_sum / grad_accum
+                loss_det = step_loss.detach()
+                epoch_acc = (loss_det.clone() if epoch_acc is None
+                             else epoch_acc + loss_det)
+                epoch_count += 1
+                interval_acc = (loss_det.clone() if interval_acc is None
+                                else interval_acc + loss_det)
+                interval_count += 1
+                history.last_good_loss = float(loss_det)
+                last_eff_batch = window_tokens
+                tokens_consumed += window_tokens
+                history.tokens_processed = tokens_consumed
+                interval.steps += 1
+                interval.tokens += window_tokens
+                # ---- intra-epoch periodic checkpoint (--save-every-tokens) ----
+                if save_every_tokens > 0:
+                    multiple = tokens_consumed // save_every_tokens
+                    if multiple > last_periodic_multiple:
+                        last_periodic_multiple = multiple
+                        pckpt_path = os.path.join(
+                            out_dir, f"step-{global_step}.pt"
+                        )
+                        mean = (
+                            float(epoch_acc / epoch_count)
+                            if epoch_acc is not None and epoch_count > 0
+                            else float("nan")
+                        )
+                        _save_ckpt(
+                            pckpt_path, global_step, mean, None,
+                            rng=capture_rng_state(), ckpt_epoch=epoch,
+                            ckpt_tokens=tokens_consumed,
+                            ckpt_norm=history.last_grad_norm,
+                        )
+                        history.last_periodic_checkpoint = pckpt_path
+                        log.info(
+                            "periodic checkpoint %s (epoch %d step %d, %d "
+                            "tokens consumed)",
+                            os.path.basename(pckpt_path), epoch, global_step,
+                            tokens_consumed,
+                        )
+                flush_interval()
+                if (token_budget is not None
+                        and tokens_consumed >= token_budget):
+                    history.budget_reached = True
+                    break
+                micro_step = 0
+                window_loss_sum = None
+                continue
             # Every ATTEMPT consumes a step number (a bad step is an attempted
             # step: it gets an event + a safety checkpoint but no weight update
             # and no tokens) — checkpoint files stay unique and monotonic.
@@ -1624,9 +1810,34 @@ def make_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--amp", choices=AMP_CHOICES, default="none",
-        help="mixed precision: 'none' (fp32, default) or 'fp16' (autocast + "
+        help="mixed precision: 'none' (fp32, default), 'fp16' (autocast + "
              "GradScaler; requires the SDPA attention backend to avoid the "
-             "recorded -inf Half overflow). Validation always runs fp32.",
+             "recorded -inf Half overflow) or 'bf16' (autocast bfloat16 on "
+             "CUDA or CPU; NO GradScaler — bf16 needs no scaling). bf16 "
+             "requires Ampere+ (SM80+); the T4/Turing SM7.5 has NO bf16 — "
+             "on a T4 use fp16 or none. Validation always runs fp32.",
+    )
+    p.add_argument(
+        "--grad-checkpoint", action="store_true",
+        help="activation checkpointing (W2): wrap every decoder block forward "
+             "in torch.utils.checkpoint.checkpoint(use_reentrant=False) "
+             "during TRAINING only — the backward recomputes instead of "
+             "saving activations (K~4 -> K~1 live activation tensors per "
+             "layer; docs/SCALING.md §7.3). Works with --amp (autocast stays "
+             "outside the checkpoint); never applied to val/eval/generation.",
+    )
+    p.add_argument(
+        "--grad-accum", type=int, default=1, metavar="N",
+        help="gradient accumulation (W2): N consecutive dataloader "
+             "micro-batches (--batch is the MICRO-batch size) form ONE "
+             "optimizer step; each micro-batch loss is scaled by 1/N so "
+             "effective batch = --batch x N (keep --batch x --grad-accum at "
+             "the desired effective batch). fp16 unscale + --grad-clip run "
+             "once per optimizer step on the accumulated gradient; step/"
+             "checkpoint accounting counts OPTIMIZER steps. A partial window "
+             "at an epoch end is DROPPED; checkpoints always land on "
+             "optimizer-step boundaries. N=1 (default) is the legacy "
+             "single-step path, bit-identical.",
     )
     p.add_argument(
         "--fused-optim", action="store_true",
@@ -1813,6 +2024,9 @@ def train_run(args: argparse.Namespace) -> dict:
     log_every_steps = getattr(args, "log_every_steps", 50)
     ckpt_staging_dir = getattr(args, "ckpt_staging_dir", None)
     ckpt_fsync = not bool(getattr(args, "no_ckpt_fsync", False))
+    # --- W2 engine-pass flags (additive; defaults reproduce old behavior) ---
+    grad_accum = int(getattr(args, "grad_accum", 1) or 0)
+    grad_checkpoint = bool(getattr(args, "grad_checkpoint", False))
     if attention_backend not in ATTENTION_BACKEND_CHOICES:
         raise ValueError(
             f"--attention-backend must be one of {ATTENTION_BACKEND_CHOICES}, "
@@ -1843,6 +2057,11 @@ def train_run(args: argparse.Namespace) -> dict:
         raise ValueError(
             f"--max-consecutive-bad-steps must be >= 0, got "
             f"{max_consecutive_bad_steps} (0 = never abort)"
+        )
+    if grad_accum < 1:
+        raise ValueError(
+            f"--grad-accum must be >= 1, got {grad_accum} (1 = the legacy "
+            "single-step path)"
         )
     if packed_dir_arg and args.data:
         raise ValueError("pass exactly one of --data / --packed-dir, not both")
@@ -2211,6 +2430,8 @@ def train_run(args: argparse.Namespace) -> dict:
         "log_every_steps": log_every_steps,
         "ckpt_staging_dir": ckpt_staging_dir,
         "ckpt_fsync": ckpt_fsync,
+        "grad_accum": grad_accum,
+        "grad_checkpoint": grad_checkpoint,
     }
     tokenizer_meta = {
         "sha256": (
@@ -2378,6 +2599,11 @@ def train_run(args: argparse.Namespace) -> dict:
                 "log_every_steps": log_every_steps,
                 "ckpt_staging_dir": ckpt_staging_dir,
                 "ckpt_fsync": ckpt_fsync,
+                "grad_accum": grad_accum,
+                "grad_checkpoint": grad_checkpoint,
+                #: micro-batches consumed per optimizer step (== grad_accum
+                #: on every executed step; partial windows are dropped).
+                "micro_batches_per_step": grad_accum,
             },
             "checkpoint_save_total_s": round(history.checkpoint_save_s, 3),
             "vram_peak_mb": (
@@ -2414,6 +2640,8 @@ def train_run(args: argparse.Namespace) -> dict:
             log_every_steps=log_every_steps,
             ckpt_stager=ckpt_stager,
             ckpt_fsync=ckpt_fsync,
+            grad_accum=grad_accum,
+            grad_checkpoint=grad_checkpoint,
         )
     except BadStepsAbort as exc:
         # The abort is a DELIBERATE stop: write the same artifacts a clean

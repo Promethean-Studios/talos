@@ -15,7 +15,12 @@ Lanes (all on the same ``--packed-dir``, ``--token-budget`` and ``--seed``):
            --prefetch 2 --pin-memory);
   new-fp16 the upgraded engine with AMP fp16 (--attention-backend sdpa
            --amp fp16 --prefetch 2 --pin-memory; fp16 requires SDPA — the
-           plain path's -inf mask overflowed Half).
+           plain path's -inf mask overflowed Half);
+  new-bf16 the upgraded engine with AMP bf16 (--attention-backend sdpa
+           --amp bf16 --prefetch 2 --pin-memory; OPT-IN via ``--lanes`` —
+           bf16 needs Ampere+ (SM80+), so the T4's default three-lane run
+           does not include it; include ``bf16`` when benchmarking on an
+           A100/A10G/3090-class GPU).
 
 Per lane it reports (reusing the trainer's own phase timers + performance
 records): run-wide and steady-state tok/s, steps/s, torch-allocator VRAM
@@ -69,6 +74,11 @@ LANES: Dict[str, Dict[str, Any]] = {
     "fp16": dict(
         attention_backend="sdpa", amp="fp16", prefetch=2, pin_memory=True,
         label="SDPA fp16",
+    ),
+    # W2: bf16 lane — opt-in (bf16 needs Ampere+; the T4/Turing has none).
+    "bf16": dict(
+        attention_backend="sdpa", amp="bf16", prefetch=2, pin_memory=True,
+        label="SDPA bf16",
     ),
 }
 DEFAULT_LANES = ("old", "fp32", "fp16")
@@ -386,7 +396,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--lr", type=float, default=3e-3)
     p.add_argument("--lanes", default=",".join(DEFAULT_LANES),
                    help=f"comma-separated lanes out of {list(LANES)} "
-                        "(default: all three)")
+                        "(default: all three T4 lanes — old, fp32, fp16; add "
+                        "'bf16' to A/B bf16 on an Ampere+ GPU; bf16 has no "
+                        "T4 support)")
     p.add_argument("--prefetch", type=int, default=2,
                    help="prefetch depth for the fp32/fp16 lanes (old lane is "
                         "always 0)")

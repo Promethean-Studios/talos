@@ -47,6 +47,12 @@ class TalosGPT(nn.Module):
         )
         self.final_norm = RMSNorm(config.hidden_size, config.layer_norm_eps)
 
+        #: W2 engine: activation checkpointing switch (training-only; see
+        #: :meth:`forward` and :meth:`set_gradient_checkpointing`). It is a
+        #: plain runtime flag — deliberately NOT a buffer/parameter, so it
+        #: never enters state_dict/checkpoints.
+        self.gradient_checkpointing = False
+
         self.apply(self._init_weights)
         # Scale embedding output to reduce early training instability.
         self.embed_scale = math.sqrt(config.hidden_size)
@@ -141,13 +147,33 @@ class TalosGPT(nn.Module):
         aux_loss = hidden.new_zeros(())
         for idx, layer in enumerate(self.layers):
             window_size = self.config.layer_window_size(idx)
-            hidden, layer_aux = layer(
-                hidden,
-                positions=position_ids[0],
-                cache=cache if use_cache else None,
-                layer_idx=idx,
-                window_size=window_size,
-            )
+            if self.gradient_checkpointing and self.training:
+                # W2: activation checkpointing — recompute this layer's
+                # forward in the backward instead of saving every activation
+                # (K≈4 -> K≈1 live activation tensors; see docs/SCALING.md
+                # §7.3). ``use_reentrant=False`` preserves RNG state (dropout)
+                # for determinism and tolerates the non-tensor arguments
+                # (layer module, positions, idx, window_size, cache=None).
+                # Training-only: eval/val/generation forwards take the plain
+                # path below.
+                hidden, layer_aux = torch.utils.checkpoint.checkpoint(
+                    self._layer_forward,
+                    layer,
+                    hidden,
+                    position_ids[0],
+                    cache if use_cache else None,
+                    idx,
+                    window_size,
+                    use_reentrant=False,
+                )
+            else:
+                hidden, layer_aux = layer(
+                    hidden,
+                    positions=position_ids[0],
+                    cache=cache if use_cache else None,
+                    layer_idx=idx,
+                    window_size=window_size,
+                )
             aux_loss = aux_loss + layer_aux
 
         hidden = self.final_norm(hidden)
@@ -156,6 +182,39 @@ class TalosGPT(nn.Module):
         else:
             logits = torch.matmul(hidden, self.embed_tokens.weight.t())
         return logits, cache
+
+    def set_gradient_checkpointing(self, enabled: bool) -> None:
+        """Enable/disable activation checkpointing of the decoder layers.
+
+        Trades FLOPs for activation memory: each layer's forward is wrapped in
+        ``torch.utils.checkpoint.checkpoint(use_reentrant=False)`` so the
+        backward recomputes (rather than saves) intermediate activations —
+        K≈4 → K≈1 live activations per layer (docs/SCALING.md §7.3). The flag
+        only takes effect while ``self.training`` is True, so validation /
+        evaluation / generation forwards are never checkpointed. RNG state is
+        preserved by the checkpoint implementation, keeping same-seed runs
+        deterministic (dropout masks match the forward during recompute).
+        """
+        self.gradient_checkpointing = bool(enabled)
+
+    @staticmethod
+    def _layer_forward(
+        layer: nn.Module,
+        hidden: torch.Tensor,
+        positions: torch.Tensor,
+        cache: Optional[KVCache],
+        layer_idx: int,
+        window_size: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """One decoder-layer forward, hoisted so it is ``checkpoint()``-able.
+
+        ``checkpoint`` with ``use_reentrant=False`` accepts the non-tensor
+        arguments (module, positions, indices) alongside the activation tensor.
+        """
+        return layer(
+            hidden, positions=positions, cache=cache,
+            layer_idx=layer_idx, window_size=window_size,
+        )
 
     def new_cache(
         self,
