@@ -116,8 +116,9 @@ def test_grad_checkpoint_gradients_and_loss_identical(tmp_path):
         assert m["total_bad_steps"] == 0
         results[flag] = (m, _weights(os.path.join(out, "step-3.pt")))
     (m0, w0), (m1, w1) = results[False], results[True]
-    assert torch.allclose(m0["final_train_loss"], m1["final_train_loss"],
-                          atol=1e-6, rtol=1e-6)
+    # metrics.json holds floats, not tensors — compare with abs(); the weight
+    # and gradient comparisons below stay on actual tensors (torch.allclose).
+    assert abs(m0["final_train_loss"] - m1["final_train_loss"]) < 1e-6
     for k in w0:
         assert torch.allclose(w0[k], w1[k], atol=1e-6, rtol=1e-6), k
     # measured: max |ck_on - ck_off| = 0.0 on this box (exact recompute)
@@ -203,11 +204,19 @@ def test_grad_accum_remainder_dropped_at_epoch_end(tmp_path):
         val_max_steps=1, grad_accum=3, log_every_steps=1,
     )
     done = n_batches // 3
+    # Pinned semantics (the ONE coherent rule): `attempts` counts every loop
+    # window that reaches its completion/void DECISION — completed optimizer
+    # steps plus bad-step-voided windows (each consuming one step number, the
+    # N=1 bad-batch rule of §12) — while the epoch-end PARTIAL window consumes
+    # no step number, no tokens and no checkpoint. On this healthy run (no bad
+    # steps) attempts == completed steps == the final global_step.
     assert history.attempts == done == history.rows[-1].global_step
     assert history.tokens_processed == done * 3 * BATCH * (SEQ - 1)
     assert history.last_good_loss is not None
     ckpt = load_checkpoint(os.path.join(out_dir, f"step-{done}.pt"))
     assert ckpt["tokens_consumed"] == history.tokens_processed
+    # the voided remainder window produced NO checkpoint (no step-{done+1}.pt)
+    assert not os.path.exists(os.path.join(out_dir, f"step-{done + 1}.pt"))
 
 
 def test_grad_accum_fp16_and_bf16_run_clean(tmp_path):

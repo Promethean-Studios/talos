@@ -873,7 +873,9 @@ class TrainingHistory:
     abort_reason: Optional[str] = None
     #: TOTAL attempted steps across the run (good + bad). Equals the executed-
     #: step count on healthy runs; on aborts it is the honest "how far did the
-    #: loop get" number (executed = attempts - total_bad_steps).
+    #: loop get" number (executed = attempts - total_bad_steps). With
+    #: --grad-accum a step number is consumed at each window's completion/void
+    #: decision; a partial window dropped at an epoch end consumes none.
     attempts: int = 0
     #: T4 engine pass (P4): per-interval performance records (see
     #: :class:`IntervalStats`), oldest first.
@@ -1371,12 +1373,10 @@ def train_epochs(
         for batch in train_ds:
             t_iter0 = time.monotonic()
             if max_steps_per_epoch is not None and steps >= max_steps_per_epoch:
-                # W2: with grad accumulation, the cap counts COMPLETED optimizer
-                # steps (`steps` increments at window start, so a mid-window
-                # check would cut the window short and under-execute). For
-                # N=1 this is the legacy behavior verbatim.
-                if grad_accum <= 1 or micro_step == 0:
-                    break
+                # W2: `steps` advances only at a window's completion/void
+                # decision, so a mid-window check can never cut a window short
+                # — the plain gate is correct for N=1 and N>1 alike.
+                break
             if history.budget_reached:
                 break
             # P1d: pinned H2D handoff (non_blocking) — no-op on CPU paths.
@@ -1393,18 +1393,23 @@ def train_epochs(
                 # form ONE optimizer step (effective batch = batch x N). Each
                 # micro-batch loss is scaled by 1/N so the accumulated gradient
                 # is the MEAN — equal (up to fp summation order) to one large
-                # batch of batch*N. A partial window at an epoch end / token
-                # budget / step cap is DROPPED (no step, no token credit), so
-                # periodic/epoch checkpoints always land on optimizer-step
-                # boundaries. A NaN/Inf micro-batch voids its whole window (bad
-                # step -> safety checkpoint, no update, no token credit); the
-                # next micro-batch starts a fresh window.
+                # batch of batch*N. A step number is consumed ONLY at a
+                # window's completion/void decision — never at window start —
+                # so a PARTIAL window at an epoch end / token budget / step
+                # cap is DROPPED (no step number, no token credit, no
+                # checkpoint) and periodic/epoch checkpoints always land on
+                # optimizer-step boundaries. A NaN/Inf micro-batch voids its
+                # whole window as an ATTEMPTED step (bad step -> safety
+                # checkpoint step-N, no update, no token credit); the next
+                # micro-batch starts a fresh window.
                 if micro_step == 0:
-                    global_step += 1
-                    steps += 1
-                    history.attempts += 1
-                    # LR: a function of tokens consumed pre-step — evaluated
-                    # once per optimizer step at window start.
+                    # New window — the optimizer-step number (global_step /
+                    # steps / attempts) is NOT assigned here. It is consumed
+                    # only at the window's completion/void DECISION below, so
+                    # a partial window dropped at an epoch end / token budget
+                    # / step cap consumes no step number and checkpoints keep
+                    # naming optimizer-step boundaries. LR is a function of
+                    # tokens consumed pre-step, evaluated once per window.
                     opt.param_groups[0]["lr"] = schedule.lr_at(tokens_consumed)
                     opt.zero_grad(set_to_none=True)
                     window_tokens = 0
@@ -1419,6 +1424,13 @@ def train_epochs(
                 interval.fwd_s += time.monotonic() - t_fwd
                 # ---- loss finiteness BEFORE backward (always on) ----
                 if not torch.isfinite(loss):
+                    # Void decision: the window consumes one step NUMBER (an
+                    # attempted step, same rule as an N=1 bad batch — safety
+                    # checkpoint named step-N, no update, no tokens), assigned
+                    # here at the void, never at window start.
+                    global_step += 1
+                    steps += 1
+                    history.attempts += 1
                     stat = "nan" if torch.isnan(loss.detach()) else "inf"
                     handle_bad_step(
                         global_step, tokens_consumed, "loss", stat,
@@ -1443,6 +1455,12 @@ def train_epochs(
                 micro_step += 1
                 if micro_step < grad_accum:
                     continue
+                # ---- the window is complete: ONE attempted optimizer step ---
+                # Step number consumed here at the completion decision; a
+                # grading overflow below keeps the SAME number as a bad step.
+                global_step += 1
+                steps += 1
+                history.attempts += 1
                 # ---- window end = ONE optimizer step ------------------------
                 # unscale BEFORE clip and BEFORE the finiteness guard (P1b
                 # order): a scaling overflow surfaces as an inf grad, and the
