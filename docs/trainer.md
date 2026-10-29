@@ -45,7 +45,7 @@ script. Those are stated as MISSING and specified, not implied to exist.**
 | 24 | Benchmark mode (s/step, tok/s, peak VRAM) | **MISSING** — no trainer-side benchmark flag (spec in §17) | n/a |
 | 25 | Preflight gate script (`scripts/preflight.py`) | **MISSING** — proposed in §16 | n/a |
 | 26 | GPU-memory / ETA logging in the trainer | **MISSING (partially improved)** — still no VRAM/ETA sampling, ONLY host peak RSS + wall time; the hardening pass DID add grad-norm / bad-step / abort records to `metrics.json` (see §15.2) | `scripts/train_oasst1.py:1704-1739` (stability metrics) — GPU/ETA itself remains n/a |
-| 27 | FP16/AMP training | **MISSING + FORBIDDEN** — owner-reported fp16 failure (see §11, §28); BF16 unsupported on T4; FP32 is the only mode | n/a |
+| 27 | FP16/AMP training | **IMPLEMENTED (W2, §31.1)** — opt-in `--amp fp16`/`--amp bf16`; default none = legacy fp32 bit-identical. BF16 still unavailable on T4 (SM7.5) — use fp16 there. The old owner-reported fp16 failure (§11, §28) is historical (pre-SDPA). | `scripts/train_oasst1.py` §31.1; `tests/test_trainer_engine_w2.py` |
 | 28 | Google Drive layout / Drive storage preflight | **PROPOSED** — a deployment convention, not code (§14) | n/a |
 | 29 | Colab T4 tool / path (platform) | PARTIAL — lead-side Colab tool registered but connection times out (re-tested 2026-09-27); manual notebooks at `shared/colab/` are the working fallback | `shared/colab/README.md` |
 | 30 | OASST1 data preserved for later SFT | CURRENT (untouched in repo; see §24) | plan §24 |
@@ -79,9 +79,10 @@ be mixed into the base corpus** (§24).
 
 Two hard constraints from the plan:
 
-1. **FP16/AMP stays OFF** unless the attention mask path is proven safe under AMP (it is not — see
-   §11 and §28 for the owner-reported overflow). **BF16 does not exist on T4 (SM7.5). FP32 is the
-   safe and only sanctioned mode.**
+1. **AMP is opt-in** (`--amp fp16` / `--amp bf16` — legal since the W2 engine pass, §31.1; the
+   owner-reported overflow that kept fp16 "OFF" applied to the OLD plain masked-fill attention
+   path and is historical, §11.3/§28). **BF16 still does not exist on T4 (SM7.5)** — on the T4
+   use `--amp fp16` or none. **The default (no `--amp`) is FP32, unchanged and bit-identical.**
 2. **Before any long run**: smoke tests + a short benchmark on the new dataset, all config recorded
    in metadata, and a **gate**: the proposed training report (dataset, token budget, batch, LR
    config, checkpoint schedule, expected T4 runtime, dataset passes) must be approved by the owner
@@ -164,7 +165,7 @@ Still **MISSING and specified** here (unchanged by the hardening pass):
 | Item | Value | Source / status |
 |---|---|---|
 | GPU target | NVIDIA Tesla T4, 16 GB VRAM (SM 7.5) | Colab free tier; notebook asserts T4 |
-| Compute mode | **FP32 only.** No AMP autocast anywhere in the repo. BF16 unavailable on SM7.5; fp16 documented broken for this attention mask path (§11, §28) | verified: no `autocast`/`half()` in `scripts/train_oasst1.py`, `model/` |
+| Compute mode | **FP32 default** — the no-flag run is bit-identical to the pre-W2 engine. AMP is opt-in (`--amp fp16` / `--amp bf16`, §31.1); BF16 unavailable on SM7.5 — on the T4 use fp16 or none; the old fp16 masked-fill failure (§11.3, §28) is historical (pre-SDPA) | verified: no-flag run uses no autocast; AMP runs are explicit opt-in flags |
 | Peak-VRAM model (computed, audit §13) | B=32/S=64 ≈ **2.2–2.4 GiB**; B=32/S=512 ≈ **7.7–9.2 GiB** (fp32 incl. CUDA overhead); weights+grads+AdamW = 16×P ≈ **1.44 GiB** regardless of batch | `shared/talos-100m-audit.md` §13 (computed, not measured) |
 | Recommended T4 starting shape | **batch 32 × seq 64** (2,048 tokens/step) | `docs/SCALING.md:327` (repo recommendation) |
 | CPU box (this repo's dev box) | no GPU; all repo-recorded benchmarks are CPU | `benchmarks/phase-b/report-tiny-1m.md` §4 |
@@ -482,15 +483,20 @@ budget ≈ ~145 h. These are **estimates from owner-reported numbers**, not meas
 Repo recommendation: **batch 32 × seq 64 to start** (`docs/SCALING.md:327`). The audit concludes
 VRAM is not the binding constraint on a 16 GB T4; throughput is.
 
-### 11.3 Precision — the hard rule
-
-- **FP32 is the safe and only sanctioned mode** (no AMP code exists in the repo at all).
-- **BF16 is unsupported on T4 (SM 7.5)** — do not attempt.
-- **FP16/AMP FAILED (owner-reported, do NOT enable):**
+### 11.3 Precision — the hard rule (UPDATED 2026-10-21: AMP is now legal)
+- **Default is FP32** (no `--amp` flag → the legacy fp32 path, bit-identical to every earlier
+  release). **AMP is optional and implemented**: `--amp fp16` (autocast + GradScaler) and
+  `--amp bf16` (autocast, no scaler) — engine details in §31.1.
+- **BF16 is unsupported on T4 (SM 7.5)** — on the T4 use `--amp fp16` or `--amp none`;
+  bf16 needs Ampere+ (SM80+).
+- **HISTORICAL (pre-2026-10-21, owner-reported):** FP16/AMP "FAILED" with
   `RuntimeError: value cannot be converted to type c10::Half without overflow`
-  in the attention masked-fill path: `model/attention.py:182-184` builds
-  `mask = torch.zeros_like(scores); mask = mask.masked_fill(~allowed…, NEG_INF)` — under fp16
-  autocast the `-inf` fill in fp16 overflows. The plan forbids AMP until this path is proven safe.
+  in the OLD plain masked-fill attention path (`model/attention.py:182-184` builds
+  `mask = torch.zeros_like(scores); mask = mask.masked_fill(~allowed…, NEG_INF)` — under
+  fp16 autocast the `-inf` fill in fp16 overflows). PR #33 replaced the default attention
+  with SDPA (native fp16-safe masking) and PR #36 added the tested fp16/bf16 AMP paths — on
+  the SDPA default the overflow no longer occurs; the plain fallback retains the old
+  behavior, so use `--attention-backend sdpa` when enabling AMP.
 
 ### 11.4 Required preflight batch benchmark (before the real run)
 
@@ -532,8 +538,9 @@ loss of state (the last-good checkpoint is on disk before the abort
 propagates).
 
 **Not implemented (unchanged):** GPU-memory/ETA logging (§15.3) and the
-preflight script (§16) remain MISSING; the FP16/AMP caveat of §11/§28 still
-holds (this pass adds no AMP — FP32 only).
+preflight script (§16) remain MISSING. (The FP16/AMP caveat of §11/§28 is
+now HISTORICAL — §31.1 added the opt-in AMP paths in the W2 pass; the no-flag
+run this pass describes is still FP32.)
 
 ---
 
@@ -734,7 +741,7 @@ consecutive_bad_steps, checkpoint}`), `total_bad_steps`, `consecutive_bad_steps`
 | 24 | Budget not already exhausted at resume | CURRENT | `:785-800` warns + no-op finish |
 | 25 | `--lr-decay cosine` only with `--token-budget` | CURRENT | `TokenSchedule` validation (`:118-127`) |
 | 26 | Batch×seq fits VRAM (preflight benchmark) | **MISSING/NEEDS IMPLEMENTATION** | no trainer benchmark mode — §17 spec; manual 20-step smoke is the current substitute |
-| 27 | FP32 mode forced (no AMP anywhere) | CURRENT by absence | no autocast in repo; preflight asserts no env var forces AMP |
+| 27 | FP32 default (AMP opt-in, §31.1) | SUPERSEDED by the W2 engine pass | default none = fp32 bit-identical; AMP only via an explicit `--amp`; preflight asserts no env var forces AMP |
 | 28 | Token-ID bounds proven on a live batch | CURRENT | `validate_token_ids` at data source + batch + model seam; guards tested (`tests/test_training.py::test_invalid_token_id_rejected`-style) |
 | 29 | Generation length guard (CLI) | CURRENT | `scripts/generate.py` truncation (`:179-198` per audit); library `generate()` guard fixed in P0 (#25) |
 | 30 | Before-run smoke: N steps train + val + checkpoint write | PARTIAL | use `--max-steps-per-epoch N --val-max-steps M` (existing flags); an automated smoke cell/mode is NEEDS IMPLEMENTATION |
@@ -992,11 +999,16 @@ and the packed corpus prepared (§8) either on Drive or in Colab scratch.
 | `--max-steps-per-epoch` | int | None | no | CI/smoke cap |
 | `--val-max-steps` | int | None | no | CI/smoke cap on val batches |
 | `--device` | str | None (auto) | no | auto → `cuda` if available else `cpu` |
+| `--amp` | str | `"none"` | no | `none` \| `fp16` \| `bf16` — AMP autocast (§31.1); bf16 needs Ampere+ (no T4 path); fp16 = autocast + GradScaler; default none = legacy fp32 bit-identical |
+| `--grad-checkpoint` | flag | False | no | per-block activation checkpointing, training-only (§31.2) |
+| `--grad-accum` | int | 1 | no | N micro-batches per optimizer step (§31.3); 1 = the legacy single-step path |
 
 **Still missing (NEEDS IMPLEMENTATION — do not try to pass them):** `--benchmark`,
-`--fp16`/`--amp` (FORBIDDEN, §11), `--eta`, `--vit`… none of these exist. The three hardening
+`--eta`, `--vit`… none of these exist. The three hardening
 flags above (`--save-every-tokens`, `--grad-clip`, `--max-consecutive-bad-steps`) are the ones
 this doc's earlier revisions listed as `--super-save-every`/`--nan-abort` (§29 pruned accordingly).
+The W2 engine flags `--amp` / `--grad-checkpoint` / `--grad-accum` (1B workstream) are in the
+table above and detailed in §31 — AMP is no longer forbidden (§11.3).
 
 ### 21.2 `scripts/prepare_corpus.py` — full table in §8.1 (11 flags; `--tokenizer-json`,
 `--target-tokens`, `--out-dir` required).
@@ -1263,7 +1275,7 @@ library guard fixed in PR #25).
 
 | Issue | Detail | Status |
 |---|---|---|
-| **FP16 AMP overflow (do NOT enable AMP)** | Owner-reported, verbatim: `RuntimeError: value cannot be converted to type c10::Half without overflow`. Code path: `model/attention.py:182-184` — `mask = torch.zeros_like(scores); mask.masked_fill(~allowed, NEG_INF)` under fp16 autocast overflows filling `-inf` in half precision. No AMP code exists in the repo; the plan forbids enabling it until the mask path is proven safe. BF16 is unavailable on T4 (SM7.5). | FORBIDDEN (plan) + not implemented |
+| **FP16 AMP overflow — HISTORICAL (pre-SDPA)** | Owner-reported, verbatim: `RuntimeError: value cannot be converted to type c10::Half without overflow`. Code path: the OLD plain attention `model/attention.py:182-184` — `mask = torch.zeros_like(scores); mask.masked_fill(~allowed, NEG_INF)` under fp16 autocast overflows filling `-inf` in half precision. PR #33's SDPA default masks natively (no fp16 `-inf` fill) and PR #36 added the tested `--amp fp16`/`--amp bf16` paths (§31.1); the no-flag run stays fp32. Plain fallback + fp16 retains the old risk — use `--attention-backend sdpa` with AMP. BF16 is unavailable on T4 (SM7.5). | RESOLVED for the SDPA default (W2); historical record |
 | NaN/Inf detection, grad clipping, abort-with-checkpoint | **FIXED (2026-09-27, hardening pass)** — detection always-on in `train_epochs`; bad steps skip the optimizer update, log structured events into `metrics.json`, write a safety checkpoint, abort after 3 consecutive failures; `--grad-clip` bounds the norm. Metadata now records `nan_inf_detection: True` + the real `gradient_clip_type`. | CURRENT (§12, `tests/test_trainer_stability.py`) |
 | Non-atomic `.pt` writes | **FIXED (2026-09-27)** — `save_checkpoint` writes `<path>.tmp` + `os.replace` for every cadence (epoch-end, periodic, safety); the corrupt-fallback scanner remains for pre-hardening artifacts. | CURRENT (§13.4) |
 | Local-box memory limits (dev box, not Colab) | The build box is memory-starved (~3.9 GB total, <2.2 GB usable); `tests/conftest.py` skips 100M-scale tests under ~900 MB MemAvailable. CI runners (7 GB) run everything. Not a Colab-T4 concern. | documented in `.github/workflows/tests.yml` |
@@ -1299,9 +1311,9 @@ below is what remains.
 6. **Expose AdamW knobs** (`--weight-decay`, `--betas`, `--eps`) if a non-default optimizer config
    is ever wanted (§10.1 — currently not configurable).
 
-Not required for the run itself: FP16/AMP (forbidden), gradient accumulation (not needed at these
-shapes), FlashAttention (plain backend suffices; Flash backend exists but neither is required on
-T4 at S=512).
+Not required for the run itself: AMP, gradient accumulation, FlashAttention — the plain fp32
+backend suffices at these shapes on the T4 (S=512). (AMP + grad-accum exist as opt-in engine
+flags since the W2 pass, §31; this run does not need them.)
 
 ---
 
@@ -1322,7 +1334,7 @@ T4 at S=512).
   (trainer-side, CURRENT — §12/§13; the operator wrapper of the old §12.4 is no longer needed and
   must NOT be relied on instead of the trainer's own guards).
 - [ ] Drive free space ≥ corpus + checkpoints budget + margin (§14); per-epoch copy planned.
-- [ ] FP32 only: no AMP anywhere; no `--fp16` flag exists to pass.
+- [ ] FP32 default: pass no `--amp` flag (AMP is opt-in, §31.1; not needed for this run).
 
 **During the run:**
 - [ ] Watch per-epoch stdout line (§15.1); verify loss finite + directionally decreasing.
@@ -1365,10 +1377,60 @@ This document's T4/Colab reference does **not** apply to them:
   3.9 GB RAM) — 1B validation uses the meta device + a small-dim functional
   config (see ``tests/test_talos_1b.py`` and docs/SCALING.md §7 for the full
   memory model and formulas).
-* Engine note: bf16-master weights, gradient checkpointing and gradient
-  accumulation are **not** in the engine yet and were deliberately not added
-  by the 1B-preset PR; the 18 B/param mixed-precision layout in docs/SCALING.md
-  §7.3 is the sizing assumption for the later engine delegation.
+* Engine note (updated by the W2 pass, 2026-10-21): bf16 AMP (`--amp bf16`),
+  gradient checkpointing (`--grad-checkpoint`) and gradient accumulation
+  (`--grad-accum`) were deliberately NOT added by the 1B-preset PR; the W2
+  engine delegation (PR #36) has since added all three as opt-in flags (§31).
+  The 18 B/param mixed-precision layout in docs/SCALING.md §7.3 remains the
+  sizing assumption for the full 1B training run.
 
 All other sections of this document continue to describe the ``tiny_100m``
 T4/Colab reference only.
+
+---
+## 31. W2 engine capabilities: bf16 / grad-checkpoint / grad-accum (2026-10-21)
+Added for the 1B workstream (owner-directed; additive — all three default to
+the legacy engine and the no-flag run is bit-identical, regression-pinned by
+`tests/test_trainer_engine_w2.py`).
+### 31.1 `--amp bf16`
+`bf16` joins `none`/`fp16` in `AMP_CHOICES`. Autocast runs bf16 on CUDA **and**
+CPU; **no GradScaler** (bf16's exponent range matches fp32 — it does not need
+scaling — so backward/step run direct and grad-clip is unchanged). The fp16
+path (autocast + GradScaler, unscale-before-clip) is byte-identical when
+chosen. Validation always runs fp32 (unchanged).
+**Hardware note: bf16 needs Ampere+ (SM80+). The T4/Turing (SM7.5) has NO bf16
+tensor-core path — on a T4 use `--amp fp16` or `--amp none`.**
+`scripts/bench_train.py` gained an opt-in `bf16` lane (`--lanes
+old,fp32,fp16,bf16`); it is NOT a default lane because the T4 cannot run it.
+### 31.2 `--grad-checkpoint` (activation checkpointing)
+Wraps each decoder-block forward in
+`torch.utils.checkpoint.checkpoint(use_reentrant=False)` during TRAINING only
+(the model flag is ignored in eval mode, so val/eval/generation never
+checkpoint). Recompute-in-backward keeps only the layer input per block:
+**K≈4 → K≈1 live activation tensors**, i.e. the `activations (ckpt)` column of
+docs/SCALING.md §7.3 (for `talos_1b` at seq 2048 B=1: ≈1.4 GiB → ≈0.35 GiB).
+Costs ~one extra forward pass per step. RNG is preserved by the implementation
+(dropout masks match between forward and recompute), and the measured final
+weights/loss are identical to the non-checkpointed run (max abs diff 0.0 on
+the CI box; tests bound <1e-6). Works inside the AMP autocast context.
+Combines freely with `--grad-accum`.
+### 31.3 `--grad-accum N` (gradient accumulation)
+`--batch` is the MICRO-batch size; N consecutive micro-batches form ONE
+optimizer step, each micro-batch loss scaled by `1/N` (the accumulated
+gradient is the mean — equal, up to fp summation order, to one batch of
+`--batch × N` rows; measured weight diff vs the single-step run ~8e-6 after
+2 steps, identical per-step losses). **Keep `--batch × --grad-accum` at the
+desired effective batch.**
+Accounting: `metrics["steps"]`, checkpoint numbering and `tokens_consumed`
+count OPTIMIZER steps; `metrics["engine"]` records `grad_accum` and
+`micro_batches_per_step`. Step-number semantics (the ONE coherent rule,
+pinned by `tests/test_trainer_engine_w2.py`): a step number (`global_step` /
+`steps` / `attempts`) is consumed ONLY when a window reaches its
+completion/void DECISION — a completed optimizer step (all N micro-batches,
+`opt.step()` ran) or a bad-step void (NaN/Inf → safety checkpoint named for
+the attempted step, no update, no tokens — the N=1 bad-batch rule of §12).
+A PARTIAL window silently dropped at an epoch end / token budget / step cap
+consumes **no step number, no tokens and no checkpoint**, so checkpoints
+always land on optimizer-step boundaries. `attempts` therefore equals the
+number of completed optimizer steps on runs with no bad steps; bad-step voids
+add attempted-but-not-completed steps (matching §12).
