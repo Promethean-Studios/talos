@@ -103,6 +103,12 @@ from data.tokenized import StreamingTokenizedDataset  # noqa: E402
 from model import ModelConfig, TalosGPT  # noqa: E402
 from model.attention import build_attention_backend  # noqa: E402
 from model.utils import get_logger, set_seed, validate_token_ids  # noqa: E402
+from tokenizer.assets import (  # noqa: E402
+    asset_for_preset,
+    assert_asset_preset_pairing,
+    assert_tokenizer_vocab_pairs,
+    get_asset,
+)
 from tokenizer.corpus import iter_text_documents  # noqa: E402
 from tokenizer.tokenizer import (  # noqa: E402
     ByteLevelBPETokenizer,
@@ -1763,6 +1769,17 @@ def make_arg_parser() -> argparse.ArgumentParser:
                         "path is used if it exists on this machine, else the "
                         "run proceeds without a tokenizer sidecar (identity "
                         "still recorded from the manifest).")
+    p.add_argument("--tokenizer-asset", default=None, metavar="NAME",
+                   help="load a COMMITTED tokenizer asset from "
+                        "assets/tokenizers/ (e.g. 'talos_1b_32k') instead of "
+                        "training BPE from --data or reading --tokenizer-json. "
+                        "The asset's sha256 is verified against "
+                        "assets/tokenizers/MANIFEST.json and its vocab must pair "
+                        "with --preset. The 1B presets (talos_1b / "
+                        "talos_1b_spec16) select their 32,000-vocab asset "
+                        "automatically (this flag is then only needed to be "
+                        "explicit); the canonical tiny presets own no committed "
+                        "asset and reject it.")
     # training
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--seq", type=int, default=None,
@@ -2145,6 +2162,45 @@ def train_run(args: argparse.Namespace) -> dict:
     exp_params, exp_vocab = CANONICAL_PRESETS[preset]
     cfg = ALL_PRESETS[preset]().derive()
 
+    # ---- tokenizer ASSET selection (Talos 1B track) ------------------------
+    # The 1B presets own a committed 32,000-vocab tokenizer asset
+    # (assets/tokenizers/, sha256-pinned in MANIFEST.json); the canonical tiny
+    # family trains its vocab-1024 tokenizer inside the run. Resolving the
+    # asset HERE — before the data step — means the packed-corpus manifest
+    # check, the out_dir sidecar copy and every checkpoint fingerprint all see
+    # the same tokenizer identity, and a 1B run can never silently fall back to
+    # the canonical 1024 tokenizer.
+    tokenizer_asset = getattr(args, "tokenizer_asset", None)
+    asset_record = None
+    if tokenizer_asset is None:
+        # Preset-owned default: 'talos_1b'/'talos_1b_spec16' -> the 32K asset;
+        # the tiny family -> None (train in-run, unchanged behaviour).
+        tokenizer_asset = asset_for_preset(preset)
+    if tokenizer_asset:
+        assert_asset_preset_pairing(tokenizer_asset, preset)
+        asset_record = get_asset(tokenizer_asset)
+        asset_path = asset_record.verify()  # sha256 vs MANIFEST.json, loud on drift
+        if args.tokenizer_json:
+            provided = tokenizer_file_sha256(args.tokenizer_json)
+            if provided != asset_record.sha256:
+                raise ValueError(
+                    f"--tokenizer-json {args.tokenizer_json} (sha256 "
+                    f"{provided[:12]}...) is not the registered tokenizer asset "
+                    f"{tokenizer_asset!r} (sha256 {asset_record.sha256[:12]}...) "
+                    f"-- the {preset} preset must run with its dedicated "
+                    f"{asset_record.vocab_size:,}-vocab asset; drop "
+                    f"--tokenizer-json to use it, or point it at a copy of the "
+                    f"asset file"
+                )
+            print(f"  tokenizer     : --tokenizer-json matches tokenizer asset "
+                  f"{tokenizer_asset!r} (sha256 verified)")
+        else:
+            args.tokenizer_json = asset_path
+        print(f"  tokenizer     : asset {tokenizer_asset!r} — vocab "
+              f"{asset_record.vocab_size:,}, {asset_record.merges:,} merges, "
+              f"sha256 {asset_record.sha256[:12]}... verified against "
+              f"assets/tokenizers/MANIFEST.json")
+
     # ---- resume runs must continue the SAME data source ---------------------
     ckpt_run_meta = (resume_ckpt or {}).get("run_metadata") or {}
     ckpt_prov = ckpt_run_meta.get("data_provenance") or {}
@@ -2350,17 +2406,15 @@ def train_run(args: argparse.Namespace) -> dict:
             print(f"  tokenizer     : reused from packed-corpus manifest "
                   f"(sha256 {manifest_tok_sha[:12]}… verified) — no sidecar file")
 
-    # Uniform vocab contract: a realized tokenizer's vocab must fit inside the
-    # preset model's embedding rows. Packed rows are additionally range-checked
-    # per batch against the model vocab, and the manifest's vocab_size_bound is
-    # verified against it by load_packed_manifest.
+    # Uniform vocab contract (tokenizer/assets.py): a realized tokenizer's vocab
+    # must fit inside the preset model's embedding rows -- and for the Talos 1B
+    # track it must match EXACTLY (32,000), because a 1024-vocab tokenizer
+    # satisfies "<=" but is precisely the silent reuse the owner forbade. Packed
+    # rows are additionally range-checked per batch against the model vocab, and
+    # the manifest's vocab_size_bound is verified by load_packed_manifest.
     model_vocab = ALL_PRESETS[preset]().vocab_size
-    if tokenizer is not None and tokenizer.vocab_size > model_vocab:
-        raise ValueError(
-            f"tokenizer vocab_size {tokenizer.vocab_size} exceeds the {preset} "
-            f"model's {model_vocab} — the tokenizer cannot be embedded; use a "
-            f"tokenizer built for the canonical vocab-{model_vocab} contract"
-        )
+    if tokenizer is not None:
+        assert_tokenizer_vocab_pairs(tokenizer.vocab_size, preset)
 
     # ---- 2) canonical preset model + hard param-count guard (fail fast) ---
     model = build_preset_model(preset, attention_backend=attention_backend).to(device)
@@ -2472,6 +2526,9 @@ def train_run(args: argparse.Namespace) -> dict:
             else None
         ),
         "origin": tokenizer_origin,
+        #: name of the committed asset the run loaded (None = trained in-run or
+        #: packed-manifest tokenizer), so metrics/checkpoints name the tokenizer.
+        "asset": tokenizer_asset,
     }
     if data_src == "packed":
         data_provenance = {
@@ -2542,6 +2599,7 @@ def train_run(args: argparse.Namespace) -> dict:
             #: (sha256 of out_dir/tokenizer.json, or the packed manifest's record).
             "tokenizer_sha256": tokenizer_meta["sha256"],
             "tokenizer_origin": tokenizer_origin,
+            "tokenizer_asset": tokenizer_meta.get("asset"),
             "tokenizer_json_arg": tokenizer_json,
             "data_source": data_src,
             "train_docs": split.train_docs if split is not None else None,
