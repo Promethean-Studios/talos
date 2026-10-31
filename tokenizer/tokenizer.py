@@ -25,7 +25,7 @@ from dataclasses import asdict
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from tokenizer._logging import get_logger
-from tokenizer.bpe import encode_bytes, ranks_from_merges
+from tokenizer.bpe import encode_bytes, encode_bytes_exact, ranks_from_merges
 from tokenizer.pre_tokenize import iter_words_with_gaps, resolve_pattern
 from tokenizer.vocab import BASE_VOCAB_SIZE, TokenizerConfig, Vocabulary
 
@@ -59,14 +59,25 @@ class ByteLevelBPETokenizer:
         merges: ordered list of byte pairs (``[left_byte, right_byte]``) in merge
             rank order. Omit to build an empty-vocab tokenizer (just the 256 base
             bytes + special tokens), e.g. when encoding text before training.
+        exact_bpe: use the **correct** greedy BPE encoder
+            (:func:`tokenizer.bpe.encode_bytes_exact`) instead of the legacy
+            heap encoder (:func:`tokenizer.bpe.encode_bytes`). Default ``False``
+            keeps every existing tokenizer/checkpoint byte-identical — the
+            legacy encoder is what the canonical 1024 presets were trained and
+            fingerprinted with. New tokenizers (the Talos 1B 32K asset) set it
+            to ``True``; it is persisted in the saved ``tokenizer.json`` so a
+            reload cannot silently switch encoders.
     """
 
     def __init__(
         self,
         config: TokenizerConfig,
         merges: Optional[Sequence[Sequence[int]]] = None,
+        exact_bpe: bool = False,
     ) -> None:
         self.config = config
+        self.exact_bpe = bool(exact_bpe)
+        self._encode_bytes_fn = encode_bytes_exact if self.exact_bpe else encode_bytes
         self._vocab = Vocabulary(config, merges or [])
         self._pre_pattern = resolve_pattern(config.pre_tokenize)
         self._special_re: Optional[re.Pattern] = None
@@ -141,12 +152,14 @@ class ByteLevelBPETokenizer:
         # a pattern that does not cover the text must never silently drop bytes.
         if self._pre_pattern is None:
             byte_ids = list(data)
-            return encode_bytes(byte_ids, self._ranks, self._merge_id_map)
+            return self._encode_bytes_fn(byte_ids, self._ranks, self._merge_id_map)
         out: List[int] = []
         for word in iter_words_with_gaps(text, self._pre_pattern):
             if word:
                 out.extend(
-                    encode_bytes(list(word.encode("utf-8")), self._ranks, self._merge_id_map)
+                    self._encode_bytes_fn(
+                        list(word.encode("utf-8")), self._ranks, self._merge_id_map
+                    )
                 )
         return out
 
@@ -263,6 +276,12 @@ class ByteLevelBPETokenizer:
             "config": asdict(self.config),
             "merges": [list(p) for p in self._vocab.merges],
         }
+        # The encoder choice is part of the tokenizer's identity: persist it ONLY
+        # when it differs from the default, so every existing (legacy-encoder)
+        # tokenizer.json stays byte-identical and its recorded sha256 fingerprint
+        # keeps matching old checkpoints.
+        if self.exact_bpe:
+            payload["exact_bpe"] = True
         # Atomic write: dump to a temp file in the same directory, then
         # os.replace() so a crash/interrupt mid-save can never leave a
         # truncated or otherwise corrupted file at ``path``.
@@ -291,7 +310,7 @@ class ByteLevelBPETokenizer:
             raise ValueError(f"unsupported tokenizer file version: {payload.get('version')}")
         config = TokenizerConfig(**payload["config"])
         merges = [tuple(p) for p in payload["merges"]]
-        tok = cls(config, merges)
+        tok = cls(config, merges, exact_bpe=bool(payload.get("exact_bpe", False)))
         return tok
 
     # -- reporting ----------------------------------------------------------
@@ -307,6 +326,8 @@ class ByteLevelBPETokenizer:
             "unused_slots": unused,
             "first_merge_id": self.config.merge_base_id(),
             "last_merge_id": self.config.merge_base_id() + self.merge_count - 1,
+            #: which encoder this tokenizer runs (see the ``exact_bpe`` ctor arg)
+            "exact_bpe": self.exact_bpe,
         }
 
     # -- helper for model integration --------------------------------------

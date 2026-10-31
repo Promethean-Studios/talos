@@ -1,0 +1,87 @@
+{
+  "version": 1,
+  "comment": "Committed tokenizer assets for the Talos 1B track. Source of truth for tokenizer/assets.py: every sha256 here is verified at load time, so a modified/truncated asset fails loudly instead of tokenizing silently. The training sample is NOT committed (no third-party text in the repo); re-fetch it with the documented command and check it against training_sample.sha256.",
+  "assets": {
+    "talos_1b_32k": {
+      "file": "talos_1b_32k.json",
+      "vocab_size": 32000,
+      "merges": 31740,
+      "sha256": "2d9476674e758f8d6dd611b56c9209b2fe77b13bfa592c0a65971a9168c4b165",
+      "presets": [
+        "talos_1b",
+        "talos_1b_spec16"
+      ],
+      "special_ids": {
+        "<|beginoftext|>": 31996,
+        "<|endoftext|>": 31997,
+        "<|pad|>": 31998,
+        "<|unk|>": 31999
+      },
+      "pre_tokenize": "gpt2",
+      "minfreq": 1,
+      "seed": 0,
+      "encoder": "exact_bpe",
+      "trained_with": "scripts/train_tokenizer_32k.py",
+      "date": "2026-10-29",
+      "training_sample": {
+        "dataset": "HuggingFaceFW/fineweb-edu",
+        "config": "default",
+        "split": "train",
+        "start_offset": 0,
+        "num_rows": 1000,
+        "page_size": 100,
+        "chars": 4756229,
+        "bytes": 4955380,
+        "sha256": "f183e03bac859063a62b868a47f1410b738e42bd8f8c02681f040c7805d73072",
+        "license": "ODC-By 1.0 (openly licensed educational web text)",
+        "committed": false,
+        "fetch_command": "python -m scripts.fetch_tokenizer_sample --output /tmp/fw_sample_1b.jsonl",
+        "heldout": {
+          "dataset": "HuggingFaceFW/fineweb-edu",
+          "config": "default",
+          "split": "train",
+          "start_offset": 1000000,
+          "num_rows": 200,
+          "page_size": 100,
+          "sha256": "d7c75e27e4a62efd5e90aa818b75b2b612b3d9027f0acffbe1777110b68cb326",
+          "committed": false,
+          "fetch_command": "python -m scripts.fetch_tokenizer_sample --start-offset 1000000 --num-rows 200 --output /tmp/fw_heldout_1b.jsonl"
+        }
+      },
+      "compression": {
+        "train_sample": {
+          "docs": 1000,
+          "chars": 4756229,
+          "tokens": 1007433,
+          "chars_per_token": 4.72113679023816,
+          "bytes_per_token": 4.72113679023816
+        },
+        "train_sample_legacy_encoder": {
+          "docs": 1000,
+          "chars": 4756229,
+          "tokens": 2749605,
+          "chars_per_token": 1.7297862783927145,
+          "bytes_per_token": 1.7297862783927145
+        },
+        "baseline_byte_tokenizer_chars_per_token": 1.0,
+        "encoder": "exact_bpe",
+        "heldout_sample": {
+          "docs": 200,
+          "chars": 1111482,
+          "tokens": 251377,
+          "chars_per_token": 4.4215739705701,
+          "bytes_per_token": 4.4215739705701
+        },
+        "heldout_sample_legacy_encoder": {
+          "docs": 200,
+          "chars": 1111482,
+          "tokens": 643570,
+          "chars_per_token": 1.7270568858088475,
+          "bytes_per_token": 1.7270568858088475
+        },
+        "train_compression_vs_byte_baseline": 4.72113679023816,
+        "heldout_compression_vs_byte_baseline": 4.4215739705701
+      }
+    }
+  }
+}
