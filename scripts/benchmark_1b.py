@@ -101,8 +101,15 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 import torch
 
-from configs.canonical import CANONICAL_PRESETS
-from configs.presets import ALL_PRESETS
+# Repo-root packages are importable when this module is run from the repo root
+# (conftest.py does the same for pytest); add the root defensively so the script
+# also works when invoked from another CWD (same bootstrap as train_oasst1.py).
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from configs.canonical import CANONICAL_PRESETS  # noqa: E402
+from configs.presets import ALL_PRESETS  # noqa: E402
 from inference.generate import decode_step, prefill
 from model.gpt import TalosGPT
 from scripts.train_oasst1 import (
