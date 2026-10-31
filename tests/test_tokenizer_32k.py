@@ -264,7 +264,7 @@ def test_canonical_1024_tokenizer_is_unchanged() -> None:
     tok = ByteLevelBPETokenizer(cfg, [(104, 105), (256, 101)])
     assert tok.exact_bpe is False  # default preserved
     assert tok.encode("hie") == tok.encode("hie")  # deterministic
-    assert tok.vocab_size == 1024
+    assert tok.config.vocab_size == 1024  # configured rows; 262 ids realised from 2 merges
     # A legacy-encoder save writes NO exact_bpe key, so every existing
     # tokenizer.json keeps its byte-identical sha256 fingerprint.
     import tempfile, os
