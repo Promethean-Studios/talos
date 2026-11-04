@@ -392,29 +392,32 @@ python -m pytest -q
   has produced measured evidence at ≥2 scales beyond 254K and the owner
   explicitly green-lights scaling work.
 
-## 7. The Talos 1B presets (owner-directed 2026-10; memory estimates)
+## 7. The Talos 1B presets (owner-directed 2026-10; FFN axis chosen 2026-11-04)
 
-The owner directed a Talos **1B** preset with a specific architecture. Two
+The owner directed a Talos **1B** preset with a specific architecture. Three
 presets are registered (``configs/presets.py``, canonical registry
-``configs/canonical.py``), both built and validated on the **meta device** —
+``configs/canonical.py``), all built and validated on the **meta device** —
 no 1B model has been instantiated in real memory, and **no training run has
-started** (this PR only registers + validates the presets; the tokenizer asset
-and any run are later delegations). Every number below is code-computed
-(``tests/test_talos_1b.py`` asserts the exact counts); all memory figures are
-**estimates**, labeled as such.
+started**. Every number below is code-computed (``tests/test_talos_1b.py``
+asserts the exact counts); all memory figures are **estimates**, labeled as
+such.
 
-### 7.1 Architecture (both presets — the owner's spec)
+### 7.1 Architecture (the owner's spec)
 
 vocab **32,000** · seq **2,048** · hidden **2,048** · **16 query heads / 4 KV
-heads (4:1 GQA)** · **head_dim 128** · SwiGLU dense FFN intermediate **5,504**
-(2.6875× hidden) · RMSNorm pre-norm · RoPE (theta 1e4) · **no biases** ·
-**TIED input/output embeddings** · ``initializer_range`` 0.02. Depth is the
-only difference:
+heads (4:1 GQA)** · **head_dim 128** · SwiGLU dense FFN · RMSNorm pre-norm ·
+RoPE (theta 1e4) · **no biases** · **TIED input/output embeddings** ·
+``initializer_range`` 0.02. The literal spec's FFN is **5,504** (2.6875×
+hidden); its 16 layers compute to ≈774M, ~23% under the 1B target. The owner
+pre-authorized adjusting dimensions and, on **2026-11-04, chose the FFN axis**:
+``talos_1b`` keeps the spec's 16 layers and widens the SwiGLU FFN to **7,808**
+(3.8125× hidden). Depth is the other axis, preserved as ``talos_1b_21l``.
 
-| preset | layers | exact params | rationale |
-|---|---:|---:|---|
-| ``talos_1b`` | 21 | **995,973,120** | depth-adjusted to approach 1B (per-layer shape untouched) |
-| ``talos_1b_spec16`` | 16 | **774,440,960** | the literal 16-layer spec |
+| preset | layers | FFN | exact params | rationale |
+|---|---:|---:|---:|---|
+| ``talos_1b`` | 16 | 7,808 | **1,000,933,376** | **primary** — the owner's 2026-11-04 FFN-adjusted variant (≈1,000.9M) |
+| ``talos_1b_21l`` | 21 | 5,504 | **995,973,120** | the earlier depth-adjusted build, preserved unchanged |
+| ``talos_1b_spec16`` | 16 | 5,504 | **774,440,960** | the literal 16-layer spec |
 
 **Parameter arithmetic** (identical code path as ``ModelConfig.param_count_breakdown``,
 all three of meta-device model count / ``configs.compute`` / breakdown agree):
@@ -424,10 +427,12 @@ all three of meta-device model count / ``configs.compute`` / breakdown agree):
   - attention = ``H·H + 2·H·(kv·d) + H·H`` = 2,048² + 2·(2,048·512) + 2,048²
     = 4,194,304 + 2,097,152 + 4,194,304 = **10,485,760**
   - norms = ``2·H`` = **4,096**
-  - SwiGLU FFN = ``3·H·I`` = 3·2,048·5,504 = **33,816,576**
-  - per layer = **44,306,432**
+  - SwiGLU FFN = ``3·H·I`` = 3·2,048·I → **47,972,352** at I = 7,808 /
+    **33,816,576** at I = 5,504
+  - per layer = **58,462,208** (I = 7,808) / **44,306,432** (I = 5,504)
 - final norm = **2,048**
-- ``talos_1b``: 65,536,000 + 21·44,306,432 + 2,048 = **995,973,120**
+- ``talos_1b``: 65,536,000 + 16·58,462,208 + 2,048 = **1,000,933,376**
+- ``talos_1b_21l``: 65,536,000 + 21·44,306,432 + 2,048 = **995,973,120**
 - ``talos_1b_spec16``: 65,536,000 + 16·44,306,432 + 2,048 = **774,440,960**
 
 ### 7.2 Inference VRAM (fp16/bf16, batch 1)
@@ -436,20 +441,21 @@ Weights are 2 bytes/param (fp16 or bf16 — same footprint):
 
 | preset | weights (fp16) | KV cache / token | KV @ 2,048 tokens | **total @ 2,048 tok** |
 |---|---:|---:|---:|---:|
-| ``talos_1b`` | 1,991,946,240 B ≈ **1.86 GiB** | 43,008 B (42 KiB) | 88,080,384 B ≈ **84.0 MiB** | ≈ **1.94 GiB** |
+| ``talos_1b`` | 2,001,866,752 B ≈ **1.86 GiB** | 32,768 B (32 KiB) | 67,108,864 B ≈ **64.0 MiB** | ≈ **1.93 GiB** |
+| ``talos_1b_21l`` | 1,991,946,240 B ≈ **1.86 GiB** | 43,008 B (42 KiB) | 88,080,384 B ≈ **84.0 MiB** | ≈ **1.94 GiB** |
 | ``talos_1b_spec16`` | 1,548,881,920 B ≈ **1.44 GiB** | 32,768 B (32 KiB) | 67,108,864 B ≈ **64.0 MiB** | ≈ **1.51 GiB** |
 
 KV formula (state it explicitly): **kv bytes per token = layers × 2 (K and V)
 × num_kv_heads × head_dim × bytes** = ``L × 2 × 4 × 128 × 2`` = ``L × 2048``
-bytes/token (21 L → 43,008 B/token; 16 L → 32,768 B/token). At a full
-2,048-token sequence (batch 1): **84.0 MiB** (21 L) / **64.0 MiB** (16 L).
+bytes/token (16 L → 32,768 B/token; 21 L → 43,008 B/token). At a full
+2,048-token sequence (batch 1): **64.0 MiB** (16 L) / **84.0 MiB** (21 L).
 
 Add activations: hidden states ≈ a few × ``seq·hidden`` (2,048·2,048·2 B ≈
 8 MiB each live tensor at fp16) plus full-sequence logits 32,000·2,048·2 B ≈
 **125 MiB** (fp16; chunkable). **Verdict: 1B inference is comfortably
-T4-feasible at fp16** — ≈2.1–2.3 GiB total for ``talos_1b``, well inside
-16 GB. (SDPA math attention avoids materializing the 2048² scores; the plain
-chunked fallback exists but is not needed here.)
+T4-feasible at fp16** — ≈2.1–2.3 GiB total, well inside 16 GB. (SDPA math
+attention avoids materializing the 2048² scores; the plain chunked fallback
+exists but is not needed here.)
 
 ### 7.3 Training VRAM under AdamW mixed precision
 
@@ -474,7 +480,8 @@ memory plan should be sized against.)
 
 | preset | params | fp32-only 16 B/p | mixed 18 B/p | activations* (seq 2048, B=1) no-ckpt / ckpt | + logits (fp32) |
 |---|---:|---:|---:|---:|---:|
-| ``talos_1b`` | 995,973,120 | ≈ **14.84 GiB** | ≈ **16.70 GiB** | ≈ 1.4 GiB / ≈ 0.35 GiB | 262 MB |
+| ``talos_1b`` | 1,000,933,376 | ≈ **14.92 GiB** | ≈ **16.78 GiB** | ≈ 1.1 GiB / ≈ 0.27 GiB | 262 MB |
+| ``talos_1b_21l`` | 995,973,120 | ≈ **14.84 GiB** | ≈ **16.70 GiB** | ≈ 1.4 GiB / ≈ 0.35 GiB | 262 MB |
 | ``talos_1b_spec16`` | 774,440,960 | ≈ **11.54 GiB** | ≈ **12.98 GiB** | ≈ 1.1 GiB / ≈ 0.27 GiB | 262 MB |
 
 \* Activation formula (estimate): ``≈ K · L · seq · hidden · 4 B`` where
@@ -485,28 +492,36 @@ is recomputed in the backward — roughly one extra forward pass). The 32,000×
 2,048 logits (262 MB fp32, 125 MiB fp16) sit on top and can be chunked.
 
 **T4 (16 GB) verdict — explicit:** a 1B variant **cannot be trained on a T4**
-in this layout: ``talos_1b`` alone needs ≈16.7 GiB of weights+optimizer state
+in this layout: ``talos_1b`` alone needs ≈16.8 GiB of weights+optimizer state
 before activations and CUDA overhead (+0.5–1 GiB); ``talos_1b_spec16`` needs
 ≈13.0 GiB + ~1.4 GiB activations + overhead ≈ 15+ GiB — over budget in
 practice (batch ≥ 2 or any fragmentation pushes it out). **Inference on a T4
 at fp16 is feasible** (§7.2: ≈2.3 GiB for the full 2,048-token sequence).
-Minimum training hardware: ≈24 GB-class GPU for ``talos_1b`` (A10G/3090/A100),
-≈20 GB-class for ``talos_1b_spec16``; a full-size fwd/bwd numerical smoke
-needs an A100-class GPU or the owner's T4 at fp16 with a small batch
-(e.g. batch 1 × seq ≤ 128). **The team CPU box (3.9 GB RAM) cannot instantiate
-a 1B fp32 model (3.98 GB weights alone)**: that is exactly why the 1B
-validation in ``tests/test_talos_1b.py`` builds on the **meta device** and
-runs the functional battery on a small-dim config with the same feature
-switches (head_dim 128, 4:1 GQA, SwiGLU, tied embeddings).
+Minimum training hardware: ≈24 GB-class GPU for the 1B presets (A10G/3090/A100),
+≈20 GB-class for ``talos_1b_spec16``; the owner's **RTX 3060 12 GB** runs the
+bf16 + gradient-checkpointing + grad-accumulation configuration that
+``scripts/benchmark_1b.py`` measures (the measured microbatch ladder, not an
+estimate, decides what fits). A full-size fwd/bwd numerical smoke needs an
+A100-class GPU or a small batch (e.g. batch 1 × seq ≤ 128). **The team CPU box
+(3.9 GB RAM) cannot instantiate a 1B fp32 model (≈4 GB weights alone)**: that
+is exactly why the 1B validation in ``tests/test_talos_1b.py`` builds on the
+**meta device** and runs the functional battery on a small-dim config with the
+same feature switches (head_dim 128, 4:1 GQA, SwiGLU at the primary's 3.8125×
+ratio, tied embeddings).
 
 ### 7.4 Status and wiring
 
-- Neither preset has been trained; the tokenizer **asset** (vocab 32,000) is a
-  later delegation — the config seam already refuses a mismatched tokenizer
-  (``_assert_tokenizer_model_pairing``; see ``tests/test_vocab_seam.py``).
-- Both presets are registered in ``configs.canonical.CANONICAL_PRESETS`` so
+- None of the presets has been trained; the tokenizer **asset** (vocab 32,000,
+  ``talos_1b_32k``) is shared by all three — the config seam refuses a
+  mismatched tokenizer (``_assert_tokenizer_model_pairing``; see
+  ``tests/test_vocab_seam.py``) and the asset manifest registers exactly the
+  three 1B presets (``tests/test_tokenizer_32k.py``).
+- **No 1B checkpoints exist anywhere**, so redefining ``talos_1b`` from the
+  21-layer depth adjustment to the FFN-adjusted 16-layer shape breaks no saved
+  artifact (owner policy: a better pipeline beats old-checkpoint
+  compatibility).
+- All three presets are registered in ``configs.canonical.CANONICAL_PRESETS`` so
   the existing trainer/eval/generation/safetensors guards (which enforce exact
-  counts for registered presets) will accept them with zero further wiring —
-  the paper trail for the later training delegation. Nothing else about the
-  tiny-family presets changed; their counts are regression-pinned by
-  ``tests/test_talos_1b.py`` §5 and the pre-existing tiny_*\ test files.
+  counts for registered presets) accept them with zero further wiring. Nothing
+  else about the tiny-family presets changed; their counts are regression-pinned
+  by ``tests/test_talos_1b.py`` §5 and the pre-existing tiny_*\ test files.

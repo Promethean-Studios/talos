@@ -9,6 +9,7 @@
       "sha256": "2d9476674e758f8d6dd611b56c9209b2fe77b13bfa592c0a65971a9168c4b165",
       "presets": [
         "talos_1b",
+        "talos_1b_21l",
         "talos_1b_spec16"
       ],
       "special_ids": {

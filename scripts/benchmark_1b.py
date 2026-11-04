@@ -150,7 +150,7 @@ TOKEN_BUDGETS: Tuple[int, ...] = (
 DEFAULT_MATRIX_ACCUM: Tuple[int, ...] = (1, 4)
 
 #: The 1B presets that require the dedicated 32K tokenizer asset.
-TOKENIZER_ASSET_PRESETS = ("talos_1b", "talos_1b_spec16")
+TOKENIZER_ASSET_PRESETS = ("talos_1b", "talos_1b_21l", "talos_1b_spec16")
 TOKENIZER_ASSET_NAME = "talos_1b_32k"
 
 #: Exit codes.
@@ -2321,7 +2321,8 @@ def make_arg_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--preset", default="talos_1b",
-                   help="model preset to benchmark (talos_1b | talos_1b_spec16 | "
+                   help="model preset to benchmark (talos_1b [FFN-adjusted, "
+                        "the default] | talos_1b_21l | talos_1b_spec16 | "
                         "any registered preset)")
     p.add_argument("--device", default="auto", choices=("auto", "cuda", "cpu"),
                    help="compute device; 'auto' picks cuda when available")

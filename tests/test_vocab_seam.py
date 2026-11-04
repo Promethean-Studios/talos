@@ -16,8 +16,9 @@ named — making a deliberate vocab change a one-line edit to
 error.
 
 **The one deliberate divergence:** the owner-directed Talos 1B track
-(``talos_1b`` / ``talos_1b_spec16``) uses its own **32,000**-vocab tokenizer —
-an explicit owner decision to move off the 1024 prototype contract. Those two
+(``talos_1b`` / ``talos_1b_21l`` / ``talos_1b_spec16``) uses its own
+**32,000**-vocab tokenizer — an explicit owner decision to move off the 1024
+prototype contract. Those three
 presets are pinned below as *intentionally different*, and every seam that
 would silently reuse the 1024 constant for them (the tokenizer-config registry
 pull, model↔tokenizer pairing) is asserted to use 32,000 instead.
@@ -38,7 +39,7 @@ from tokenizer.vocab import (
 )
 
 CANONICAL_NAMES = ("tiny", "tiny_1m", "tiny_10m", "tiny_100m")
-TALOS_1B_NAMES = ("talos_1b", "talos_1b_spec16")
+TALOS_1B_NAMES = ("talos_1b", "talos_1b_21l", "talos_1b_spec16")
 N_SPECIAL_TOKENS = len(DEFAULT_SPECIAL_TOKENS)
 
 

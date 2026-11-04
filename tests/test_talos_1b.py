@@ -1,18 +1,22 @@
-"""Tests for the owner-directed Talos 1B presets (``talos_1b`` / ``talos_1b_spec16``).
+"""Tests for the owner-directed Talos 1B presets.
 
-Architecture (both, verbatim owner spec): vocab **32,000**, seq **2,048**,
+``talos_1b`` (primary), ``talos_1b_21l`` and ``talos_1b_spec16``.
+
+Architecture (all, verbatim owner spec): vocab **32,000**, seq **2,048**,
 hidden **2,048**, **16 query heads / 4 KV heads (4:1 GQA), head_dim 128**,
-SwiGLU dense FFN intermediate **5,504** (2.6875× hidden), RMSNorm pre-norm,
-RoPE (theta 1e4), **no biases**, **TIED input/output embeddings**,
-``initializer_range`` 0.02. ``talos_1b`` runs the spec at **21 layers**
-(995,973,120 params — the depth-adjusted approach to 1B); ``talos_1b_spec16``
-is the literal **16-layer** spec (774,440,960 params). The exact counts below
-are verified on the **meta device** — this file never instantiates a 1B model
-in memory (the CPU box cannot hold a 4 GiB fp32 model; see docs/SCALING.md §7
-for the memory model).
+SwiGLU dense FFN, RMSNorm pre-norm, RoPE (theta 1e4), **no biases**, **TIED
+input/output embeddings**, ``initializer_range`` 0.02. The owner's 2026-11-04
+decision makes ``talos_1b`` the **FFN-adjusted** variant: the spec's 16 layers
+with the SwiGLU FFN widened 5,504 -> **7,808** (1,000,933,376 params). The
+earlier depth-adjusted build is preserved as ``talos_1b_21l`` (21 layers at the
+literal FFN 5,504 — 995,973,120 params) and the untouched literal spec as
+``talos_1b_spec16`` (16 layers at FFN 5,504 — 774,440,960 params). The exact
+counts below are verified on the **meta device** — this file never instantiates
+a 1B model in memory (the CPU box cannot hold a 4 GiB fp32 model; see
+docs/SCALING.md §7 for the memory model).
 
 What is tested here:
-  1. both 1B presets build on the meta device with exact parameter counts
+  1. all three 1B presets build on the meta device with exact parameter counts
      (model + ``configs.compute`` + ``ModelConfig.param_count_breakdown`` +
      the canonical registry all agree), full tensor-shape assertions on every
      module, no bias parameters anywhere, tied embeddings (no ``lm_head`` key);
@@ -40,6 +44,7 @@ All tests are deterministic and CPU-fast.
 from __future__ import annotations
 
 import json
+from typing import Callable
 
 import pytest
 import torch
@@ -48,6 +53,7 @@ from configs.canonical import CANONICAL_PRESETS, expected_params, resolve_preset
 from configs.compute import estimate
 from configs.presets import (
     preset_tokenizer_config,
+    talos_1b_21l_config,
     talos_1b_config,
     talos_1b_spec16_config,
     tiny_100m_config,
@@ -68,10 +74,23 @@ from scripts.train_oasst1 import (
 )
 from tests.fixture_corpus import FIXTURE_CORPUS
 
-TALOS_1B_PARAMS = 995_973_120        # talos_1b (21 layers, tied, vocab 32,000)
-TALOS_1B_SPEC16_PARAMS = 774_440_960  # talos_1b_spec16 (16 layers, tied, vocab 32,000)
+#: talos_1b — the owner's 2026-11-04 FFN-adjusted primary (16 layers, FFN 7,808).
+TALOS_1B_PARAMS = 1_000_933_376
+#: talos_1b_21l — the earlier depth-adjusted build (21 layers, FFN 5,504).
+TALOS_1B_21L_PARAMS = 995_973_120
+#: talos_1b_spec16 — the literal 16-layer spec (FFN 5,504).
+TALOS_1B_SPEC16_PARAMS = 774_440_960
 TALOS_1B_VOCAB = 32_000
 LOGIT_ATOL = 1e-4  # established fp32 guardrail (tests/test_inference.py)
+
+#: (name, builder, exact params, layers, FFN intermediate, per-layer params).
+#: The per-layer figure is attention 10,485,760 + 2 RMSNorms 4,096 + SwiGLU
+#: 3·2048·I — 58,462,208 at I = 7,808 and 44,306,432 at I = 5,504.
+TALOS_1B_VARIANTS = (
+    ("talos_1b", talos_1b_config, TALOS_1B_PARAMS, 16, 7808, 58_462_208),
+    ("talos_1b_21l", talos_1b_21l_config, TALOS_1B_21L_PARAMS, 21, 5504, 44_306_432),
+    ("talos_1b_spec16", talos_1b_spec16_config, TALOS_1B_SPEC16_PARAMS, 16, 5504, 44_306_432),
+)
 
 # Canonical family regression pins (these must stay byte-for-byte unchanged).
 TINY_PARAMS = 254_272
@@ -84,42 +103,50 @@ VOCAB_1024 = 1024
 # ---------------------------------------------------------------------------
 # 1. Meta-device construction: exact counts + shape assertions at 1B
 # ---------------------------------------------------------------------------
-def _meta_talos_1b(layers: int) -> TalosGPT:
+def _meta_talos_1b(builder: Callable[[], ModelConfig]) -> TalosGPT:
     """Build a 1B variant on the meta device (no host RAM allocated)."""
-    cfg = talos_1b_config().derive() if layers == 21 else talos_1b_spec16_config().derive()
+    cfg = builder().derive()
     with torch.device("meta"):
         model = TalosGPT(cfg)
     return model
 
 
 @pytest.mark.parametrize(
-    ("builder", "expected"),
-    [(talos_1b_config, TALOS_1B_PARAMS), (talos_1b_spec16_config, TALOS_1B_SPEC16_PARAMS)],
+    ("name", "builder", "expected", "layers", "ffn", "layer_params"),
+    TALOS_1B_VARIANTS,
+    ids=[v[0] for v in TALOS_1B_VARIANTS],
 )
-def test_talos_1b_meta_device_exact_parameter_count(builder, expected: int) -> None:
+def test_talos_1b_meta_device_exact_parameter_count(
+    name, builder, expected: int, layers: int, ffn: int, layer_params: int
+) -> None:
     """Meta-device build: the model, compute estimate, breakdown and registry agree."""
     cfg = builder().derive()
-    model = _meta_talos_1b(cfg.num_layers)
+    model = _meta_talos_1b(builder)
+    # Three independent count paths must agree with the pinned integer.
     assert model.num_parameters() == expected
     assert estimate(cfg).total_params == expected
     assert cfg.param_count_breakdown()["total"] == expected
     assert cfg.param_count_breakdown()["lm_head"] == 0  # tied: no separate head
     assert CANONICAL_PRESETS[resolve_preset(cfg)] == (expected, TALOS_1B_VOCAB)
+    assert resolve_preset(cfg) == name
     assert expected_params(cfg) == expected
     # Analytic per-layer arithmetic from the preset docstrings.
+    assert cfg.num_layers == layers
+    assert cfg.intermediate_size == ffn
     assert cfg.param_count_breakdown()["per_layer_attention"] == 10_485_760
-    assert cfg.param_count_breakdown()["per_layer_ffn"] == 33_816_576
+    assert cfg.param_count_breakdown()["per_layer_ffn"] == 3 * 2048 * ffn
     assert cfg.param_count_breakdown()["embedding"] == TALOS_1B_VOCAB * 2048 == 65_536_000
-    assert (
-        65_536_000 + cfg.num_layers * 44_306_432 + 2048 == expected
-    )
+    assert 65_536_000 + cfg.num_layers * layer_params + 2048 == expected
 
 
 @pytest.mark.parametrize(
-    ("builder", "expected"),
-    [(talos_1b_config, TALOS_1B_PARAMS), (talos_1b_spec16_config, TALOS_1B_SPEC16_PARAMS)],
+    ("name", "builder", "expected", "layers", "ffn", "layer_params"),
+    TALOS_1B_VARIANTS,
+    ids=[v[0] for v in TALOS_1B_VARIANTS],
 )
-def test_talos_1b_meta_device_shapes_and_no_bias_and_tied(builder, expected: int) -> None:
+def test_talos_1b_meta_device_shapes_and_no_bias_and_tied(
+    name, builder, expected: int, layers: int, ffn: int, layer_params: int
+) -> None:
     """Every module's tensor shape at 1B, no bias params anywhere, no lm_head key.
 
     The P5 resume seam (:func:`scripts.train_oasst1.expected_state_dict_shapes`)
@@ -129,7 +156,7 @@ def test_talos_1b_meta_device_shapes_and_no_bias_and_tied(builder, expected: int
     — because the 1B presets are TIED — must contain **no** ``lm_head.weight``.
     """
     cfg = builder().derive()
-    model = _meta_talos_1b(cfg.num_layers)
+    model = _meta_talos_1b(builder)
     state = model.state_dict()
     expected_map = expected_state_dict_shapes(cfg)
     assert set(state.keys()) == set(expected_map.keys()), (
@@ -148,10 +175,10 @@ def test_talos_1b_meta_device_shapes_and_no_bias_and_tied(builder, expected: int
     assert tuple(sa.k_proj.weight.shape) == (512, 2048)  # 4 kv heads x head_dim 128
     assert tuple(sa.v_proj.weight.shape) == (512, 2048)
     assert tuple(sa.o_proj.weight.shape) == (2048, 2048)
-    ffn = model.layers[0].ffn.swiglu
-    assert tuple(ffn.gate_proj.weight.shape) == (5504, 2048)
-    assert tuple(ffn.up_proj.weight.shape) == (5504, 2048)
-    assert tuple(ffn.down_proj.weight.shape) == (2048, 5504)
+    ffn_mod = model.layers[0].ffn.swiglu
+    assert tuple(ffn_mod.gate_proj.weight.shape) == (ffn, 2048)
+    assert tuple(ffn_mod.up_proj.weight.shape) == (ffn, 2048)
+    assert tuple(ffn_mod.down_proj.weight.shape) == (2048, ffn)
     assert tuple(model.embed_tokens.weight.shape) == (TALOS_1B_VOCAB, 2048)
     assert tuple(model.final_norm.weight.shape) == (2048,)
     assert model.lm_head is None  # tied embeddings
@@ -160,35 +187,66 @@ def test_talos_1b_meta_device_shapes_and_no_bias_and_tied(builder, expected: int
     # walking the actual modules, not just the state dict key set).
     import torch.nn as nn
 
-    for name, module in model.named_modules():
+    for mod_name, module in model.named_modules():
         if isinstance(module, nn.Linear):
-            assert module.bias is None, f"{name} has a bias — 1B spec is bias-free"
+            assert module.bias is None, f"{mod_name} has a bias — 1B spec is bias-free"
     assert not any(n.endswith(".bias") for n in model.state_dict())
 
 
 def test_talos_1b_meta_device_forward_never_materialized() -> None:
     """The meta model is shape-only (no parameters were allocated in RAM)."""
-    model = _meta_talos_1b(21)
+    model = _meta_talos_1b(talos_1b_config)
     assert all(p.device == torch.device("meta") for p in model.parameters())
+
+
+def test_talos_1b_primary_is_the_ffn_adjusted_variant() -> None:
+    """The 2026-11-04 owner decision: FFN width is the only knob moved off spec.
+
+    ``talos_1b`` must be the literal 16-layer spec with the FFN widened to
+    7,808 — same depth, same head geometry, same everything else. The
+    depth-adjusted build keeps its own preset name and shape.
+    """
+    primary = talos_1b_config().derive()
+    literal = talos_1b_spec16_config().derive()
+    depth_adj = talos_1b_21l_config().derive()
+
+    assert primary.num_layers == literal.num_layers == 16
+    assert primary.intermediate_size == 7808
+    assert literal.intermediate_size == depth_adj.intermediate_size == 5504
+    # Only the FFN width differs from the literal spec.
+    diffs = {
+        f for f in ("vocab_size", "hidden_size", "num_layers", "num_attention_heads",
+                    "num_kv_heads", "head_dim", "ffn_type", "max_seq_len",
+                    "attention_type", "rope_theta", "initializer_range",
+                    "tie_word_embeddings", "layer_norm_eps", "intermediate_size")
+        if getattr(primary, f) != getattr(literal, f)
+    }
+    assert diffs == {"intermediate_size"}, f"primary moved more than the FFN: {diffs}"
+    # The preserved depth-adjusted preset is the old primary, unchanged.
+    assert depth_adj.num_layers == 21 and depth_adj.intermediate_size == 5504
+    assert primary.param_count_breakdown()["total"] == TALOS_1B_PARAMS
+    assert depth_adj.param_count_breakdown()["total"] == TALOS_1B_21L_PARAMS
+    # The new primary is the closest to the 1B mark of the three.
+    assert abs(TALOS_1B_PARAMS - 1_000_000_000) < abs(TALOS_1B_21L_PARAMS - 1_000_000_000)
 
 
 def test_talos_1b_config_flags() -> None:
     """Every knob from the owner's spec is present on the derived configs."""
-    for builder, layers in ((talos_1b_config, 21), (talos_1b_spec16_config, 16)):
+    for name, builder, expected, layers, ffn, layer_params in TALOS_1B_VARIANTS:
         cfg = builder().derive()
-        assert cfg.vocab_size == TALOS_1B_VOCAB
-        assert cfg.max_seq_len == 2048
-        assert cfg.hidden_size == 2048
-        assert cfg.num_layers == layers
-        assert cfg.num_attention_heads == 16
-        assert cfg.num_kv_heads == 4
-        assert cfg.head_dim == 128  # explicit override, never derived
-        assert cfg.intermediate_size == 5504
-        assert cfg.ffn_type == "dense"
-        assert cfg.tie_word_embeddings is True
-        assert cfg.rope_theta == 10_000.0
-        assert cfg.initializer_range == 0.02
-        assert cfg.attention_type == "full"
+        assert cfg.vocab_size == TALOS_1B_VOCAB, name
+        assert cfg.max_seq_len == 2048, name
+        assert cfg.hidden_size == 2048, name
+        assert cfg.num_layers == layers, name
+        assert cfg.num_attention_heads == 16, name
+        assert cfg.num_kv_heads == 4, name
+        assert cfg.head_dim == 128, name  # explicit override, never derived
+        assert cfg.intermediate_size == ffn, name
+        assert cfg.ffn_type == "dense", name
+        assert cfg.tie_word_embeddings is True, name
+        assert cfg.rope_theta == 10_000.0, name
+        assert cfg.initializer_range == 0.02, name
+        assert cfg.attention_type == "full", name
 
 
 # ---------------------------------------------------------------------------
@@ -196,15 +254,16 @@ def test_talos_1b_config_flags() -> None:
 # ---------------------------------------------------------------------------
 def test_talos_1b_tokenizer_config_pairing() -> None:
     """TokenizerConfigs are vocab 32,000 and refuse an incompatible pairing."""
-    for name in ("talos_1b", "talos_1b_spec16"):
+    for name, builder, *_ in TALOS_1B_VARIANTS:
         tok = preset_tokenizer_config(name)
-        model = talos_1b_config() if name == "talos_1b" else talos_1b_spec16_config()
+        model = builder()
         assert tok.vocab_size == TALOS_1B_VOCAB == model.vocab_size
         # The ≤ model-compat contract still holds (trained assets may use fewer
         # merge slots, never more).
         assert tok.vocab_size <= model.vocab_size
         # max_merges arithmetic: 32,000 = 256 bytes + 4 specials + merge slots.
         assert tok.max_merges() == TALOS_1B_VOCAB - 256 - 4 == 31_740
+
 
 
 # ---------------------------------------------------------------------------
@@ -215,9 +274,10 @@ def talos_1b_like_config() -> ModelConfig:
 
     Mirrors every switch of the 1B spec — explicit ``head_dim=128`` (not
     derived), **4:1 GQA** (4 query / 1 KV head), SwiGLU dense FFN at the same
-    2.6875× ratio (1376 = 512 · 5504/2048), tied embeddings, RoPE theta 1e4,
-    init range 0.02, no biases — at hidden 512 / 4 layers / vocab 4096 so the
-    whole functional battery runs on this CPU box in seconds.
+    3.8125× ratio as the primary ``talos_1b`` (1952 = 512 · 7808/2048), tied
+    embeddings, RoPE theta 1e4, init range 0.02, no biases — at hidden 512 /
+    4 layers / vocab 4096 so the whole functional battery runs on this CPU box
+    in seconds.
     """
     return ModelConfig(
         vocab_size=4096,
@@ -227,7 +287,7 @@ def talos_1b_like_config() -> ModelConfig:
         num_kv_heads=1,
         head_dim=128,
         ffn_type="dense",
-        intermediate_size=1376,
+        intermediate_size=1952,
         max_seq_len=512,
         attention_type="full",
         rope_theta=10000.0,
@@ -237,7 +297,9 @@ def talos_1b_like_config() -> ModelConfig:
     )
 
 
-TALOS_1B_LIKE_PARAMS = 13_177_344  # 2,097,152 + 4·2,769,920 + 512 (pinned below)
+#: 2,097,152 (tied 4096x512 embedding) + 4·3,654,656 (per layer) + 512 (final
+#: norm) — pinned below by :func:`test_talos_1b_like_exact_parameter_count`.
+TALOS_1B_LIKE_PARAMS = 16_716_288
 
 
 def talos_1b_like_model(seed: int = 0) -> TalosGPT:

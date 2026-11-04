@@ -1359,24 +1359,32 @@ flags since the W2 pass, §31; this run does not need them.)
 
 ## 30. The Talos 1B presets are NOT a T4 training target (added with the 1B-preset PR)
 
-The owner-directed 1B presets (``talos_1b`` 995,973,120 params / 21 layers,
-``talos_1b_spec16`` 774,440,960 params / 16 layers — vocab 32,000, seq 2,048,
-hidden 2,048, 16/4 GQA heads, head_dim 128, SwiGLU 5,504, no biases, TIED
-embeddings) exist as registered, meta-device-validated configs from 2026-10.
+The owner-directed 1B presets (``talos_1b`` **1,000,933,376 params / 16 layers /
+FFN 7,808** — the owner's 2026-11-04 FFN-adjusted primary; ``talos_1b_21l``
+995,973,120 params / 21 layers at FFN 5,504 — the earlier depth-adjusted build;
+``talos_1b_spec16`` 774,440,960 params / 16 layers at FFN 5,504 — the literal
+spec; all vocab 32,000, seq 2,048, hidden 2,048, 16/4 GQA heads, head_dim 128,
+no biases, TIED embeddings) exist as registered, meta-device-validated configs.
 This document's T4/Colab reference does **not** apply to them:
 
 * **Training: out of reach on a 16 GB T4.** Mixed-precision AdamW state alone
-  is ≈16.7 GiB for ``talos_1b`` and ≈13.0 GiB for ``talos_1b_spec16``
-  (18 B/param layout: fp32 master + fp32 m/v + fp16 working copy + fp32
-  grads), before activations (≈1.4 / 1.1 GiB at batch 1 × seq 2048) and CUDA
-  overhead. Minimum class: ≈24 GB (A10G/3090/A100) / ≈20 GB.
-* **Inference on the T4 at fp16 is feasible**: ≈1.86 / 1.44 GiB weights +
-  84.0 / 64.0 MiB KV cache at the full 2,048-token sequence (§7.2 of
+  is ≈16.8 GiB for ``talos_1b``, ≈16.7 GiB for ``talos_1b_21l`` and ≈13.0 GiB
+  for ``talos_1b_spec16`` (18 B/param layout: fp32 master + fp32 m/v + fp16
+  working copy + fp32 grads), before activations (≈1.1 / 1.4 / 1.1 GiB at
+  batch 1 × seq 2048) and CUDA overhead. Minimum class: ≈24 GB
+  (A10G/3090/A100) / ≈20 GB. The owner's **RTX 3060 12 GB** is the intended
+  1B box, running the bf16 + grad-checkpoint + grad-accum configuration that
+  ``scripts/benchmark_1b.py`` measures.
+* **Inference on the T4 at fp16 is feasible**: ≈1.86 / 1.86 / 1.44 GiB weights
+  + 64.0 / 84.0 / 64.0 MiB KV cache at the full 2,048-token sequence (§7.2 of
   docs/SCALING.md).
-* The team CPU box cannot instantiate a 1B fp32 model (3.98 GB weights vs
+* The team CPU box cannot instantiate a 1B fp32 model (≈4 GB weights vs
   3.9 GB RAM) — 1B validation uses the meta device + a small-dim functional
   config (see ``tests/test_talos_1b.py`` and docs/SCALING.md §7 for the full
   memory model and formulas).
+* **No 1B checkpoints exist**, so the 2026-11-04 redefinition of ``talos_1b``
+  (21 layers → 16 layers at FFN 7,808) breaks no saved artifact; the old shape
+  is still available as ``talos_1b_21l``.
 * Engine note (updated by the W2 pass, 2026-10-21): bf16 AMP (`--amp bf16`),
   gradient checkpointing (`--grad-checkpoint`) and gradient accumulation
   (`--grad-accum`) were deliberately NOT added by the 1B-preset PR; the W2
@@ -1408,7 +1416,7 @@ Wraps each decoder-block forward in
 (the model flag is ignored in eval mode, so val/eval/generation never
 checkpoint). Recompute-in-backward keeps only the layer input per block:
 **K≈4 → K≈1 live activation tensors**, i.e. the `activations (ckpt)` column of
-docs/SCALING.md §7.3 (for `talos_1b` at seq 2048 B=1: ≈1.4 GiB → ≈0.35 GiB).
+docs/SCALING.md §7.3 (for `talos_1b` at seq 2048 B=1: ≈1.1 GiB → ≈0.27 GiB).
 Costs ~one extra forward pass per step. RNG is preserved by the implementation
 (dropout masks match between forward and recompute), and the measured final
 weights/loss are identical to the non-checkpointed run (max abs diff 0.0 on
