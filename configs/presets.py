@@ -208,19 +208,35 @@ def tiny_100m_tokenizer_config() -> TokenizerConfig:
 # The 1B presets deliberately diverge from the tiny family on THREE knobs, each
 # an explicit owner decision: vocab_size 32,000 (the real tokenizer track), a
 # 4:1 GQA ratio (16/4 heads instead of 2:1), head_dim 128 instead of 16, and a
-# SwiGLU FFN at 2.6875x hidden (5504/2048 instead of 4x). The per-layer shape
-# is otherwise the classic small-LLM recipe: pre-norm RMSNorm, RoPE
-# (theta 1e4), dense SwiGLU, no biases, TIED input/output embeddings.
+# SwiGLU FFN at 2.6875x hidden (5504/2048 instead of 4x) for the *literal*
+# spec. The per-layer shape is otherwise the classic small-LLM recipe: pre-norm
+# RMSNorm, RoPE (theta 1e4), dense SwiGLU, no biases, TIED input/output
+# embeddings.
+#
+# Owner decision 2026-11-04: the literal 16-layer spec lands ~23% under 1B, and
+# the owner chose the **FFN-adjusted** variant as the primary ``talos_1b`` —
+# 16 layers with the SwiGLU FFN widened 5,504 -> 7,808 (3.8125x hidden). Only
+# the FFN width moved; every other number is the literal spec. The earlier
+# depth-adjusted build (21 layers, FFN 5,504) is kept as ``talos_1b_21l``, and
+# the untouched literal spec as ``talos_1b_spec16``.
 
-#: The exact per-layer parameter arithmetic shared by both 1B presets
-#: (see the docstrings below for the full derivation).
-TALOS_1B_LAYER_PARAMS = 44_306_432  # attention + norms + SwiGLU FFN
+#: The literal spec's SwiGLU FFN width (2.6875x hidden: 5504/2048).
+TALOS_1B_INTERMEDIATE_SIZE = 5504
+#: The owner-chosen FFN width for the primary ``talos_1b`` preset
+#: (3.8125x hidden: 7808/2048) — the 2026-11-04 adjustment axis.
+TALOS_1B_FFN_ADJUSTED_INTERMEDIATE_SIZE = 7808
+
 TALOS_1B_EMBEDDING_PARAMS = 32_000 * 2048  # tied: one 32000x2048 matrix
 TALOS_1B_FINAL_NORM_PARAMS = 2048
 
+#: Per-layer parameter arithmetic (attention + 2 RMSNorms + SwiGLU FFN), one
+#: constant per FFN width (see the docstrings below for the derivations).
+TALOS_1B_LAYER_PARAMS = 44_306_432  # I = 5,504: literal spec / talos_1b_21l
+TALOS_1B_FFN_ADJUSTED_LAYER_PARAMS = 58_462_208  # I = 7,808: primary talos_1b
+
 
 def talos_1b_config() -> ModelConfig:
-    """The Talos ~1B preset — the owner's spec with depth adjusted to 21 layers.
+    """The Talos ~1B preset — the owner's spec with the **FFN** adjusted.
 
     Owner's target architecture (verbatim): decoder-only, vocab 32,000, seq
     2,048, hidden 2,048, **16 heads / 4 KV heads (4:1 GQA), head_dim 128**,
@@ -228,25 +244,68 @@ def talos_1b_config() -> ModelConfig:
     TIED input/output embeddings, standard stable init (``initializer_range``
     0.02, ``rope_theta`` 1e4).
 
-    The owner pre-authorized adjusting dims to approach 1B; **depth is the
-    chosen adjustment axis** (``num_layers=21``) so the per-layer shape stays
-    exactly as specified. Parameter count, verified programmatically (see
-    ``tests/test_talos_1b.py`` and the meta-device construction in
-    docs/SCALING.md §7):
+    The owner pre-authorized adjusting dims to approach 1B, and **on 2026-11-04
+    chose the FFN axis**: the spec's 16 layers are kept exactly and the SwiGLU
+    FFN is widened 5,504 -> **7,808** (3.8125x hidden). Depth, head geometry and
+    every other number stay exactly as specified. Parameter count, verified
+    programmatically (see ``tests/test_talos_1b.py`` and the meta-device
+    construction in docs/SCALING.md §7):
 
     * embedding (tied, single copy) = ``V·H`` = 32,000·2,048 = **65,536,000**
       (tied ⇒ no separate lm_head);
     * per layer: attention = ``H·H + H·(H/4) + H·(H/4) + H·H`` =
       2,048² + 2·2,048·512 + 2,048² = 4,194,304 + 2·1,048,576 + 4,194,304
       = **10,485,760**; 2 RMSNorms = 2·2,048 = **4,096**; SwiGLU FFN =
-      3·H·I = 3·2,048·5,504 = **33,816,576**; per layer total
-      = **44,306,432**;
-    * 21 layers = 930,435,072; final norm = **2,048**;
-    * **total = 65,536,000 + 930,435,072 + 2,048 = 995,973,120** (≈996M —
-      the closest the owner's per-layer shape gets to 1B below the mark).
+      3·H·I = 3·2,048·7,808 = **47,972,352**; per layer total
+      = **58,462,208**;
+    * 16 layers = 935,395,328; final norm = **2,048**;
+    * **total = 65,536,000 + 935,395,328 + 2,048 = 1,000,933,376**
+      (≈1,000.9M — the closest the owner's architecture gets to 1B from the
+      spec's own 16 layers).
+
+    Sibling presets on the same track: :func:`talos_1b_21l_config` (the earlier
+    depth-adjusted build, 21 layers at FFN 5,504, 995,973,120 params) and
+    :func:`talos_1b_spec16_config` (the untouched literal spec, 16 layers at
+    FFN 5,504, 774,440,960 params).
 
     ``vocab_size=32_000`` ≠ the canonical 1024 constant deliberately — see
     :func:`talos_1b_tokenizer_config` for the tokenizer pairing guard.
+    """
+    return ModelConfig(
+        vocab_size=32_000,
+        hidden_size=2048,
+        num_layers=16,
+        num_attention_heads=16,
+        num_kv_heads=4,
+        head_dim=128,
+        ffn_type="dense",
+        intermediate_size=TALOS_1B_FFN_ADJUSTED_INTERMEDIATE_SIZE,
+        max_seq_len=2048,
+        attention_type="full",
+        rope_theta=10000.0,
+        initializer_range=0.02,
+        tie_word_embeddings=True,
+        layer_norm_eps=1e-5,
+    )
+
+
+def talos_1b_21l_config() -> ModelConfig:
+    """The depth-adjusted 1B build (21 layers at the literal FFN 5,504).
+
+    This was the primary ``talos_1b`` before the owner's 2026-11-04 decision to
+    adjust the FFN instead; it is preserved unchanged as its own registered
+    preset so the earlier arithmetic, benchmark runs and any future A/B against
+    the FFN-adjusted variant stay one flag away.
+
+    Same architecture and per-layer shape as the literal spec (vocab 32,000,
+    hidden 2,048, 16/4 GQA heads, head_dim 128, SwiGLU intermediate 5,504, no
+    biases, tied embeddings, RoPE theta 1e4) with **21 layers**. Parameter
+    count, verified programmatically:
+
+    * embedding (tied) = **65,536,000**;
+    * 21 layers × 44,306,432 = **930,435,072**;
+    * final norm = **2,048**;
+    * **total = 65,536,000 + 930,435,072 + 2,048 = 995,973,120** (≈996M).
     """
     return ModelConfig(
         vocab_size=32_000,
@@ -256,7 +315,7 @@ def talos_1b_config() -> ModelConfig:
         num_kv_heads=4,
         head_dim=128,
         ffn_type="dense",
-        intermediate_size=5504,
+        intermediate_size=TALOS_1B_INTERMEDIATE_SIZE,
         max_seq_len=2048,
         attention_type="full",
         rope_theta=10000.0,
@@ -269,7 +328,7 @@ def talos_1b_config() -> ModelConfig:
 def talos_1b_spec16_config() -> ModelConfig:
     """The literal 16-layer variant of the owner's 1B spec (no dim adjustments).
 
-    Same architecture and per-layer shape as :func:`talos_1b_config`
+    Same architecture and per-layer shape as :func:`talos_1b_21l_config`
     (vocab 32,000, hidden 2,048, 16/4 GQA heads, head_dim 128, SwiGLU
     intermediate 5,504, no biases, tied embeddings, RoPE theta 1e4) with the
     spec's **exact 16 layers**. Parameter count, verified programmatically:
@@ -279,11 +338,10 @@ def talos_1b_spec16_config() -> ModelConfig:
     * final norm = **2,048**;
     * **total = 65,536,000 + 708,902,912 + 2,048 = 774,440,960** (≈774M).
 
-    The spec's literal shape lands ~23% under 1B; ``talos_1b`` (21 layers,
-    995,973,120) is the preset that actually approaches the 1B target with the
-    owner's per-layer shape untouched. This variant exists so a subsequent
-    16-layer reference run is one config away and the arithmetic is pinned by
-    tests either way.
+    The spec's literal shape lands ~23% under 1B. The owner's chosen approach to
+    1B is the FFN-adjusted :func:`talos_1b_config` (16 layers, FFN 7,808,
+    1,000,933,376); this variant keeps the literal FFN width available as the
+    reference point and pins its arithmetic by tests either way.
     """
     return ModelConfig(
         vocab_size=32_000,
@@ -293,7 +351,7 @@ def talos_1b_spec16_config() -> ModelConfig:
         num_kv_heads=4,
         head_dim=128,
         ffn_type="dense",
-        intermediate_size=5504,
+        intermediate_size=TALOS_1B_INTERMEDIATE_SIZE,
         max_seq_len=2048,
         attention_type="full",
         rope_theta=10000.0,
@@ -340,12 +398,25 @@ def talos_1b_tokenizer_config() -> TokenizerConfig:
     return tok
 
 
+def talos_1b_21l_tokenizer_config() -> TokenizerConfig:
+    """Tokenizer config for ``talos_1b_21l``: identical (vocab 32,000).
+
+    All three 1B presets (``talos_1b`` / ``talos_1b_21l`` / ``talos_1b_spec16``)
+    share the one 32,000-vocab contract exactly — they differ only in depth and
+    FFN width, never in vocabulary — so this reuses the same guarded config via
+    :func:`_assert_tokenizer_model_pairing`.
+    """
+    tok = TokenizerConfig(vocab_size=32_000)
+    _assert_tokenizer_model_pairing(tok, talos_1b_21l_config())
+    return tok
+
+
 def talos_1b_spec16_tokenizer_config() -> TokenizerConfig:
     """Tokenizer config for ``talos_1b_spec16``: identical (vocab 32,000).
 
-    ``talos_1b_spec16`` shares ``talos_1b``'s vocabulary exactly (the two
-    presets differ only in depth), so this reuses the same guarded 32,000-vocab
-    config via :func:`_assert_tokenizer_model_pairing`.
+    ``talos_1b_spec16`` shares the other 1B presets' vocabulary exactly (they
+    differ only in depth / FFN width), so this reuses the same guarded 32,000
+    vocab config via :func:`_assert_tokenizer_model_pairing`.
     """
     tok = TokenizerConfig(vocab_size=32_000)
     _assert_tokenizer_model_pairing(tok, talos_1b_spec16_config())
@@ -353,7 +424,7 @@ def talos_1b_spec16_tokenizer_config() -> TokenizerConfig:
 
 
 #: canonical preset name -> tokenizer-config builder. All four tiny-family
-#: presets reuse the sole vocab-1024 contract (their rows stay 1024); the two
+#: presets reuse the sole vocab-1024 contract (their rows stay 1024); the three
 #: 1B presets deliberately register a 32,000-vocab contract. The registry
 #: exists so a future preset with a different vocab is a one-line deliberate
 #: change, not a silent re-wire — and ``tests/test_vocab_seam.py`` pins the
@@ -364,6 +435,7 @@ TOKENIZER_CONFIGS = {
     "tiny_10m": tiny_10m_tokenizer_config,
     "tiny_100m": tiny_100m_tokenizer_config,
     "talos_1b": talos_1b_tokenizer_config,
+    "talos_1b_21l": talos_1b_21l_tokenizer_config,
     "talos_1b_spec16": talos_1b_spec16_tokenizer_config,
 }
 
@@ -514,6 +586,7 @@ ALL_PRESETS = {
     "tiny_10m": tiny_10m_config,
     "tiny_100m": tiny_100m_config,
     "talos_1b": talos_1b_config,
+    "talos_1b_21l": talos_1b_21l_config,
     "talos_1b_spec16": talos_1b_spec16_config,
     "small": small_config,
     "medium": medium_config,

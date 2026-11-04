@@ -2,13 +2,15 @@
 
 Covers the asset itself (vocab exactly 32,000, sane special ids, lossless
 round-trip, sha256-pinned manifest), its pairing with ``talos_1b`` /
-``talos_1b_spec16`` (including a meta-device embedding-shape check — the 1B
+``talos_1b_21l`` / ``talos_1b_spec16`` (including a meta-device
+embedding-shape check — the 1B
 model is NEVER instantiated for real on this box), the mismatch guards, the
 correct greedy encoder, and the frozen canonical 1024 tokenizer.
 """
 from __future__ import annotations
 
 import json
+import os
 import random
 
 import pytest
@@ -30,7 +32,7 @@ from tokenizer.tokenizer import ByteLevelBPETokenizer, tokenizer_file_sha256
 from tokenizer.vocab import TokenizerConfig
 
 ASSET_NAME = "talos_1b_32k"
-PRESETS_1B = ("talos_1b", "talos_1b_spec16")
+PRESETS_1B = ("talos_1b", "talos_1b_21l", "talos_1b_spec16")
 
 REPRESENTATIVE_TEXTS = [
     "The quick brown fox jumps over the lazy dog.",
@@ -146,7 +148,7 @@ def test_encode_decode_round_trip_is_identity(tokenizer, text) -> None:
 # --------------------------------------------------------------------------
 # pairing with the 1B presets (meta device — never a real 1B model)
 # --------------------------------------------------------------------------
-def test_asset_is_registered_for_both_1b_presets() -> None:
+def test_asset_is_registered_for_all_1b_presets() -> None:
     mapping = preset_asset_map()
     for preset in PRESETS_1B:
         assert asset_for_preset(preset) == ASSET_NAME
@@ -154,6 +156,25 @@ def test_asset_is_registered_for_both_1b_presets() -> None:
     # the canonical tiny family owns NO committed asset (trains in-run)
     for preset in ("tiny", "tiny_1m", "tiny_10m", "tiny_100m"):
         assert asset_for_preset(preset) is None
+
+
+def test_manifest_lists_exactly_the_1b_roster_and_keeps_its_sha() -> None:
+    """The manifest's preset roster is the three 1B presets; the asset is unchanged.
+
+    Owner decision 2026-11-04 redefined ``talos_1b`` as the FFN-adjusted variant
+    and preserved the old build as ``talos_1b_21l``. The vocabulary did not
+    move — all three 1B presets use the *same* 32,000-vocab asset — so the
+    manifest roster grew by one name and the sha256 pin stayed byte-identical.
+    """
+    manifest = json.loads(open(os.path.join(ASSET_DIR, MANIFEST_FILENAME), encoding="utf-8").read())
+    asset = manifest["assets"][ASSET_NAME]
+    assert sorted(asset["presets"]) == sorted(PRESETS_1B)
+    assert asset["sha256"] == (
+        "2d9476674e758f8d6dd611b56c9209b2fe77b13bfa592c0a65971a9168c4b165"
+    )
+    # The committed file still hashes to that pin (load-time verification).
+    assert tokenizer_file_sha256(os.path.join(ASSET_DIR, asset["file"])) == asset["sha256"]
+    assert asset["vocab_size"] == TALOS_1B_VOCAB_SIZE == 32_000
 
 
 @pytest.mark.parametrize("preset", PRESETS_1B)

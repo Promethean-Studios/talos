@@ -6,7 +6,7 @@ the training guard and the test suite) resolve the expected count from a
 rebuilt :class:`~model.config.ModelConfig`'s shape, so *every* canonical preset
 is enforced against its exact count by the **same** code path.
 
-Today that is six presets on two tracks:
+Today that is seven presets on two tracks:
 
 The **tiny family** (the original four-scale ladder, vocab 1024):
 
@@ -22,16 +22,20 @@ The **tiny family** (the original four-scale ladder, vocab 1024):
 The **Talos 1B track** (owner-directed 2026-10, vocab 32,000 — a deliberate
 divergence from the 1024 constant, tied embeddings):
 
-* ``talos_1b``       -> exactly    995,973,120 params (vocab 32,000) — the
-  owner's 1B spec at 21 layers (depth-adjusted to approach 1B);
+* ``talos_1b``       -> exactly  1,000,933,376 params (vocab 32,000) — the
+  owner's 1B spec with the **FFN** adjusted to 7,808 (16 layers, the owner's
+  2026-11-04 decision: the FFN-adjusted variant is the primary 1B);
+* ``talos_1b_21l``   -> exactly    995,973,120 params (vocab 32,000) — the
+  earlier depth-adjusted build (21 layers, literal FFN 5,504);
 * ``talos_1b_spec16``-> exactly    774,440,960 params (vocab 32,000) — the
   literal 16-layer spec variant.
 
-See :func:`configs.presets.talos_1b_config` / :func:`talos_1b_spec16_config`
-for the full arithmetic. The registry deliberately does **not** include the
-``small``/``medium``/``large`` and MoE configs: those are design artifacts with
-*estimated* counts (``configs.compute``), not owner-fixed canonical prototypes,
-so they are not hard-enforced here.
+See :func:`configs.presets.talos_1b_config` / :func:`talos_1b_21l_config` /
+:func:`talos_1b_spec16_config` for the full arithmetic. The registry
+deliberately does **not** include the ``small``/``medium``/``large`` and MoE
+configs: those are design artifacts with *estimated* counts
+(``configs.compute``), not owner-fixed canonical prototypes, so they are not
+hard-enforced here.
 """
 from __future__ import annotations
 
@@ -45,7 +49,7 @@ from model.config import ModelConfig
 #: preset name -> (canonical parameter count, canonical vocab size).
 #: The four tiny-family entries read the single source of truth
 #: (configs.vocab.VOCAB_SIZE) so a deliberate vocab change is one edit, not
-#: four. The two 1B entries record their own 32,000 vocab inline: their token
+#: four. The three 1B entries record their own 32,000 vocab inline: their token
 #: configs define a separate, deliberately-larger vocabulary track and
 #: ``tests/test_vocab_seam.py`` pins that divergence explicitly.
 TALOS_1B_VOCAB_SIZE = 32_000
@@ -54,7 +58,8 @@ CANONICAL_PRESETS: dict[str, Tuple[int, int]] = {
     "tiny_1m": (1_000_320, VOCAB_SIZE),
     "tiny_10m": (9_952_320, VOCAB_SIZE),
     "tiny_100m": (96_482_304, VOCAB_SIZE),
-    "talos_1b": (995_973_120, TALOS_1B_VOCAB_SIZE),
+    "talos_1b": (1_000_933_376, TALOS_1B_VOCAB_SIZE),
+    "talos_1b_21l": (995_973_120, TALOS_1B_VOCAB_SIZE),
     "talos_1b_spec16": (774_440_960, TALOS_1B_VOCAB_SIZE),
 }
 

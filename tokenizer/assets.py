@@ -2,10 +2,10 @@
 
 The canonical tiny-family presets (254K/1M/10M/100M) *train* their vocab-1024
 tokenizer inside each run (``scripts/train_oasst1.py`` step 2). The Talos 1B
-track does not: ``talos_1b`` / ``talos_1b_spec16`` use a **dedicated, committed,
-32,000-vocab BPE asset** that every 1B run must load — so the tokenizer is
-identical across runs, machines and checkpoints, and so the canonical 1024
-tokenizer can never be silently reused for a 1B model.
+track does not: ``talos_1b`` / ``talos_1b_21l`` / ``talos_1b_spec16`` all use
+the same **dedicated, committed, 32,000-vocab BPE asset** that every 1B run must
+load — so the tokenizer is identical across runs, machines and checkpoints, and
+so the canonical 1024 tokenizer can never be silently reused for a 1B model.
 
 Layout (see ``assets/tokenizers/``)::
 
@@ -278,8 +278,9 @@ def assert_asset_preset_pairing(
 ) -> None:
     """Refuse to pair an asset with a preset it is not registered for.
 
-    This is the *asset-level* guard: ``talos_1b``/``talos_1b_spec16`` are owned
-    by the 32,000-vocab asset; the tiny family owns no committed asset at all.
+    This is the *asset-level* guard: ``talos_1b``/``talos_1b_21l``/
+    ``talos_1b_spec16`` are owned by the 32,000-vocab asset; the tiny family
+    owns no committed asset at all.
     Both directions are loud:
 
     * a 32K asset requested for a tiny-family preset (vocab 1024) raises;
