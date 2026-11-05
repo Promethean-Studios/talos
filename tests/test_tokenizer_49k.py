@@ -35,7 +35,7 @@ ASSET_NAME = "talos_1b_49k"
 VOCAB_49K = 49_152
 MERGES_49K = 48_892
 SHA_49K = "c7d26acebad67be04af9b16cb72a812156cf3a708121a8ee9bf794d6a95c8684"
-PRIMARY_32K_SHA = "2d9476674e758f8d6dd611b56c9209b2fe77b13bfa592c0a65971a9168c4b165"
+PRIMARY_32K_SHA = "9777034aec31f864ddc2f14114556d8042ab91df92f08720980d1e45a4f27863"
 
 DIVERSE_TEXTS = [
     "The quick brown fox jumps over the lazy dog.",
@@ -104,15 +104,15 @@ def test_49k_round_trip_is_lossless(tokenizer) -> None:
         assert tokenizer.decode(tokenizer.encode(text)) == text, repr(text[:40])
 
 
-def test_32k_primary_asset_is_untouched() -> None:
-    """The 32K asset is *not* swapped: the retrain failed the ship gate."""
+def test_32k_primary_asset_is_v2_retrained() -> None:
+    """The 32K primary is the v2 asset retrained on the 16,000-row sample (held-out gate passed)."""
     path = os.path.join(ASSET_DIR, "talos_1b_32k.json")
     assert tokenizer_file_sha256(path) == PRIMARY_32K_SHA
     with open(os.path.join(ASSET_DIR, MANIFEST_FILENAME), encoding="utf-8") as fh:
         raw = json.load(fh)
     assert raw["version"] == 1  # top-level = manifest SCHEMA version
     assert raw["assets"]["talos_1b_32k"]["sha256"] == PRIMARY_32K_SHA
-    assert raw["assets"]["talos_1b_32k"]["training_sample"]["num_rows"] == 1000
+    assert raw["assets"]["talos_1b_32k"]["training_sample"]["num_rows"] == 16000
 
 
 # --------------------------------------------------------------------------

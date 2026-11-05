@@ -71,11 +71,11 @@ def test_manifest_pins_the_committed_asset(asset) -> None:
     sample = entry["training_sample"]
     assert sample["dataset"] == "HuggingFaceFW/fineweb-edu"
     assert sample["sha256"] == (
-        "f183e03bac859063a62b868a47f1410b738e42bd8f8c02681f040c7805d73072"
+        "2bafe0fb63999bf4f9c69b4f064fcaa6c692c24db29b5f03a9d235e79d815033"
     )
     assert sample["committed"] is False
     assert "fetch_tokenizer_sample" in sample["fetch_command"]
-    assert sample["num_rows"] == 1000 and sample["bytes"] > 4_000_000
+    assert sample["num_rows"] == 16000 and sample["bytes"] > 79_000_000
 
 
 def test_asset_sha256_mismatch_is_loud(tmp_path, asset) -> None:
@@ -170,7 +170,7 @@ def test_manifest_lists_exactly_the_1b_roster_and_keeps_its_sha() -> None:
     asset = manifest["assets"][ASSET_NAME]
     assert sorted(asset["presets"]) == sorted(PRESETS_1B)
     assert asset["sha256"] == (
-        "2d9476674e758f8d6dd611b56c9209b2fe77b13bfa592c0a65971a9168c4b165"
+        "9777034aec31f864ddc2f14114556d8042ab91df92f08720980d1e45a4f27863"
     )
     # The committed file still hashes to that pin (load-time verification).
     assert tokenizer_file_sha256(os.path.join(ASSET_DIR, asset["file"])) == asset["sha256"]

@@ -6,7 +6,7 @@
       "file": "talos_1b_32k.json",
       "vocab_size": 32000,
       "merges": 31740,
-      "sha256": "2d9476674e758f8d6dd611b56c9209b2fe77b13bfa592c0a65971a9168c4b165",
+      "sha256": "9777034aec31f864ddc2f14114556d8042ab91df92f08720980d1e45a4f27863",
       "presets": [
         "talos_1b",
         "talos_1b_21l",
@@ -23,66 +23,64 @@
       "seed": 0,
       "encoder": "exact_bpe",
       "trained_with": "scripts/train_tokenizer_32k.py",
-      "date": "2026-10-29",
+      "date": "2026-11-05",
       "training_sample": {
         "dataset": "HuggingFaceFW/fineweb-edu",
         "config": "default",
         "split": "train",
         "start_offset": 0,
-        "num_rows": 1000,
+        "num_rows": 16000,
         "page_size": 100,
-        "chars": 4756229,
-        "bytes": 4955380,
-        "sha256": "f183e03bac859063a62b868a47f1410b738e42bd8f8c02681f040c7805d73072",
+        "chars": 76262504,
+        "bytes": 79444384,
+        "sha256": "2bafe0fb63999bf4f9c69b4f064fcaa6c692c24db29b5f03a9d235e79d815033",
         "license": "ODC-By 1.0 (openly licensed educational web text)",
         "committed": false,
-        "fetch_command": "python -m scripts.fetch_tokenizer_sample --output /tmp/fw_sample_1b.jsonl",
+        "fetch_command": "python -m scripts.fetch_tokenizer_sample --start-offset 0 --num-rows 16000 --output /tmp/fw_sample_16k.jsonl (fetched as 8x2000-row chunks 2026-11-05; concatenation sha-pinned)",
         "heldout": {
           "dataset": "HuggingFaceFW/fineweb-edu",
           "config": "default",
           "split": "train",
           "start_offset": 1000000,
-          "num_rows": 200,
+          "num_rows": 1000,
           "page_size": 100,
-          "sha256": "d7c75e27e4a62efd5e90aa818b75b2b612b3d9027f0acffbe1777110b68cb326",
+          "sha256": "7b1acb47217f855147d084c476f22afe1283bfcd3e6cf76b02989f61d393daae",
           "committed": false,
-          "fetch_command": "python -m scripts.fetch_tokenizer_sample --start-offset 1000000 --num-rows 200 --output /tmp/fw_heldout_1b.jsonl"
+          "fetch_command": "python -m scripts.fetch_tokenizer_sample --start-offset 1000000 --num-rows 1000 --output /tmp/fw_heldout_1k.jsonl",
+          "bytes": 5155740
         }
       },
       "compression": {
-        "train_sample": {
-          "docs": 1000,
-          "chars": 4756229,
-          "tokens": 1007433,
-          "chars_per_token": 4.72113679023816,
-          "bytes_per_token": 4.72113679023816
-        },
-        "train_sample_legacy_encoder": {
-          "docs": 1000,
-          "chars": 4756229,
-          "tokens": 2749605,
-          "chars_per_token": 1.7297862783927145,
-          "bytes_per_token": 1.7297862783927145
-        },
-        "baseline_byte_tokenizer_chars_per_token": 1.0,
         "encoder": "exact_bpe",
-        "heldout_sample": {
+        "baseline_byte_tokenizer_chars_per_token": 1.0,
+        "heldout_200_rows": {
           "docs": 200,
           "chars": 1111482,
+          "tokens": 246782,
+          "chars_per_token": 4.5039022295
+        },
+        "heldout_1000_rows": {
+          "docs": 1000,
+          "chars": 4954464,
+          "tokens": 1096238,
+          "chars_per_token": 4.5195149229
+        },
+        "v1_baseline_heldout_200_rows": {
           "tokens": 251377,
-          "chars_per_token": 4.4215739705701,
-          "bytes_per_token": 4.4215739705701
+          "chars_per_token": 4.4215739705701
         },
-        "heldout_sample_legacy_encoder": {
-          "docs": 200,
-          "chars": 1111482,
-          "tokens": 643570,
-          "chars_per_token": 1.7270568858088475,
-          "bytes_per_token": 1.7270568858088475
+        "v1_baseline_heldout_1000_rows": {
+          "tokens": 1119069,
+          "chars_per_token": 4.427286649775039
         },
-        "train_compression_vs_byte_baseline": 4.72113679023816,
-        "heldout_compression_vs_byte_baseline": 4.4215739705701
-      }
+        "measured_by": "lead verification run 2026-11-05 via scripts.measure_tokenizer_compression.py (independent of the engineering session)",
+        "token_count_delta_vs_v1_pct": {
+          "heldout_200_rows": -1.828,
+          "heldout_1000_rows": -2.04
+        },
+        "note": "chars_per_token: higher is better (fewer tokens per char). token_count_delta_vs_v1_pct: negative is better."
+      },
+      "version": 2
     },
     "talos_1b_49k": {
       "file": "talos_1b_49k.json",
