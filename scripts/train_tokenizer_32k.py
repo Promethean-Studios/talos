@@ -54,15 +54,63 @@ from configs.presets import talos_1b_tokenizer_config
 from tokenizer.corpus import iter_text_documents
 from tokenizer.tokenizer import ByteLevelBPETokenizer, tokenizer_file_sha256
 from tokenizer.train import train_tokenizer
+from tokenizer.vocab import TokenizerConfig
 
 #: Pinned training parameters (the 1B tokenizer contract).
 DEFAULT_VOCAB_SIZE = TALOS_1B_VOCAB_SIZE  # 32,000
+
+#: The **asset-only** 49,152-vocab variant (``talos_1b_49k``). It exists so the
+#: owner has a *measured* vocab-upgrade option; it is deliberately **not**
+#: paired with any model preset (``talos_1b`` stays a 32,000-row embedding), so
+#: training it changes no config under ``configs/`` or ``model/``.
+VOCAB_49K = 49_152
+
+#: Vocab sizes this trainer may produce. Anything else is refused: the 1B track
+#: has exactly two measured vocabularies, and a third would be a deliberate
+#: decision rather than a typo.
+SUPPORTED_VOCAB_SIZES = (DEFAULT_VOCAB_SIZE, VOCAB_49K)
+
 DEFAULT_PRE_TOKENIZE = "gpt2"
 DEFAULT_MINFREQ = 1
 DEFAULT_SEED = 0  # provenance only: BPE merge learning has no RNG
 
-#: Number of merge slots the 32,000-vocab contract leaves: 32,000 - 256 - 4.
+#: Merge slots the 32,000-vocab contract leaves: 32,000 - 256 - 4.
 DEFAULT_NUM_MERGES = DEFAULT_VOCAB_SIZE - 256 - len(talos_1b_tokenizer_config().special_tokens)
+
+
+def merges_for_vocab(vocab_size: int) -> int:
+    """Merge slots ``vocab_size`` leaves: ``vocab - 256 base bytes - specials``."""
+    if vocab_size == DEFAULT_VOCAB_SIZE:
+        specials = len(talos_1b_tokenizer_config().special_tokens)
+    elif vocab_size == VOCAB_49K:
+        # Same four specials as the 32K contract (same ids at the top of the
+        # vocab), so the two assets differ only in merge budget.
+        specials = len(TokenizerConfig(vocab_size=vocab_size).special_tokens)
+    else:
+        raise ValueError(
+            f"unsupported vocab_size {vocab_size:,} (supported: "
+            f"{', '.join(f'{v:,}' for v in SUPPORTED_VOCAB_SIZES)})"
+        )
+    return vocab_size - 256 - specials
+
+
+def tokenizer_config_for_vocab(vocab_size: int) -> TokenizerConfig:
+    """Tokenizer config for one of the two supported 1B-track vocabularies.
+
+    The 32,000 contract goes through :func:`talos_1b_tokenizer_config`, which is
+    guarded against the model config (``vocab_size`` must equal the preset's
+    embedding rows). The 49,152 variant is built directly: it is an **asset
+    only** — no preset pairs with it — so it must *not* be run through the
+    model-pairing guard.
+    """
+    if vocab_size == DEFAULT_VOCAB_SIZE:
+        return talos_1b_tokenizer_config()
+    if vocab_size == VOCAB_49K:
+        return TokenizerConfig(vocab_size=vocab_size)
+    raise ValueError(
+        f"unsupported vocab_size {vocab_size:,} (supported: "
+        f"{', '.join(f'{v:,}' for v in SUPPORTED_VOCAB_SIZES)})"
+    )
 
 
 def count_chars_and_tokens(
@@ -142,9 +190,14 @@ def make_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--heldout", default=None,
                    help="optional held-out JSONL for the compression report")
     p.add_argument("--text-field", default="text", help="JSONL text field (default text)")
-    p.add_argument("--num-merges", type=int, default=DEFAULT_NUM_MERGES,
-                   help=f"merges to learn (default {DEFAULT_NUM_MERGES} = the full "
-                        f"{DEFAULT_VOCAB_SIZE:,}-vocab budget)")
+    p.add_argument("--vocab-size", type=int, default=DEFAULT_VOCAB_SIZE,
+                   choices=list(SUPPORTED_VOCAB_SIZES),
+                   help=f"total vocabulary size (default {DEFAULT_VOCAB_SIZE:,}, the "
+                        f"model-paired 1B contract; {VOCAB_49K:,} trains the "
+                        "asset-only talos_1b_49k variant)")
+    p.add_argument("--num-merges", type=int, default=None,
+                   help=f"merges to learn (default: the full budget of --vocab-size, "
+                        f"i.e. {DEFAULT_NUM_MERGES:,} at {DEFAULT_VOCAB_SIZE:,})")
     p.add_argument("--minfreq", type=int, default=DEFAULT_MINFREQ,
                    help=f"minimum pair frequency (default {DEFAULT_MINFREQ}: the full "
                         "vocabulary is mandatory, so the tail merges are learned)")
@@ -180,20 +233,23 @@ def main(argv: Optional[list] = None) -> int:
             "train a different tokenizer than the one the manifest describes"
         )
 
-    config = talos_1b_tokenizer_config()  # guarded: 32,000 vocab, 1B pairing
+    config = tokenizer_config_for_vocab(args.vocab_size)
     # The guarded 1B config carries the vocab + special tokens; the
     # pre-tokenizer is a *training* choice, so it is set here (and recorded in
     # the manifest). Without this the trainer would silently fall back to pure
     # byte-level splitting, where merges cross word boundaries.
     config.pre_tokenize = args.pre_tokenize
-    if config.vocab_size != DEFAULT_VOCAB_SIZE:  # pragma: no cover - config guard
+    if config.vocab_size != args.vocab_size:  # pragma: no cover - config guard
         raise ValueError(
-            f"1B tokenizer config vocab_size {config.vocab_size} != "
-            f"{DEFAULT_VOCAB_SIZE} — the guarded config drifted"
+            f"tokenizer config vocab_size {config.vocab_size} != requested "
+            f"{args.vocab_size} — the guarded config drifted"
         )
-    if args.num_merges > config.max_merges():
+    num_merges = (
+        merges_for_vocab(args.vocab_size) if args.num_merges is None else args.num_merges
+    )
+    if num_merges > config.max_merges():
         raise ValueError(
-            f"--num-merges {args.num_merges} exceeds the {config.vocab_size:,}-vocab "
+            f"--num-merges {num_merges} exceeds the {config.vocab_size:,}-vocab "
             f"budget of {config.max_merges():,} merges"
         )
 
@@ -203,7 +259,7 @@ def main(argv: Optional[list] = None) -> int:
         texts,
         config,
         minfreq=args.minfreq,
-        num_merges=args.num_merges,
+        num_merges=num_merges,
         max_docs=args.max_docs,
         max_chars=args.max_chars,
     )
@@ -219,11 +275,11 @@ def main(argv: Optional[list] = None) -> int:
     if shortfall and not args.allow_short_vocab:
         raise RuntimeError(
             f"trained vocabulary is {tokenizer.vocab_size:,} "
-            f"({tokenizer.merge_count:,} merges) but the 1B contract requires "
-            f"exactly {config.vocab_size:,} ({config.max_merges():,} merges): "
-            f"{shortfall:,} slots short. The sample ran out of pairs above "
-            f"minfreq={args.minfreq}; lower --minfreq or use a larger sample. "
-            f"(--allow-short-vocab exists for diagnostics only.)"
+            f"({tokenizer.merge_count:,} merges) but the requested vocabulary "
+            f"requires exactly {config.vocab_size:,} ({config.max_merges():,} "
+            f"merges): {shortfall:,} slots short. The sample ran out of pairs "
+            f"above minfreq={args.minfreq}; lower --minfreq or use a larger "
+            f"sample. (--allow-short-vocab exists for diagnostics only.)"
         )
 
     out_dir = os.path.dirname(os.path.abspath(args.output))
