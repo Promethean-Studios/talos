@@ -1,5 +1,28 @@
 # Talos `tiny_100m` — T4/Colab Training Reference (authoritative, repo-state `d8bfbdd`)
 
+> **Revision note — 2026-11-06 (docs audit).** This document was written against
+> `main` @ `d8bfbdd` (2026-09-27) and later extended twice: the W2 engine pass
+> (2026-10-21, §31) and the 1B presets (2026-11-04, §30). It remains the
+> authoritative reference for **flags, guards, checkpoint format and resume
+> semantics**, but three things moved since the original snapshot and are
+> corrected in place below:
+>
+> 1. **Gradient accumulation, BF16 AMP and activation checkpointing exist** as
+>    opt-in flags (`--grad-accum`, `--amp bf16`, `--grad-checkpoint`; §31).
+>    Earlier "not in the engine" / "MISSING" statements are stale.
+> 2. **A tokenizer asset is now committed** —
+>    `assets/tokenizers/talos_1b_32k.json` (vocab 32,000, v2) plus the
+>    asset-only `talos_1b_49k`. The vocab-1024 tokenizer this document uses for
+>    `tiny_100m` is still **not** in the repo.
+> 3. **The Colab/T4 path is no longer the target box.** The owner's local
+>    **RTX 3060 12 GB** is the 1B benchmark/training machine, driven by
+>    `scripts/benchmark_1b.py` — which has **not been run**, so no GPU results
+>    exist anywhere. §29's "benchmark mode" item is satisfied by that sibling
+>    script, not by a trainer flag.
+>
+> Project-level status lives in [`docs/STATUS.md`](STATUS.md); this document does
+> not keep a competing project-status table.
+
 **Target reader:** an agent or the owner executing the full `tiny_100m` pretraining run on a Google
 Colab T4 with **minimal ambiguity**. Every component below is labeled **CURRENT** (implemented and
 verified in this repo), **PARTIAL** (implemented with gaps), **MISSING** (needs implementation), or
@@ -42,12 +65,12 @@ script. Those are stated as MISSING and specified, not implied to exist.**
 | 21 | Safetensors release export for the 100M preset | CURRENT | `scripts/export_safetensors.py:309-312` (+ tests `tests/test_safetensors_io.py`) |
 | 22 | Grad clipping / NaN-Inf detection in the trainer loop | **CURRENT** (hardening pass) — loss finiteness checked before `backward`, gradient finiteness after, on EVERY step; a bad step skips the optimizer update, logs a structured event into `metrics.json`, writes a safety checkpoint, and aborts after `--max-consecutive-bad-steps` (default 3). `--grad-clip` bounds the total grad norm and records the pre-clip norm | `scripts/train_oasst1.py:979-1018` (loop guards), `:895-950` (`handle_bad_step`), `:606-620` (`BadStepsAbort`), metadata `:1573-1582` |
 | 23 | Super-save / intra-epoch checkpointing | **CURRENT** — `--save-every-tokens N` writes an atomic v1 checkpoint at every absolute multiple of N tokens since run start (restored on resume), through the same single checkpoint writer; epoch-end checkpoints unchanged | `scripts/train_oasst1.py:1015-1039` (periodic), `:661-734` (single writer + atomic `os.replace`), flag `:1162-1170` |
-| 24 | Benchmark mode (s/step, tok/s, peak VRAM) | **MISSING** — no trainer-side benchmark flag (spec in §17) | n/a |
+| 24 | Benchmark mode (s/step, tok/s, peak VRAM) | **PARTIAL** — there is still no *trainer-side* benchmark flag, but `scripts/benchmark_1b.py` (PR #39) is the standalone one-command benchmark (VRAM, OOM microbatch ladder, activation matrix, resume check, inference timing). **It has not been run; no GPU result exists.** | `scripts/benchmark_1b.py`, §29 item 1 |
 | 25 | Preflight gate script (`scripts/preflight.py`) | **MISSING** — proposed in §16 | n/a |
 | 26 | GPU-memory / ETA logging in the trainer | **MISSING (partially improved)** — still no VRAM/ETA sampling, ONLY host peak RSS + wall time; the hardening pass DID add grad-norm / bad-step / abort records to `metrics.json` (see §15.2) | `scripts/train_oasst1.py:1704-1739` (stability metrics) — GPU/ETA itself remains n/a |
 | 27 | FP16/AMP training | **IMPLEMENTED (W2, §31.1)** — opt-in `--amp fp16`/`--amp bf16`; default none = legacy fp32 bit-identical. BF16 still unavailable on T4 (SM7.5) — use fp16 there. The old owner-reported fp16 failure (§11, §28) is historical (pre-SDPA). | `scripts/train_oasst1.py` §31.1; `tests/test_trainer_engine_w2.py` |
 | 28 | Google Drive layout / Drive storage preflight | **PROPOSED** — a deployment convention, not code (§14) | n/a |
-| 29 | Colab T4 tool / path (platform) | PARTIAL — lead-side Colab tool registered but connection times out (re-tested 2026-09-27); manual notebooks at `shared/colab/` are the working fallback | `shared/colab/README.md` |
+| 29 | Colab T4 tool / path (platform) | SUPERSEDED — the owner's local **RTX 3060 12 GB** replaced Colab T4 as the 1B benchmark/training box; the team has no GPU access. Kept only as the historical record of why this document targets a T4 shape. | `docs/STATUS.md` |
 | 30 | OASST1 data preserved for later SFT | CURRENT (untouched in repo; see §24) | plan §24 |
 
 Legend: **CURRENT** = verified in this repo at `d8bfbdd` · **PARTIAL** = exists with gaps ·
@@ -134,9 +157,11 @@ Two hard constraints from the plan:
   is CPU. The owner's published T4 baseline (`benchmarks/phase-b/report-tiny-1m.md` §5) recorded
   config + losses (train 1.7859 / val 1.9177) but **no wall-clock/tok/s**. Batch benchmarks quoted in
   §11 are owner-reported records, cited as such, not repo artifacts.
-- **No trained `tokenizer.json` is shipped in the repo** (only the legacy 512-vocab test fixture
-  `tests/data/tokenizer_vocab512_legacy.json`); the established tokenizer must be downloaded from
-  HF (§6). Its identity sha256 `58e4ad40…` is the canonical check, and `benchmarks/phase-b/
+- **No trained vocab-1024 `tokenizer.json` is shipped in the repo** (only the legacy 512-vocab
+  test fixture `tests/data/tokenizer_vocab512_legacy.json`); the established 1024 tokenizer must be
+  downloaded from HF (§6). *(Since 2026-11-05 the repo DOES ship the 1B-track assets —
+  `assets/tokenizers/talos_1b_32k.json` v2 and `talos_1b_49k` — but those are vocab 32,000/49,152
+  and are deliberately refused for every `tiny_*` preset; see `docs/tokenizer.md` §0.)* Its identity sha256 `58e4ad40…` is the canonical check, and `benchmarks/phase-b/
   data-provenance.json` records the published tokenizer as byte-identical to the team-trained one.
 - **The owner's 32-point preflight checklist is not present verbatim in the repo or `/home/team/
   shared`** (searched on 2026-09-27). §16 provides a 32-point gate reconstructed from the repo's
@@ -384,7 +409,9 @@ opt.zero_grad(); loss.backward(); opt.step()
   (Note the eval path uses `CrossEntropyLoss(reduction="sum")` and normalizes externally — §9.2.)
 - Every batch is token-id-range-checked before the model (`validate_token_ids`, `:717`), and the
   model re-checks at the embedding seam (`model/gpt.py:100-104`).
-- One optimizer step = one batch (no gradient accumulation anywhere — see §10).
+- One optimizer step = one batch **by default**. Gradient accumulation is available as an
+  opt-in flag (`--grad-accum N`, W2 pass): with N > 1 the dataloader yields N micro-batches per
+  optimizer step, each loss scaled by 1/N — see §31.3.
 - Per-epoch mean train loss: `sum(epoch_losses)/len(epoch_losses)` (`:841-843`), recorded per epoch.
 
 ### 9.1 Shapes
@@ -425,7 +452,7 @@ Only `lr` is configurable. **Everything else is torch AdamW default**:
 | `eps` | `1e-8` | **NEEDS IMPLEMENTATION** (not exposed) |
 | `weight_decay` | `0.01` (AdamW default) | **NEEDS IMPLEMENTATION** (not exposed) |
 | gradient clipping | `--grad-clip N` default **0 = off** (§12) | **CURRENT** — `torch.nn.utils.clip_grad_norm_` after backward; pre-clip norm recorded |
-| gradient accumulation | none (batch == micro-batch == optimizer step) | **MISSING** if ever needed |
+| gradient accumulation | `--grad-accum N` default **1** (= batch is the optimizer step, legacy path) | **CURRENT** (W2, §31.3) — `--batch` becomes the micro-batch; accounting counts optimizer steps |
 
 ### 10.2 LR schedule (CURRENT; `TokenSchedule`, `:127-198`)
 
@@ -1293,9 +1320,11 @@ revision (NaN/Inf detection + checkpoint-before-abort, gradient clipping,
 super-save checkpoints, atomic `.pt` writes) are DONE** — see §12/§13; the list
 below is what remains.
 
-1. **Benchmark mode** (§17) — `--benchmark-steps N` (or a sibling script) measuring s/step, tok/s,
-   `torch.cuda.max_memory_allocated()` VRAM peak, loss stability, printed + saved (e.g.
-   `benchmarks/t4-tiny100m-benchmark-<shape>.json`).
+1. ~~**Benchmark mode** (§17)~~ — **DONE as a sibling script**: `scripts/benchmark_1b.py`
+   measures s/step, tok/s, `torch.cuda.max_memory_allocated()` VRAM, an OOM microbatch ladder, an
+   activation matrix, a save→kill→resume check and inference timing, writing a timestamped results
+   JSON. It targets the 1B presets on the owner's RTX 3060 12 GB and **has not been run**. A
+   trainer-side `--benchmark-steps` flag still does not exist (not needed).
 2. **`scripts/preflight.py`** (§16) — the 32-point gate as a runnable script; must add: disk-free
    check (Drive + scratch), out-dir clobber guard, GPU probe, cargo-cult the repo's existing
    guards (param count, vocab, manifest validation, tokenizer sha, resume validity).

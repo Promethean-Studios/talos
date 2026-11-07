@@ -1,116 +1,197 @@
-<img width="432" height="124" alt="Screenshot 2026-09-17 4 30 09 PM" src="https://github.com/user-attachments/assets/b4cbb3f5-875f-419d-a74f-1eb073459a78" />
+<img width="432" height="124" alt="Talos" src="https://github.com/user-attachments/assets/b4cbb3f5-875f-419d-a74f-1eb073459a78" />
 
-# 
+# Talos
 
-**Talos** is an experimental language-model project by **Promethean Studios**, focused on building and testing small, efficient transformer architectures before scaling toward larger models.
+**Talos** is an open-source research project by **Promethean Studios** building a
+family of small, reproducible decoder-only language models on one code path, and
+documenting exactly what has and has not been measured at each scale.
 
-> **Status:** Experimental / active development
-> **Current model:** Talos Mini
-> **Trained checkpoint:** Not yet available
+## Status at a glance (2026-11-06)
 
-## Talos Mini
+- **Architecture and tooling: complete** for four canonical presets (254K, 1M,
+  10M, 100M parameters) and three 1B presets. All are CI-tested at their exact
+  parameter counts.
+- **Trained:** the 254K and 1M presets, on small public corpora. Both produce
+  incoherent text — they are pipeline validations, not useful models.
+- **Talos 1B: implemented, not trained.** No 1B checkpoint exists, and no
+  1B-scale measurement (loss, throughput, VRAM) exists. The architecture is
+  tested on the meta device.
+- **Not trained:** the 10M and 100M presets (configs only), and every larger
+  design config.
 
-The current canonical Talos Mini configuration contains **254,272 trainable parameters**.
+The full evidence table — one row per area, each labeled *measured* / *verified
+in CI* / *historical* / *estimate* / *design only* — is in
+[`docs/STATUS.md`](docs/STATUS.md). Read that before quoting any number from
+this repository.
 
-| Specification           |                     Value |
-| ----------------------- | ------------------------: |
-| Parameters              |               **254,272** |
-| Hidden size             |                    **64** |
-| Transformer layers      |                     **2** |
-| Attention heads         |                     **4** |
-| KV heads                |                     **2** |
-| Vocabulary size         |                 **1,024** |
-| Maximum sequence length |            **512 tokens** |
-| Precision               |                  **FP32** |
-| Attention backend       | **PlainAttentionBackend** |
+## Model presets
 
-The parameter count describes the configured architecture. It does **not** represent a released trained model checkpoint.
+### Canonical ladder (configs frozen, exact counts registry-pinned)
 
-## Current Development
+All four are dense decoder-only, vocab 1,024, 2:1 GQA, RoPE (theta 1e4),
+head_dim 16, SwiGLU FFN at 4× hidden, max sequence 512, un-tied embeddings, no
+biases, FP32.
 
-Talos currently focuses on validating the complete model and training stack:
+| preset | parameters | hidden | layers | Q / KV heads | FFN |
+|---|---:|---:|---:|---:|---:|
+| `tiny` | **254,272** | 64 | 2 | 4 / 2 | 256 |
+| `tiny_1m` | **1,000,320** | 128 | 3 | 8 / 4 | 512 |
+| `tiny_10m` | **9,952,320** | 448 | 3 | 28 / 14 | 1,792 |
+| `tiny_100m` | **96,482,304** | 1,024 | 6 | 64 / 32 | 4,096 |
 
-* Transformer architecture
-* Attention and KV-cache implementation
-* Rotary positional embeddings
-* RMS normalization
-* Feed-forward networks
-* Training pipeline
-* Inference pipeline
-* Evaluation
-* Benchmarking
-* Quantization experiments
-* Future scaling experiments
+The counts are enforced by `configs/canonical.py` and asserted by the tests, so
+a drift fails CI rather than quietly changing the model.
 
-The project has successfully completed architecture and CUDA smoke testing, but a **usable trained Talos checkpoint has not yet been produced**.
+### Talos 1B (vocab 32,000 track, tied embeddings)
+
+Common architecture: vocab 32,000 · max sequence 2,048 · hidden 2,048 ·
+16 query / 4 KV heads (4:1 GQA) · head_dim 128 · RMSNorm pre-norm · RoPE ·
+SwiGLU dense FFN · no biases · **tied** input/output embeddings · SDPA with a
+plain functional fallback · BF16/FP16 AMP, gradient checkpointing and gradient
+accumulation available as opt-in trainer flags.
+
+| preset | layers | FFN | parameters | note |
+|---|---:|---:|---:|---|
+| `talos_1b` | 16 | 7,808 | **1,000,933,376** | **primary** — the owner's FFN-adjusted 1B (2026-11-04) |
+| `talos_1b_21l` | 21 | 5,504 | **995,973,120** | earlier depth-adjusted variant, preserved |
+| `talos_1b_spec16` | 16 | 5,504 | **774,440,960** | the literal 16-layer spec |
+
+These are **architecture, not results**: the presets are validated on the meta
+device (the dev box cannot hold a 1B fp32 model), and no training run has been
+started. See [`docs/SCALING.md`](docs/SCALING.md) §7 for the parameter and
+memory arithmetic.
+
+## Tokenizers
+
+| asset | vocab | encoder | paired with | status |
+|---|---:|---|---|---|
+| `talos_1b_32k` (**v2**) | 32,000 | exact BPE | `talos_1b`, `talos_1b_21l`, `talos_1b_spec16` | **primary** for the 1B presets |
+| `talos_1b_49k` | 49,152 | exact BPE | none (`asset_only`) | **experimental, unpaired** alternative |
+| vocab-1024 BPE | 1,024 | legacy heap encoder (retained) | trained inside each canonical run | unchanged workflow for 254K/1M/10M/100M |
+
+`talos_1b_32k` v2 is trained on a documented 16,000-row FineWeb-Edu sample
+(ODC-By 1.0, sha256-pinned, not committed) and measures **4.5039 chars/token on
+a 200-row held-out slice and 4.5195 on a 1,000-row held-out slice**, versus
+4.4216 / 4.4273 for v1 on the identical text — i.e. **1.83% / 2.04% fewer
+tokens**. Higher chars/token is better. `talos_1b_49k` measures 4.6411 / 4.6525
+(−4.73% / −4.84% tokens vs v1, ~3% fewer tokens than the 32K v2).
+
+Whether the 1B model moves to a 49,152 vocab (which would make it ≈1,036M
+parameters, replacing the owner-ratified 1,000,933,376 count) is an **open owner
+decision** — the 49K asset is built and guarded, but it is not planned and not
+rejected.
+
+Two rules that matter in practice:
+
+1. **Assets are sha256-verified at load time**, and a tokenizer must pair with
+   its model exactly (the 32K asset refuses every canonical preset; a
+   1,024-vocab tokenizer refuses every 1B preset). Mismatches fail loudly.
+2. **Any dataset tokenized with a different tokenizer — including the old
+   1,024-vocab one *and* datasets built with 32K v1 — must be regenerated
+   before use with the 32K v2 asset.** The pairing guard refuses mismatched IDs
+   rather than silently training on them.
+
+Details: [`docs/tokenizer.md`](docs/tokenizer.md).
 
 ## Training
 
-Early development tests have demonstrated that the training pipeline can reduce loss on extremely small test data.
+The trainer (`scripts/train_oasst1.py`) supports two data paths — a JSONL path
+that trains its BPE on the fly, and a packed-token path
+(`scripts/prepare_corpus.py` → `.npy` shards + manifest). Implemented and
+tested features:
 
-These experiments are **not a benchmark of model intelligence or general language performance**. They are primarily used to verify that forward passes, backpropagation, optimization, and loss calculation behave as expected.
+- **AMP:** `--amp fp16` (autocast + GradScaler) or `--amp bf16` (autocast, no
+  scaler; requires SM80+, so not on a T4). Default is FP32 and bit-identical to
+  the pre-AMP engine.
+- **Attention:** `--attention-backend sdpa` (default `auto` prefers it) with the
+  plain functional fallback available and used by the canonical tests.
+- **Memory:** `--grad-checkpoint` (activation checkpointing) and `--grad-accum N`
+  (gradient accumulation; `--batch` is then the micro-batch).
+- **Stability:** NaN/Inf loss and gradient detection is always on — a bad step
+  skips the optimizer update, logs a structured event, writes a safety
+  checkpoint, and aborts after `--max-consecutive-bad-steps` (default 3).
+  `--grad-clip` bounds the norm and records the pre-clip value.
+- **Checkpoints:** atomic writes, `--save-every-tokens N` intra-epoch cadence,
+  `--token-budget` stop, step-cap and no-overwrite guards, completed-optimizer-
+  step accounting, and resume validation on preset, parameter count, tokenizer
+  fingerprint and corpus identity.
 
-A production-quality training run and released checkpoint are still pending.
+The training corpus is **owner-prepared and not in this repository**: 205,002,065
+train + 15,001,394 validation tokens in 46 packed seq-512 shards, held on the
+owner's Drive. Nothing in the repo can reproduce those exact tokens from a
+clone.
 
-## Experimental MoE Configuration
+Reference: [`docs/trainer.md`](docs/trainer.md).
 
-The repository also contains an experimental Mixture-of-Experts code path.
+## Quick start
 
-| Specification   |     Value |
-| --------------- | --------: |
-| Hidden size     |   **128** |
-| Layers          |     **3** |
-| Attention heads |     **8** |
-| KV heads        |     **4** |
-| Head dimension  |    **16** |
-| Experts         |    **16** |
-| Active experts  |     **3** |
-| Shared experts  |     **1** |
-| Vocabulary      | **2,048** |
+```bash
+# parameter counts for every preset (no download, no GPU)
+python -m configs.compute --summary
 
-This configuration is currently a **code-path experiment**, not the primary Talos Mini model.
+# tiny forward/backward smoke test on CPU
+python -m scripts.cli --steps 3 --seq 64
 
-## Project Direction
+# train the 254K preset on a deterministic synthetic corpus (CPU, ~45 s)
+python -m tools.make_synthetic_oasst1 --docs 400 --seed 0 --output /tmp/oasst1.jsonl
+python -m scripts.train_oasst1 --data /tmp/oasst1.jsonl --out-dir /tmp/talos_run \
+    --epochs 3 --seq 64 --batch 4 --seed 0
 
-Talos is being developed incrementally:
+# eval + generation on the resulting checkpoint
+python -m scripts.eval_checkpoint --checkpoint /tmp/talos_run --seed 0
+python -m scripts.generate --checkpoint /tmp/talos_run \
+    --prompt "The capital of France is" --max-new-tokens 32
 
-**254K → 1M+ parameters → larger architectures**
+# tokenizer compression on a held-out JSONL slice
+python -m scripts.measure_tokenizer_compression --asset talos_1b_32k \
+    --slice heldout=/tmp/fw_heldout_1k.jsonl
 
-Future research directions include larger context windows, sparse/MoE architectures, quantization, efficient inference, and heterogeneous memory/compute systems.
+# test suite
+python -m pytest -q
+```
 
-Long-term experimental concepts include architectures with substantially larger total parameter counts while keeping active parameters significantly lower through sparsity and expert routing.
+Expect incoherent text from the 254K model — the point of that run is a
+deterministic config → data → train → checkpoint → eval → generate loop, not
+language quality.
 
-## Repository Structure
+## Repository layout
 
 ```text
 talos/
-├── model/          # Model architecture
-├── configs/        # Model configurations
-├── data/           # Data utilities
-├── training/       # Training components
-├── inference/      # Inference components
-├── evaluation/     # Evaluation tools
-├── benchmarks/     # Benchmarking
-├── distributed/    # Distributed-training experiments
-├── experiments/    # Experimental implementations
-├── examples/       # Usage examples
-├── docs/           # Documentation
+├── model/          # Transformer: attention backends, RoPE, RMSNorm, SwiGLU, MoE, KV cache
+├── configs/        # Presets, canonical registry, parameter/FLOP helper
+├── tokenizer/      # Byte-level BPE (train/encode/decode), committed-asset registry + guards
+├── assets/tokenizers/  # Committed tokenizer assets + MANIFEST.json (sha256 pins)
+├── data/           # Streaming data pipeline + packed-token dataset
+├── training/       # Training-side utilities (schedules, synthetic corpora)
+├── scripts/        # CLIs: corpus prep, training, eval, generation, tokenizer tools, benchmarks
+├── inference/      # Canonical prefill/decode + generation
+├── evaluation/     # Reproducible checkpoint evaluation harness
+├── quantization/   # int8 experiments
+├── distributed/    # Distributed-training scaffolding (not implemented)
+├── benchmarks/     # Committed measurement artifacts
+├── docs/           # Architecture, scaling, tokenizer, trainer, status
 └── tests/          # Test suite
 ```
 
-## Current State
+## Documentation
 
-| Component                    | Status                  |
-| ---------------------------- | ----------------------- |
-| Model architecture           | 🟢 Implemented          |
-| 254K parameter configuration | 🟢 Implemented          |
-| CUDA execution               | 🟢 Tested               |
-| Training pipeline            | 🟡 In development       |
-| Full training run            | 🟡 Pending              |
-| Trained checkpoint           | 🔴 Not released         |
-| HF model weights             | 🔴 Not released         |
-| 1M+ parameter model          | 🔴 Not started          |
-| Production model             | 🔴 Not the current goal |
+| Document | Covers |
+|---|---|
+| [`docs/STATUS.md`](docs/STATUS.md) | **Start here.** The single project-status overview, with an evidence level per row. |
+| [`docs/architecture.md`](docs/architecture.md) | Every model design decision: GQA, RoPE/YaRN, RMSNorm, SwiGLU, MoE routing, attention abstraction, KV cache. |
+| [`docs/SCALING.md`](docs/SCALING.md) | Measured scaling progression, metric conventions, the 1B parameter/memory arithmetic. |
+| [`docs/tokenizer.md`](docs/tokenizer.md) | Tokenizer design, the shipped 32K/49K assets, pairing guards, regeneration rules. |
+| [`docs/trainer.md`](docs/trainer.md) | Training execution reference: flags, guards, checkpoint format, resume semantics. |
+| [`benchmarks/`](benchmarks/) | Committed measurement artifacts and their provenance. |
+| [`data/README.md`](data/README.md) | The streaming data pipeline. |
+
+## Scope
+
+The long-term research direction is a much larger sparse (MoE) model; the
+relevant configs exist as **design artifacts only** and are owner-gated — see
+[`docs/architecture.md`](docs/architecture.md) §9. Nothing in this repository
+trains, benchmarks, or simulates that model today.
 
 ## License
 

@@ -12,7 +12,7 @@ LM-Eval-style benchmarks, long-context benchmarks, perplexity.
   (fixed seed, file-order batches); running twice yields identical metrics.
   CLI: `python -m scripts.eval_checkpoint --checkpoint <dir-or-file>`.
 
-## Not implemented (future work)
+## Not implemented (as of 2026-11-06)
 - LM-Eval-style benchmark tasks (knowledge/reasoning suites).
 - Long-context benchmarks for the 128K-target architecture.
 - Perplexity on held-out corpora beyond the JSONL-split harness above.

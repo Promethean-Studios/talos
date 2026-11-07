@@ -54,11 +54,11 @@ python -m data.pipeline \
     --max-docs 10000 --seed 0
 ```
 
-That writes sharded JSONL under `output.dir`. From there, the next step is a
-training entry point that reads those shards (a real-dataset trainer) rather
-than `training.synthetic`. That trainer is the natural follow-up to this basic
-test; it also should save checkpoints so inference can run on the *trained*
-model instead of a fresh one.
+That writes sharded JSONL under `output.dir`. Since this notebook was written,
+the real-dataset trainer exists: `scripts/train_oasst1.py` trains from JSONL
+(`--data`) or from a packed corpus (`--packed-dir`), writes resumable
+checkpoints and a `metrics.json`, and `scripts/eval_checkpoint.py` /
+`scripts/generate.py` score and sample the result (see `docs/trainer.md`).
 
 ### Notes / gotchas
 
@@ -68,6 +68,7 @@ model instead of a fresh one.
   work with no extra setup.
 - The training script is deterministic for a fixed `--seed` (default `0`), so
   repeated runs reproduce the same loss curve.
-- This notebook is the **validated vehicle** for the prototype (Phase 4).
-  Distributed training, checkpoints, and a real-dataset trainer are later
-  steps, not part of this basic test.
+- This notebook is the **validated vehicle** for the prototype (Phase 4): a
+  smoke test that the training loop learns on synthetic data. It is *not* how
+  any documented run was produced — those use `scripts/train_oasst1.py`.
+  Distributed training remains unimplemented (`distributed/PLAN.md`).

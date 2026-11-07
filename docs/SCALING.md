@@ -6,6 +6,11 @@ exists to keep every scaling claim traceable to a real run (or explicitly
 labeled as a plan/estimate). Nothing here is extrapolated from theory; rows
 below are either backed by merged-PR artifacts or marked *not yet run*.
 
+The one-paragraph project-status overview lives in
+[`docs/STATUS.md`](STATUS.md); this document is the detail behind its scaling
+rows. Sections 1–6 cover the dense canonical ladder; §7 covers the Talos 1B
+presets.
+
 ---
 
 ## 1. Scope statement (read this first)
@@ -13,17 +18,20 @@ below are either backed by merged-PR artifacts or marked *not yet run*.
 - The long-term research target is a **~400B-total / ~30B-active MoE
   decoder-only base LLM with a 128K-token context window** (see
   `docs/architecture.md` and `configs/presets.py`). That is a **future
-  research target, not a demonstrated result**.
+  research target, not a demonstrated result**, and it is owner-gated: nothing
+  is being built, trained or simulated toward it.
 - **No model larger than 254,272 parameters had been trained in this
   repository until Phase B (2026-09-19), when the `tiny_1m` preset was trained
   end-to-end on a real OASST1 subset — see the ~1M row in §2 and
-  `benchmarks/report-tiny-1m.md`.** The codebase contains untrained *configs*
-  for larger sizes (`small` 35.7M, `medium` 285M, `large` 1.64B, `100b`,
-  `400b` — verifiable via `python -m configs.compute --summary`), but a config
-  is an estimate, not a result. Configs become results only when a training
-  run is executed, checkpointed, and evaluated through the harness.
+  `benchmarks/phase-b/report-tiny-1m.md`.** The codebase contains untrained
+  *configs* for larger sizes (`small` 35.7M, `medium` 285M, `large` 1.64B,
+  `100b` 107B, `400b` 401B — verifiable via
+  `python -m configs.compute --summary`), but a config is an estimate, not a
+  result. Configs become results only when a training run is executed,
+  checkpointed, and evaluated through the harness.
 - This document claims nothing beyond measured or clearly-labeled-estimated
-  numbers. The progression table below is the authoritative scoreboard.
+  numbers. The progression table below is the authoritative scoreboard for the
+  dense ladder.
 
 ## 2. The progression table
 
@@ -34,8 +42,8 @@ run* (placeholder — planned, no results).
 |---|---:|---:|---:|---:|---:|---|---|
 | 254K (`tiny`) | 254,272 | **0.2521** (final, epoch 3) | **0.2473** (final, epoch 3) | **~12.5K tok/s** train · **~73–77K tok/s** eval · **~1.1 ms/token** decode | **~314 MiB** train · **~231 MiB** eval (peak RSS) | Loss strictly decreased on train *and* val across all 3 epochs; deterministic under seed 0; eval recompute bit-exact vs. recorded val loss. Output text is incoherent babble (expected at this scale). | ✅ PRs #17–#19 |
 | ~1M (`tiny_1m`) | 1,000,320 | **2.1826** (final, epoch 3) | **2.3950** (final, epoch 3) | **~9.2K tok/s** train phase (6,884 tok/s whole-run) · **31.2K tok/s** eval · **2.0 ms/token** decode | **378.2 MiB** train · **237.8 MiB** eval (peak RSS) | Real OASST1 2,000-doc subset (1,800/200, seed 0, BPE 764 merges, seq 64, batch 4, lr 3e-3, 3 epochs = 11,541 steps). Train+val loss strictly decreased across all 3 epochs; eval recompute bit-exact vs recorded; canonical 1,000,320 guard enforced. **Honest A/B at this budget: final val 2.3950 vs tiny's 2.3704 on the identical data/steps — the 1M model did NOT beat 254K here** (underfits; see `benchmarks/phase-b/report-tiny-1m.md`). | ✅ Phase B, PR #22 |
-| ~10M | *not yet run* | — | — | — | — | — | ⬜ |
-| ~100M | *not yet run* | — | — | — | — | — | ⬜ |
+| ~10M | *not yet run in this repo* | — | — | — | — | Config implemented and validated; **no training artifact (loss, metrics, checkpoint) exists in this repository**. The owner has described a historical ~10M run; it is unverified here, so no numbers are stated — see §3.1 | ⬜ |
+| ~100M | *not yet run* | — | — | — | — | Config implemented and validated (`96,482,304` params); training is a pending owner decision. | ⬜ |
 
 \* Natural-log mean cross-entropy (nats). **Row 254K** was measured on the fixed
 synthetic-OASST JSONL corpus (400 docs, 360/40 train/val split, BPE vocab 1024,
@@ -150,11 +158,23 @@ per model) to test whether `tiny_1m` overtakes `tiny` given ~5.3× more tokens t
 ## 3. Not-yet-run scales (placeholders)
 
 The ~1M / ~10M / ~100M rows are the scaling ladder; only the ~1M row has been
-run so far (Phase B, 2026-09-19 — real OASST1 data; see §2.1b below). The
-~10M / ~100M rows are **planned, not executed**. When each scale is
+run so far (Phase B, 2026-09-19 — real OASST1 data; see §2.1b). The
+~10M / ~100M rows have **no run in this repository**. When each scale is
 run, it must fill the table with the **same metric conventions** (§5) so rows
 are comparable. Per-scale expectations below are **honest engineering
 estimates, not results** — they exist only to scope the run.
+
+### 3.1 The ~10M row: what this repo can and cannot say
+
+`tiny_10m` (`9,952,320` params) is implemented, registered as a canonical
+preset, and validated end-to-end (construction, forward/backward, checkpoint
+round-trip, generation, exact-count guard). **The repository contains no 10M
+training artifact** — no loss curve, no `metrics.json`, no checkpoint, no
+benchmark row. The owner has described a historical 10M training run
+outside this repo; because nothing here reproduces or verifies it, **this
+document does not state any 10M number**. Recording that run's real numbers
+(and the artifact they come from) is an owner input still needed before the
+~10M row can be filled in.
 
 ### What would be recorded per scale (same for all sizes)
 
@@ -188,7 +208,7 @@ be published alongside (available in the per-epoch checkpoints already).
 The ~1M scaling step is **defined and has one complete training run** (Phase B,
 2026-09-19, real OASST1 2,000-doc subset). This block documents the config;
 the measured numbers live in the §2 progression table and in
-`benchmarks/report-tiny-1m.md`.
+`benchmarks/phase-b/report-tiny-1m.md`.
 
 **Architecture — `tiny` scaled up, no redesign.** `tiny_1m`
 (`configs/presets.py`, canonical registry `configs/canonical.py`) keeps every
@@ -459,9 +479,12 @@ exists but is not needed here.)
 
 ### 7.3 Training VRAM under AdamW mixed precision
 
-**Layout assumption (bytes/param) — this is the state to assume for the
-future engine (bf16/fp16-master + grad-checkpointing are *not* in the engine
-yet; a later delegation adds them):**
+**Layout assumption (bytes/param) — this is the state to assume for a full 1B
+training run.** All three of the pieces it depends on are now implemented as
+opt-in trainer flags (`docs/trainer.md` §31): `--amp bf16`, `--grad-checkpoint`
+and `--grad-accum`. The engine's *default* is still `amp="none"`, fp32
+end-to-end (model + m + v + grads all fp32 = 16 bytes/param); the 18 B/param row
+is the bf16/fp16-master layout a full 1B run would be sized against.
 
 | component | bytes/param | note |
 |---|---:|---|
@@ -511,17 +534,32 @@ ratio, tied embeddings).
 
 ### 7.4 Status and wiring
 
-- None of the presets has been trained; the tokenizer **asset** (vocab 32,000,
-  ``talos_1b_32k``) is shared by all three — the config seam refuses a
-  mismatched tokenizer (``_assert_tokenizer_model_pairing``; see
-  ``tests/test_vocab_seam.py``) and the asset manifest registers exactly the
-  three 1B presets (``tests/test_tokenizer_32k.py``).
-- **No 1B checkpoints exist anywhere**, so redefining ``talos_1b`` from the
-  21-layer depth adjustment to the FFN-adjusted 16-layer shape breaks no saved
-  artifact (owner policy: a better pipeline beats old-checkpoint
-  compatibility).
-- All three presets are registered in ``configs.canonical.CANONICAL_PRESETS`` so
+- **None of the presets has been trained, and no 1B checkpoint exists
+  anywhere.** The architecture is implemented and tested on the meta device;
+  that is the whole of the 1B evidence.
+- The tokenizer is a **committed asset**, not something a run trains:
+  `talos_1b_32k` **version 2** (vocab 32,000, exact-BPE encoder, sha256-pinned)
+  is shared by all three presets. The config seam refuses a mismatched
+  tokenizer (`_assert_tokenizer_model_pairing`; see `tests/test_vocab_seam.py`)
+  and the asset manifest registers exactly the three 1B presets
+  (`tests/test_tokenizer_32k.py`). See `docs/tokenizer.md` §0 for the asset
+  details, the measured held-out compression, and the rule that **any dataset
+  tokenized with a different tokenizer — the old 1,024-vocab one or 32K v1 —
+  must be regenerated before use with v2**.
+- `talos_1b_49k` (vocab 49,152) is a committed **asset-only** option: it pairs
+  with no preset, and whether the 1B model adopts it (which would make
+  `talos_1b` ≈1,036M parameters, replacing the owner-ratified 1,000,933,376) is
+  an **open owner decision**. It is neither planned nor rejected.
+- **No 1B benchmark has been run.** `scripts/benchmark_1b.py` exists so the
+  owner can measure the 1B presets on their RTX 3060 12 GB (OOM microbatch
+  ladder, activation matrix, save→kill→resume verification, inference timing,
+  runtime projections); it has not been executed and this repo contains no GPU
+  results. Every VRAM/time number in §7.2–§7.3 is an **estimate**.
+- Because no 1B checkpoints exist, redefining `talos_1b` from the 21-layer depth
+  adjustment to the FFN-adjusted 16-layer shape broke no saved artifact (owner
+  policy: a better pipeline beats old-checkpoint compatibility).
+- All three presets are registered in `configs.canonical.CANONICAL_PRESETS` so
   the existing trainer/eval/generation/safetensors guards (which enforce exact
   counts for registered presets) accept them with zero further wiring. Nothing
   else about the tiny-family presets changed; their counts are regression-pinned
-  by ``tests/test_talos_1b.py`` §5 and the pre-existing tiny_*\ test files.
+  by `tests/test_talos_1b.py` §5 and the pre-existing tiny_* test files.
