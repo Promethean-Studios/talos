@@ -1,8 +1,18 @@
 # Talos Architecture
 
-This document explains **every major design decision** in the Phase 1 MVP and
+This document explains **every major design decision** in the model code and
 honestly notes where a hardware-specific optimization is abstracted behind a
 functional fallback.
+
+> **Scope note (2026-11-06).** This is the Phase 1 design document and it still
+> describes the whole model code, including the MoE path and the ~400B/30B-active
+> design config (§1–§2, §9). **That MoE config is a design artifact only**: it
+> is owner-gated, nothing is being built, trained or simulated toward it, and it
+> is not current work. The models actually in use are the four canonical dense
+> presets (254K/1M/10M/100M) and the three Talos 1B presets — see
+> [`docs/STATUS.md`](STATUS.md) for what is trained and what is not. The
+> parameter counts quoted below for the design configs are estimates from
+> `configs.compute`, not measurements.
 
 The guiding principle: **one code path** builds and runs a model from the tiny
 dev size to the ~400B MoE. The `ModelConfig` dataclass (`model/config.py`) is

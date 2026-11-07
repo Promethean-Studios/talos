@@ -77,6 +77,21 @@ thousands of merges from a toy corpus.
 
 ## Repo hygiene
 
-No git repository is initialised at `/home/team/shared/forge` (standalone working
-tree; WORKFLOW references a repo that is not present here), so no commits/PRs
-were made. Working tree left clean on its only branch.
+This phase was authored in a standalone working tree, so the original session
+made no commits. The code now lives in the public repository
+`Promethean-Studios/talos`.
+
+## Status since (2026-11-06)
+
+The tokenizer described here is the **library and its design**. Two further
+layers were added afterwards and are the ones that matter in practice:
+
+* a **correct greedy encoder** (`tokenizer.bpe.encode_bytes_exact`) that
+  replaces the legacy heap encoder's defective merge selection for all new
+  tokenizers, while the legacy path stays the default for the vocab-1024
+  canonical presets;
+* **committed, sha256-pinned assets** for the 1B track
+  (`assets/tokenizers/talos_1b_32k.json` v2, vocab 32,000; and the asset-only
+  `talos_1b_49k`, vocab 49,152) plus model-pairing guards.
+
+See `docs/tokenizer.md` §0 for the current state.

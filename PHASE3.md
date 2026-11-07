@@ -39,7 +39,7 @@ research-grade, executable code.
   Wikipedia, C4) with licensing notes + a `python -m data.setup.download
   --dataset NAME --out DIR` CLI (`--list` / `--dry-run` need no network). No
   data is vendored; nothing is fetched at build/test time.
-- **Example config** (`configs/example.json`) and full docs (`data/README.md`).
+- **Example config** (`data/configs/example.json`) and full docs (`data/README.md`).
 
 ## Tests
 
@@ -82,6 +82,13 @@ modified; `model/` and `tokenizer/` are untouched (no regression).
 
 ## Repo hygiene
 
-As with Phases 1–2, `/home/team/shared/forge` is a standalone working tree with
-no git repository initialised (WORKFLOW references a repo that is not present
-here), so no commits/PRs were made. Working tree left clean.
+As with Phases 1–2, this phase was authored in a standalone working tree, so
+the original session made no commits. The code now lives in the public
+repository `Promethean-Studios/talos`.
+
+## Status since (2026-11-06)
+
+This document describes the **general** pipeline (`data/pipeline.py`). The
+pretraining path actually used today is `scripts/prepare_corpus.py`, which
+streams a HF corpus straight to packed `.npy` shards + a manifest; both share
+the same readers. See `docs/trainer.md` §8.

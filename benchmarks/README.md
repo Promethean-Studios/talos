@@ -1,6 +1,6 @@
 # Talos tiny prototype — performance baselines
 
-Per-item performance baselines for the **271K `tiny` prototype** (254,272
+Per-item performance baselines for the **254K `tiny` prototype** (254,272
 params), captured with the reproducible harness at `tools/benchmark.py` before
 quantization / DDM experiments begin. **This is a CPU baseline** — numbers are
 specific to the machine and thread count recorded inside the artifact.

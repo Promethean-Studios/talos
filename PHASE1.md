@@ -6,7 +6,9 @@ test passes.
 
 ## Structure created
 
-Repository at `/home/team/shared/forge/`.
+This is a historical record of the Phase 1 build (2026-08/09). The code now
+lives in the public repository `Promethean-Studios/talos`; file paths below
+refer to the repository root.
 
 | Path | Contents |
 |---|---|
@@ -27,10 +29,10 @@ pytest). `flash-attn` is optional and intentionally NOT installed.
 | name | ffn | total params | active/token | BF16 weights | FLOPs/tok |
 |---|---|---|---|---|---|
 | tiny | dense | 254 K | 254 K (100%) | ~0.5 MB | ~0.3 M |
-| small | dense | ~11 M | ~11 M | — | — |
-| medium | dense | ~82 M | ~82 M | — | — |
-| large | dense | ~0.8 B | ~0.8 B | — | — |
-| 100b | MoE | 106.6 B | 9.9 B (9.3%) | ~198 GiB | — |
+| small | dense | 35.7 M | 35.7 M | ~68 MiB | ~67 M |
+| medium | dense | 285 M | 285 M | ~544 MiB | ~537 M |
+| large | dense | 1.64 B | 1.64 B | ~3.06 GiB | ~3.15 B |
+| 100b | MoE | 107 B | 9.93 B (9.3%) | ~198 GiB | ~19.3 B |
 | 400b | MoE | **400.7 B** | **30.0 B (7.5%)** | ~746 GiB | ~58 B |
 
 (The `small`/`medium`/`large` rows are full counts printed by the helper;
@@ -91,3 +93,9 @@ python -m configs.compute --summary             # param counts
 Distributed training (DP/TP/PP/EP, BF16/FP8, checkpoints), data pipeline,
 tokenizer training, inference server, quantization, evaluation harness. The
 directories exist with `PLAN.md` scoping notes.
+
+**Status since (2026-11-06):** the tokenizer, data pipeline, training
+pipeline with checkpoint/resume, inference (prefill + KV-cache decode) and
+the evaluation harness have all since been implemented and tested;
+quantization has an int8 experiment at 254K. **Distributed training is
+still not implemented.** See `docs/STATUS.md` for the current picture.

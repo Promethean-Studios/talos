@@ -9,13 +9,13 @@ Quick start:
 
 ```bash
 # run a pipeline described by a JSON config, capping output for a smoke run
-/opt/forge-venv/bin/python -m data.pipeline \
+python -m data.pipeline \
     --config data/configs/example.json --out /tmp/mycorp \
     --max-docs 10000 --seed 0
 
 # or build a corpus from a known public dataset (dry-run first = no network)
-/opt/forge-venv/bin/python -m data.setup.download --list
-/opt/forge-venv/bin/python -m data.setup.download --dataset fineweb --out /tmp/raw --dry-run
+python -m data.setup.download --list
+python -m data.setup.download --dataset fineweb --out /tmp/raw --dry-run
 ```
 
 ---
@@ -151,7 +151,7 @@ A pipeline config is a JSON object with `sources`, `processors`, `output` and
 
 Run it:
 ```bash
-/opt/forge-venv/bin/python -m data.pipeline --config data/configs/example.json --out /tmp/out --max-docs 50000 --seed 0
+python -m data.pipeline --config data/configs/example.json --out /tmp/out --max-docs 50000 --seed 0
 ```
 The `--max-docs` cap makes smoke runs cheap; drop it for a full pass. The writer
 emits `shard-0000.jsonl`, ..., and `manifest.json`.
