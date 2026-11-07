@@ -344,7 +344,7 @@ trainer consumes. **BPE is NOT trained here** — `--tokenizer-json` is required
 | `--val-tokens` | int | `15_000_000` | no | tokens carved from the DISJOINT val region |
 | `--val-skip-docs` | int | `10_000` | no | docs skipped at the stream head before the val region (disjoint-region gap) — val region is *after* the gap, train docs start *after* the val region |
 | `--seq` | int | `512` | no | packed row width |
-| `--dtype` | `int32`\|`uint16` | `"int32"` | no | on-disk token dtype (uint16 safe: vocab 1024 < 65536) |
+| `--dtype` | `int32`\|`uint16` | `"int32"` | no | on-disk token dtype — `uint16` accepted iff the **loaded tokenizer's** `vocab_size <= 65,536` (every id fits in 16 bits; the 32K/49K 1B assets qualify), `int32` always |
 | `--out-dir` | path | — | **yes** | output directory (shards + manifests) |
 | `--stream-buffer-docs` | int | `1_000` | no | max encoded docs held in RAM between shard flushes |
 | `--rows-per-shard` | int | `16_384` | no | max rows per `.npy` shard |
@@ -362,9 +362,10 @@ python -m scripts.prepare_corpus \
 ### 8.2 Semantics that matter (verified from code/docstring)
 
 - **Packing convention**: every document is `encode(text) + [eos]` (EOS appended, including the
-  last doc); token ids validated against `VOCAB_SIZE` at encode time via
-  `validate_token_ids` (`prepare_corpus.py:23-31`, `:333-`); the final partial row is padded with
-  `pad_id`.
+  last doc); token ids validated at encode time via `validate_token_ids` against the **loaded
+  tokenizer's** id bound (`tokenizer.config.vocab_size`: 1,024 canonical, 32,000 / 49,152 for the
+  1B-track assets — derived by `prepare_corpus.tokenizer_id_bound`, never a hard-coded constant);
+  the final partial row is padded with `pad_id`.
 - **Disjoint val carve**: skip `val-skip-docs` docs, collect val docs until `val_tokens` reached,
   then collect train docs from *after* the val region. The val region's position is **independent
   of `--target-tokens`** (stable across budgets) and the two regions never share a source doc.
@@ -381,7 +382,7 @@ python -m scripts.prepare_corpus \
   `seq_len`, `eos_id`, `pad_id`, `num_shards`, `shards` (val shards listed first, then train;
   each entry = `{name, phase, rows, ...}` from the writer), and a `metadata` block = the same dict
   as `run_metadata.json`: `schema`, `script_version`, `timestamp`, `args`, `dataset`
-  (dataset/config/split/revision/sha), `tokenizer` (path/sha256/vocab_size/merge_count), `packing`
+  (dataset/config/split/revision/sha), `tokenizer` (path/sha256/vocab_size/configured_vocab_size/merge_count/exact_bpe), `packing`
   (seq/eos_id/pad_id/dtype/vocab_size_bound/rows_per_shard/stream_buffer_docs), `val_region`,
   `train_region`, `counts` (full token/row/char/pad counters incl. `total_tokens`, `truncated`),
   `wall_s` — `prepare_corpus.py:344-548`.

@@ -8,8 +8,18 @@ existing ``tokenizer.json`` — passed with ``--tokenizer-json``; BPE is NOT
 trained here), and packs the token stream into fixed ``seq``-length rows with
 EOS separators between documents, following the packing convention of
 ``data.tokenized.py`` (``mode="pack"``, ``eos=True``: every document — including
-the last — is ``encode(text) + [eos]``; ids are validated against
-``configs.vocab.VOCAB_SIZE`` at encode time via ``model.utils.validate_token_ids``).
+the last — is ``encode(text) + [eos]``; ids are validated at encode time against
+the **loaded tokenizer's own id space** via ``model.utils.validate_token_ids``).
+
+The token-id bound is derived from the ``tokenizer.json`` that is loaded
+(``tokenizer.config.vocab_size``, the exclusive upper bound on every id the file
+can assign — base bytes, merges and the top-of-range special ids), never from a
+hard-coded constant. The canonical ladder's vocab-1024 tokenizers therefore keep
+their old bound of 1024, while the 1B-track assets (``talos_1b_32k`` v2 =
+32,000 ids, ``talos_1b_49k`` = 49,152 ids) pack under their own bound. The
+``--dtype`` capacity check follows the same rule: ``uint16`` is accepted only
+when every id fits in 16 bits (vocab_size <= 65,536), ``int32`` always is, and a
+tokenizer that outgrows the requested dtype fails loudly instead of truncating.
 
 A held-out validation slice (``--val-tokens``) is carved from a DISJOINT region
 of the stream: the first ``--val-skip-docs`` documents are skipped entirely,
@@ -71,7 +81,6 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from configs.vocab import VOCAB_SIZE  # noqa: E402
 from data._logging import get_logger  # noqa: E402
 from data.readers import DatasetReader, HuggingFaceReader  # noqa: E402
 from model.utils import validate_token_ids  # noqa: E402
@@ -83,7 +92,10 @@ from tokenizer.tokenizer import (  # noqa: E402
 log = get_logger("scripts.prepare_corpus")
 
 #: Bumped on any change to the output format or the metadata schema.
-SCRIPT_VERSION = "1.0.0"
+#: 1.1.0: token-id bound derived from the loaded tokenizer (was the hard-coded
+#: canonical VOCAB_SIZE); ``tokenizer.configured_vocab_size`` and
+#: ``tokenizer.exact_bpe`` added to the metadata.
+SCRIPT_VERSION = "1.1.0"
 #: Packing manifest format tag (analogous to ShardedWriter's JSONL manifests).
 MANIFEST_FORMAT = "talos-packed-tokens-v1"
 #: Top-level metadata schema tag.
@@ -192,14 +204,69 @@ def _np_dtype(dtype: str) -> np.dtype:
     raise ValueError(f"unsupported dtype {dtype!r}: choose from {VALID_DTYPES}")
 
 
+def tokenizer_id_bound(tokenizer: ByteLevelBPETokenizer) -> int:
+    """Exclusive upper bound on the token ids the LOADED tokenizer can assign.
+
+    Derived from the loaded ``tokenizer.json`` itself (its
+    ``TokenizerConfig.vocab_size``) — the same object whose sha256/vocab counts
+    the metadata records — so the packer follows the tokenizer it was handed
+    instead of a hard-coded canonical constant. The canonical vocab-1024
+    tokenizers keep bound 1024; the 1B-track assets get 32,000 / 49,152.
+
+    ``config.vocab_size`` (not the *realized* ``tokenizer.vocab_size``) is the
+    right bound: special-token ids are assigned at the TOP of the configured
+    range, so a partially-trained tokenizer can have ``vocab_size == 260`` while
+    its EOS/PAD live at 1021/1022 — bounding by the realized size would reject
+    the canonical untrained fixtures. ``max(config, realized)`` keeps that safe
+    even for a hand-built tokenizer whose two numbers disagree the other way.
+    """
+    config = getattr(tokenizer, "config", None)
+    configured = getattr(config, "vocab_size", None)
+    realized = int(tokenizer.vocab_size)
+    if not isinstance(configured, int) or configured <= 0:
+        bound = realized
+    else:
+        bound = max(int(configured), realized)
+    if bound <= 0:
+        raise ValueError(
+            f"tokenizer reports vocab_size {bound} — cannot derive a token-id bound"
+        )
+    return bound
+
+
+def check_tokenizer_dtype(
+    tokenizer: ByteLevelBPETokenizer, dtype: str
+) -> int:
+    """Validate ``dtype`` can hold every id of ``tokenizer``; return the bound.
+
+    ``uint16`` is accepted iff the whole id space fits in 16 bits
+    (``vocab_size <= 65,536``, i.e. max id 65,535); ``int32`` is always
+    accepted. A tokenizer that outgrows the requested dtype raises a
+    ``ValueError`` naming both numbers — never a silent truncation, which would
+    corrupt the packed corpus.
+    """
+    np_dtype = _np_dtype(dtype)  # raises on an unknown dtype name
+    bound = tokenizer_id_bound(tokenizer)
+    max_id = bound - 1
+    capacity = int(np.iinfo(np_dtype).max)
+    if max_id > capacity:
+        raise ValueError(
+            f"dtype {dtype!r} cannot hold token ids up to {max_id} "
+            f"(tokenizer vocab_size {bound}; {dtype} maxes out at {capacity}) "
+            "— use --dtype int32 for this tokenizer"
+        )
+    return bound
+
+
 class RegionPacker:
     """Pack one region's documents into seq-length rows (EOS-separated).
 
     Encodes each document with the loaded tokenizer (plain encode followed by
     an explicit EOS id — no other special tokens), range-checks every id
-    against ``VOCAB_SIZE`` at encode time, cuts contiguous ``seq_len`` rows and
-    forwards them to the region's :class:`NpyShardWriter`. A final partial row
-    is padded with ``pad_id`` on :meth:`finish` (recorded as ``pad_tokens``).
+    against the tokenizer's own id bound (``vocab_bound``, derived by
+    :func:`tokenizer_id_bound`) at encode time, cuts contiguous ``seq_len`` rows
+    and forwards them to the region's :class:`NpyShardWriter`. A final partial
+    row is padded with ``pad_id`` on :meth:`finish` (recorded as ``pad_tokens``).
     """
 
     def __init__(
@@ -209,11 +276,14 @@ class RegionPacker:
         *,
         phase: str,
         seq_len: int,
+        vocab_bound: int,
     ) -> None:
         self.writer = writer
         self.tokenizer = tokenizer
         self.phase = phase
         self.seq_len = seq_len
+        #: Exclusive upper bound on token ids for the LOADED tokenizer.
+        self.vocab_bound = int(vocab_bound)
         self.eos_id = int(tokenizer.eos_id)
         self.pad_id = int(tokenizer.pad_id)
         self.dtype = writer.dtype
@@ -228,18 +298,18 @@ class RegionPacker:
         self.first_doc: Optional[int] = None
         self.last_doc: Optional[int] = None
 
-    @staticmethod
-    def _validate_ids(arr: np.ndarray, where: str) -> None:
-        """Range-check numpy token ids against ``VOCAB_SIZE``.
+    def _validate_ids(self, arr: np.ndarray, where: str) -> None:
+        """Range-check numpy token ids against the loaded tokenizer's bound.
 
         Delegates to ``model.utils.validate_token_ids`` (the repo's canonical
-        guard) via a zero-copy torch view. torch has no uint16 tensor support,
-        so non-``int32``/``int64`` arrays (the ``uint16`` packed layout) are
+        guard) via a zero-copy torch view, with ``self.vocab_bound`` as the
+        exclusive upper bound. torch has no uint16 tensor support, so
+        non-``int32``/``int64`` arrays (the ``uint16`` packed layout) are
         validated through a small ``int64`` copy first.
         """
         if arr.dtype not in (np.dtype(np.int32), np.dtype(np.int64)):
             arr = arr.astype(np.int64)
-        validate_token_ids(torch.from_numpy(arr), VOCAB_SIZE, where=where)
+        validate_token_ids(torch.from_numpy(arr), self.vocab_bound, where=where)
 
     def add_doc(self, doc_index: int, text: str) -> None:
         """Encode + pack one document; token id bounds are enforced here."""
@@ -353,17 +423,20 @@ def prepare_corpus(
         reader: any :class:`data.readers.DatasetReader` (the CLI wires a
             ``HuggingFaceReader``; tests use synthetic JSONL readers).
         tokenizer: the established Talos tokenizer (plain ``encode``, EOS
-            separators inserted by this function).
+            separators inserted by this function). Its own ``vocab_size`` is the
+            token-id bound every packed id is validated against.
         tokenizer_path: path of the loaded ``tokenizer.json`` — its sha256
-            fingerprint and vocab counts are recorded in the metadata.
+            fingerprint, realized/configured vocab sizes, merge count and encoder
+            variant are recorded in the metadata.
         out_dir: destination for ``*.npy`` shards + ``manifest.json`` +
             ``run_metadata.json`` (created if missing).
         target_tokens: TOTAL token budget — the run stops once
             ``val_tokens + train_tokens >= target_tokens`` (val included).
         val_tokens: tokens carved for the held-out val region (must be
             ``< target_tokens``).
-        seq_len / dtype: packed row width and on-disk dtype (``int32`` or
-            ``uint16``; uint16 is safe because ``VOCAB_SIZE=1024 < 65536``).
+        seq_len / dtype: packed row width and on-disk dtype (``int32`` always
+            accepted; ``uint16`` iff the loaded tokenizer's ``vocab_size`` is
+            ``<= 65,536``, so every id fits in 16 bits).
         val_skip_docs: number of documents skipped at the head of the stream
             before the val region starts — this gap is what makes the val
             region DISJOINT from the train region (train starts after val).
@@ -380,11 +453,10 @@ def prepare_corpus(
         embedded in ``manifest.json``).
     """
     np_dtype = _np_dtype(dtype)
-    if VOCAB_SIZE > np.iinfo(np_dtype).max:
-        raise ValueError(
-            f"dtype {dtype!r} cannot hold token ids up to {VOCAB_SIZE}; "
-            "use uint16/int32 for the canonical vocab-1024 tokenizer"
-        )
+    # The id bound comes from the LOADED tokenizer (canonical 1024, 1B-track
+    # 32K/49K, ...) — never a hard-coded constant. The dtype must be able to
+    # hold every id that tokenizer can assign; refuse loudly otherwise.
+    vocab_bound = check_tokenizer_dtype(tokenizer, dtype)
     if seq_len < 2:
         raise ValueError("seq_len must be >= 2")
     if target_tokens < 1 or val_tokens < 1:
@@ -399,10 +471,11 @@ def prepare_corpus(
         raise ValueError("val_skip_docs must be >= 0")
     eos_id = int(tokenizer.eos_id)
     pad_id = int(tokenizer.pad_id)
-    if not (0 <= eos_id < VOCAB_SIZE) or not (0 <= pad_id < VOCAB_SIZE):
+    if not (0 <= eos_id < vocab_bound) or not (0 <= pad_id < vocab_bound):
         raise ValueError(
-            f"tokenizer special ids outside [0, {VOCAB_SIZE}): eos={eos_id} "
-            f"pad={pad_id} — the tokenizer does not match the canonical vocab"
+            f"tokenizer special ids outside [0, {vocab_bound}): eos={eos_id} "
+            f"pad={pad_id} — the tokenizer's own vocab_size is {vocab_bound}, so "
+            "its special ids must fall inside that range"
         )
 
     os.makedirs(out_dir, exist_ok=True)
@@ -416,8 +489,12 @@ def prepare_corpus(
         seq_len=seq_len, dtype=np_dtype,
         rows_per_shard=rows_per_shard, stream_buffer_docs=stream_buffer_docs,
     )
-    val = RegionPacker(val_writer, tokenizer, phase="val", seq_len=seq_len)
-    train = RegionPacker(train_writer, tokenizer, phase="train", seq_len=seq_len)
+    val = RegionPacker(
+        val_writer, tokenizer, phase="val", seq_len=seq_len, vocab_bound=vocab_bound
+    )
+    train = RegionPacker(
+        train_writer, tokenizer, phase="train", seq_len=seq_len, vocab_bound=vocab_bound
+    )
 
     docs_streamed = 0
     skipped_gap = 0
@@ -475,15 +552,23 @@ def prepare_corpus(
         "tokenizer": {
             "path": os.path.abspath(tokenizer_path),
             "sha256": tokenizer_fingerprint,
+            #: realized size: base bytes + specials + learned merges (the count
+            #: ``tokenizer.vocab_size`` reports; equals the configured size for a
+            #: fully-trained tokenizer such as talos_1b_49k -> 49,152).
             "vocab_size": tokenizer.vocab_size,
+            #: configured id space — the exclusive bound every packed id obeys.
+            "configured_vocab_size": int(tokenizer.config.vocab_size),
             "merge_count": tokenizer.merge_count,
+            #: encoder variant persisted in the tokenizer file ("exact_bpe" vs
+            #: the legacy heap encoder) — part of the asset's identity.
+            "exact_bpe": bool(getattr(tokenizer, "exact_bpe", False)),
         },
         "packing": {
             "seq": seq_len,
             "eos_id": eos_id,
             "pad_id": pad_id,
             "dtype": dtype,
-            "vocab_size_bound": VOCAB_SIZE,
+            "vocab_size_bound": vocab_bound,
             "rows_per_shard": rows_per_shard,
             "stream_buffer_docs": stream_buffer_docs,
         },
@@ -578,8 +663,10 @@ def make_arg_parser() -> argparse.ArgumentParser:
                         "(the disjoint-region gap; default 10000)")
     p.add_argument("--seq", type=int, default=512, help="packed sequence length (default 512)")
     p.add_argument("--dtype", choices=VALID_DTYPES, default="int32",
-                   help="on-disk token dtype (default int32; uint16 also safe: "
-                        "vocab 1024 < 65536)")
+                   help="on-disk token dtype (default int32). uint16 is accepted "
+                        "only when the loaded tokenizer's vocab_size <= 65536 "
+                        "(every id fits in 16 bits; the 49K/32K 1B assets "
+                        "qualify); int32 always works")
     p.add_argument("--out-dir", required=True, help="output directory (shards + manifests)")
     p.add_argument("--stream-buffer-docs", type=int, default=1_000,
                    help="max encoded docs held in RAM between shard flushes (default 1000)")
@@ -598,12 +685,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not os.path.isfile(tokenizer_path):
             raise FileNotFoundError(f"--tokenizer-json not found: {tokenizer_path}")
         tokenizer = ByteLevelBPETokenizer.from_file(tokenizer_path)
-        if tokenizer.vocab_size > VOCAB_SIZE:
-            raise ValueError(
-                f"tokenizer vocab_size {tokenizer.vocab_size} exceeds the "
-                f"canonical VOCAB_SIZE {VOCAB_SIZE} — this corpus packer enforces "
-                f"token ids < {VOCAB_SIZE}; use the canonical Talos tokenizer"
-            )
+        # Pre-flight against the LOADED tokenizer: any vocab it declares is
+        # packable (canonical 1024, 1B-track 32K/49K, ...) as long as the
+        # requested dtype can hold its ids — fail before streaming otherwise.
+        vocab_bound = check_tokenizer_dtype(tokenizer, args.dtype)
+        log.info(
+            "packing with tokenizer %s (vocab_size %d, bound %d, %d merges, dtype %s)",
+            os.path.basename(tokenizer_path), tokenizer.vocab_size, vocab_bound,
+            tokenizer.merge_count, args.dtype,
+        )
         reader = HuggingFaceReader(
             args.dataset, split=args.split, text_field=args.text_field,
             streaming=True, config=args.config,
