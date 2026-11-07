@@ -5,7 +5,7 @@ actually ship, which model they pair with, and the rules for using them. The
 rest (§1 onward) records the original design decisions behind the byte-level BPE
 implementation in `tokenizer/`, for people extending or integrating it.
 
-## 0. Shipped tokenizers (current as of 2026-11-06)
+## 0. Shipped tokenizers (current as of 2026-11-07)
 
 There are **two independent tokenizer tracks** in Talos, and they must not be
 mixed.
@@ -27,8 +27,8 @@ The 1B presets do **not** train a tokenizer. They load a committed asset from
 
 | asset | vocab | merges | paired with | status |
 |---|---:|---:|---|---|
-| `talos_1b_32k` (**version 2**) | 32,000 | 31,740 | `talos_1b`, `talos_1b_21l`, `talos_1b_spec16` | **primary** |
-| `talos_1b_49k` | 49,152 | 48,892 | none — `"presets": []`, `"asset_only": true` | **experimental, unpaired** |
+| `talos_1b_49k` | 49,152 | 48,892 | `talos_1b` | **primary 1B tokenizer** (owner decision 2026-11-07) |
+| `talos_1b_32k` (**version 2**) | 32,000 | 31,740 | `talos_1b_21l`, `talos_1b_spec16` | paired with the two 32K siblings |
 
 Both use the **exact BPE encoder** (`tokenizer.bpe.encode_bytes_exact`), which
 replaces the legacy heap-based greedy encoder for these assets. The legacy
@@ -76,33 +76,40 @@ monotonically with both sample size and vocab size in the measured sweep.
   instead of tokenizing silently (`tokenizer/assets.py`,
   `TokenizerAsset.verify`).
 - **Asset ↔ preset pairing.** An asset may only be loaded for a preset listed
-  in its manifest `presets` field. The 32K asset refuses `tiny_*`; a
-  vocab-1024 tokenizer refuses every 1B preset. `talos_1b_49k` lists no presets,
-  so it can never pair with a model by accident.
+  in its manifest `presets` field. Both 1B assets refuse `tiny_*`; a
+  vocab-1024 tokenizer refuses every 1B preset; `talos_1b_49k` is refused for
+  `talos_1b_21l` / `talos_1b_spec16` and `talos_1b_32k` is refused for
+  `talos_1b`.
 - **Exact vocab equality for the 1B track.** The canonical track keeps the
   historical `tokenizer_vocab <= model_vocab` contract; the 1B track requires
-  exact equality, which is what stops a stray 1,024-vocab tokenizer from
-  slipping under a 32,000-row embedding matrix.
+  exact equality (49,152 for `talos_1b`, 32,000 for the two siblings), which is
+  what stops a stray 1,024-vocab tokenizer — or the wrong 1B asset — from
+  slipping under a model's embedding matrix.
 - **Checkpoint tokenizer metadata.** Every checkpoint and `metrics.json`
   records the tokenizer's sha256 fingerprint and is validated on resume; a
   packed corpus's manifest records the fingerprint its rows were built with.
 
 #### What you must regenerate
 
-**Any dataset tokenized with a different tokenizer — including the old
-1,024-vocab tokenizer *and* datasets built with 32K v1 — must be regenerated
-before use with the 32K v2 asset.** The ids are not interchangeable: v2 learned
-a different merge set, so the same token id means different bytes in v1 and v2.
-The pairing guards refuse a mismatched tokenizer rather than silently training
-on it, and a packed corpus whose manifest fingerprint differs from the
-tokenizer you pass is rejected.
+**Any dataset tokenized with ANY other tokenizer must be regenerated before
+training the preset it is meant for.** Token ids are not interchangeable across
+assets: every asset learned its own merge set, so the same id means different
+bytes in different assets. Concretely, before training **`talos_1b`** a corpus
+must be tokenized with **`talos_1b_49k`** — datasets built with the old
+1,024-vocab tokenizer, with 32K v1, *or with 32K v2* are all invalid for it.
+Before training `talos_1b_21l` / `talos_1b_spec16`, the corpus must be tokenized
+with `talos_1b_32k` (v2). The pairing guards refuse a mismatched tokenizer
+rather than silently training on it, and a packed corpus whose manifest
+fingerprint differs from the tokenizer you pass is rejected.
 
-#### The 49K asset is not a decision
+#### The 49K asset is the decided primary tokenizer
 
-`talos_1b_49k` is built, tested and guarded so that a vocab-size decision is one
-manifest re-pin away. It is **not** planned, and it is **not** rejected: pairing
-it with `talos_1b` would produce a ≈1,036M-parameter model, which would replace
-the owner-ratified 1,000,933,376 count. That is an open owner decision.
+The owner **decided the 1B vocabulary on 2026-11-07**: `talos_1b` moves to
+49,152 (`talos_1b_49k`) for **1,036,060,672 params**, superseding the
+2026-11-04 figure of 1,000,933,376 at vocab 32,000. `talos_1b_21l`
+(995,973,120) and `talos_1b_spec16` (774,440,960) keep vocab 32,000 and the
+32K v2 asset. Both assets are sha256-pinned and were not modified by the
+decision — only the manifest's `presets` lists and the model config moved.
 
 ### 0.3 Rebuilding the assets
 
@@ -112,7 +119,7 @@ python -m scripts.fetch_tokenizer_sample --num-rows 2000 --start-offset 0 \
     --output /tmp/tokscale/part_0.jsonl
 # ... repeat at offsets 2000,4000,...,14000 and concatenate in order (8 x 2,000 = 16,000 rows)
 
-# train (32K by default; --vocab-size 49152 builds the asset-only variant)
+# train (32K by default; --vocab-size 49152 builds the 49K primary-1B asset)
 python -m scripts.train_tokenizer_32k --sample /tmp/tokscale/train.jsonl \
     --output assets/tokenizers/talos_1b_32k.json --report
 
@@ -197,7 +204,7 @@ exact — even for text that literally contains a special-token string. Set
   (§0.2) — note that `scripts/train_tokenizer_32k.py` deliberately restricts
   `--vocab-size` to those two choices.
 - Of the *model* presets, only the design-only `100b`/`400b` MoE configs use a
-  131,072 (128K) vocab; every shipped preset uses 1,024 or 32,000.
+  131,072 (128K) vocab; every shipped preset uses 1,024, 32,000 or 49,152.
 - Byte-level BPE is why a ~128K vocab is *enough*: multi-byte characters are
   packed into a few merges, so the vocab is spent on reusable sub-word units
   instead of whole-word entries. The `Vocabulary` stores merges (pairs) and

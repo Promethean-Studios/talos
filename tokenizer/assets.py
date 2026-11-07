@@ -2,15 +2,18 @@
 
 The canonical tiny-family presets (254K/1M/10M/100M) *train* their vocab-1024
 tokenizer inside each run (``scripts/train_oasst1.py`` step 2). The Talos 1B
-track does not: ``talos_1b`` / ``talos_1b_21l`` / ``talos_1b_spec16`` all use
-the same **dedicated, committed, 32,000-vocab BPE asset** that every 1B run must
-load — so the tokenizer is identical across runs, machines and checkpoints, and
-so the canonical 1024 tokenizer can never be silently reused for a 1B model.
+track does not: each 1B preset uses its own **dedicated, committed BPE asset**
+that every run of that preset must load — ``talos_1b_49k`` (49,152 vocab) for
+the primary ``talos_1b`` (owner decision 2026-11-07) and ``talos_1b_32k``
+(32,000 vocab) for ``talos_1b_21l`` / ``talos_1b_spec16`` — so the tokenizer is
+identical across runs, machines and checkpoints, and so the canonical 1024
+tokenizer can never be silently reused for a 1B model.
 
 Layout (see ``assets/tokenizers/``)::
 
     assets/tokenizers/MANIFEST.json        # provenance + sha256 pins (this module's source of truth)
     assets/tokenizers/talos_1b_32k.json    # the trained ByteLevelBPE asset
+    assets/tokenizers/talos_1b_49k.json    # the primary 1B asset (vocab 49,152)
 
 The manifest records, per asset: the file name, vocab size, merge count, the
 sha256 of the tokenizer file, the special-token ids, the presets the asset is
@@ -28,8 +31,8 @@ Two guards live here:
 * :func:`assert_tokenizer_vocab_pairs` — the *realized* tokenizer's vocab must
   pair with the preset's model vocab: ``<=`` for the canonical tiny family
   (unchanged historical contract) and **exactly equal** for the 1B track, which
-  is what stops a stray 1024-vocab tokenizer from slipping under a 32,000-row
-  embedding matrix.
+  is what stops a stray 1024-vocab tokenizer from slipping under a 1B
+  embedding matrix (32,000 rows for 21l/spec16, 49,152 for ``talos_1b``).
 
 Both raise :class:`ValueError` with the offending sizes named; nothing here is
 torch-dependent, so the checks run on any box (including the 2-core CPU box
@@ -42,7 +45,7 @@ import os
 from dataclasses import dataclass
 from typing import Dict, List, Mapping, Optional, Tuple
 
-from configs.canonical import CANONICAL_PRESETS, TALOS_1B_VOCAB_SIZE
+from configs.canonical import CANONICAL_PRESETS
 from tokenizer.tokenizer import ByteLevelBPETokenizer, tokenizer_file_sha256
 
 #: Repository root (this file lives in ``<root>/tokenizer/``).
@@ -253,8 +256,9 @@ def asset_for_preset(preset: str, asset_dir: Optional[str] = None) -> Optional[s
     """The asset name registered for ``preset``, or ``None`` if it trains in-run.
 
     The canonical tiny-family presets have no committed asset (they train their
-    vocab-1024 tokenizer inside the run), so they return ``None``; the 1B presets
-    return their 32,000-vocab asset.
+    vocab-1024 tokenizer inside the run), so they return ``None``; each 1B
+    preset returns its own committed asset (``talos_1b_49k`` for ``talos_1b``,
+    ``talos_1b_32k`` for ``talos_1b_21l`` / ``talos_1b_spec16``).
     """
     mapping = preset_asset_map(asset_dir)
     if preset not in mapping and preset not in CANONICAL_PRESETS:
@@ -278,13 +282,15 @@ def assert_asset_preset_pairing(
 ) -> None:
     """Refuse to pair an asset with a preset it is not registered for.
 
-    This is the *asset-level* guard: ``talos_1b``/``talos_1b_21l``/
-    ``talos_1b_spec16`` are owned by the 32,000-vocab asset; the tiny family
-    owns no committed asset at all.
+    This is the *asset-level* guard: the manifest's ``presets`` lists own the
+    pairing — ``talos_1b`` is owned by ``talos_1b_49k`` (vocab 49,152) and
+    ``talos_1b_21l`` / ``talos_1b_spec16`` by ``talos_1b_32k`` (vocab 32,000);
+    the tiny family owns no committed asset at all.
     Both directions are loud:
 
-    * a 32K asset requested for a tiny-family preset (vocab 1024) raises;
-    * a preset that must use the 32K asset with a different asset raises.
+    * a 1B asset requested for a tiny-family preset (vocab 1024) raises;
+    * a preset that must use a different asset raises (32K for ``talos_1b``,
+      or 49K for ``talos_1b_21l`` / ``talos_1b_spec16``).
     """
     asset = get_asset(asset_name, asset_dir)
     expected = asset_for_preset(preset, asset_dir)
@@ -309,7 +315,8 @@ def assert_tokenizer_vocab_pairs(
 
     * canonical tiny family — ``tokenizer_vocab_size <= model vocab`` (the
       historical contract: the model may keep unused embedding rows).
-    * Talos 1B track — ``tokenizer_vocab_size == model vocab`` (exactly 32,000).
+    * Talos 1B track — ``tokenizer_vocab_size == model vocab`` exactly (49,152
+      for ``talos_1b``; 32,000 for ``talos_1b_21l`` / ``talos_1b_spec16``).
       A 1024-vocab tokenizer satisfies ``<=`` but is exactly the silent-reuse
       failure the owner forbade, so it is refused here.
     """
@@ -333,7 +340,7 @@ def assert_tokenizer_vocab_pairs(
         raise ValueError(
             f"tokenizer vocab_size {tokenizer_vocab_size} does not match the "
             f"{preset} model's {model_vocab} — the Talos 1B track requires its "
-            f"dedicated {TALOS_1B_VOCAB_SIZE:,}-vocab tokenizer asset "
+            f"dedicated {model_vocab:,}-vocab tokenizer asset "
             f"({required!r}); a smaller (e.g. the canonical 1024-vocab) "
             f"tokenizer is refused"
         )

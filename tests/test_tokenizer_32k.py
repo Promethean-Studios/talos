@@ -1,11 +1,16 @@
-"""W3 — the dedicated 32,000-vocab tokenizer asset for the Talos 1B presets.
+"""W3 — the dedicated 32,000-vocab tokenizer asset for the 1B siblings.
 
 Covers the asset itself (vocab exactly 32,000, sane special ids, lossless
-round-trip, sha256-pinned manifest), its pairing with ``talos_1b`` /
-``talos_1b_21l`` / ``talos_1b_spec16`` (including a meta-device
-embedding-shape check — the 1B
+round-trip, sha256-pinned manifest), its pairing with ``talos_1b_21l`` /
+``talos_1b_spec16`` (including a meta-device embedding-shape check — the 1B
 model is NEVER instantiated for real on this box), the mismatch guards, the
 correct greedy encoder, and the frozen canonical 1024 tokenizer.
+
+**Owner decision 2026-11-07** moved the PRIMARY ``talos_1b`` to vocab 49,152
+(``talos_1b_49k``, 1,036,060,672 params). This asset keeps the two siblings —
+``talos_1b_21l`` (995,973,120) and ``talos_1b_spec16`` (774,440,960) — at vocab
+32,000 with every other spec unchanged, so ``talos_1b`` must now be REFUSED
+here in both directions (asset-level and realized-vocab-level).
 """
 from __future__ import annotations
 
@@ -32,7 +37,10 @@ from tokenizer.tokenizer import ByteLevelBPETokenizer, tokenizer_file_sha256
 from tokenizer.vocab import TokenizerConfig
 
 ASSET_NAME = "talos_1b_32k"
-PRESETS_1B = ("talos_1b", "talos_1b_21l", "talos_1b_spec16")
+#: The presets this asset owns after the owner's 2026-11-07 vocab decision.
+PRESETS_1B = ("talos_1b_21l", "talos_1b_spec16")
+#: The primary 1B preset now uses the 49,152-vocab asset instead.
+PRIMARY_1B = "talos_1b"
 
 REPRESENTATIVE_TEXTS = [
     "The quick brown fox jumps over the lazy dog.",
@@ -148,27 +156,33 @@ def test_encode_decode_round_trip_is_identity(tokenizer, text) -> None:
 # --------------------------------------------------------------------------
 # pairing with the 1B presets (meta device — never a real 1B model)
 # --------------------------------------------------------------------------
-def test_asset_is_registered_for_all_1b_presets() -> None:
+def test_asset_is_registered_for_the_32k_1b_siblings() -> None:
     mapping = preset_asset_map()
     for preset in PRESETS_1B:
         assert asset_for_preset(preset) == ASSET_NAME
         assert mapping[preset] == ASSET_NAME
+    # the primary 1B preset is owned by the 49K asset, not this one
+    assert asset_for_preset(PRIMARY_1B) == "talos_1b_49k"
+    assert mapping[PRIMARY_1B] == "talos_1b_49k"
     # the canonical tiny family owns NO committed asset (trains in-run)
     for preset in ("tiny", "tiny_1m", "tiny_10m", "tiny_100m"):
         assert asset_for_preset(preset) is None
 
 
 def test_manifest_lists_exactly_the_1b_roster_and_keeps_its_sha() -> None:
-    """The manifest's preset roster is the three 1B presets; the asset is unchanged.
+    """The manifest's preset roster is the two 32K siblings; the asset is unchanged.
 
     Owner decision 2026-11-04 redefined ``talos_1b`` as the FFN-adjusted variant
-    and preserved the old build as ``talos_1b_21l``. The vocabulary did not
-    move — all three 1B presets use the *same* 32,000-vocab asset — so the
-    manifest roster grew by one name and the sha256 pin stayed byte-identical.
+    and preserved the old build as ``talos_1b_21l``. Owner decision 2026-11-07
+    then moved the primary ``talos_1b`` to the 49,152-vocab asset, leaving this
+    one owning ``talos_1b_21l`` / ``talos_1b_spec16`` — a manifest roster edit
+    only, so the sha256 pin stayed byte-identical (and the asset file itself is
+    untouched in this change).
     """
     manifest = json.loads(open(os.path.join(ASSET_DIR, MANIFEST_FILENAME), encoding="utf-8").read())
     asset = manifest["assets"][ASSET_NAME]
     assert sorted(asset["presets"]) == sorted(PRESETS_1B)
+    assert PRIMARY_1B not in asset["presets"]
     assert asset["sha256"] == (
         "9777034aec31f864ddc2f14114556d8042ab91df92f08720980d1e45a4f27863"
     )
@@ -202,6 +216,14 @@ def test_guard_accepts_the_1b_pairing(preset) -> None:
     assert_tokenizer_vocab_pairs(32_000, preset)     # must not raise
 
 
+def test_guard_refuses_the_32k_asset_for_the_primary() -> None:
+    """``talos_1b`` moved to 49,152 — this asset and its vocab are refused for it."""
+    with pytest.raises(ValueError, match="requires tokenizer asset"):
+        assert_asset_preset_pairing(ASSET_NAME, PRIMARY_1B)
+    with pytest.raises(ValueError, match="does not match"):
+        assert_tokenizer_vocab_pairs(32_000, PRIMARY_1B)
+
+
 @pytest.mark.parametrize("preset", PRESETS_1B)
 def test_guard_refuses_canonical_1024_tokenizer_for_1b(preset) -> None:
     """1024 <= 32000 passes the old "<=" contract — the exact guard refuses it."""
@@ -211,6 +233,11 @@ def test_guard_refuses_canonical_1024_tokenizer_for_1b(preset) -> None:
         assert_tokenizer_vocab_pairs(canonical, preset)
     with pytest.raises(ValueError):
         assert_tokenizer_vocab_pairs(32_000 - 1, preset)  # off-by-one is refused
+
+
+def test_guard_refuses_canonical_1024_tokenizer_for_the_primary() -> None:
+    with pytest.raises(ValueError, match="does not match"):
+        assert_tokenizer_vocab_pairs(1024, PRIMARY_1B)
 
 
 @pytest.mark.parametrize("preset", ("tiny", "tiny_1m", "tiny_10m", "tiny_100m"))
@@ -305,10 +332,12 @@ def test_1b_config_still_guards_its_pairing() -> None:
 
     for preset in PRESETS_1B:
         assert preset_tokenizer_config(preset).vocab_size == 32_000
-    with pytest.raises(ValueError, match="does not match"):
-        _assert_tokenizer_model_pairing(
-            TokenizerConfig(vocab_size=1024), ALL_PRESETS["talos_1b"]()
-        )
+    assert preset_tokenizer_config(PRIMARY_1B).vocab_size == 49_152
+    for vocab in (1024, 32_000):
+        with pytest.raises(ValueError, match="does not match"):
+            _assert_tokenizer_model_pairing(
+                TokenizerConfig(vocab_size=vocab), ALL_PRESETS[PRIMARY_1B]()
+            )
 
 
 def test_trainer_cli_offers_the_asset_flag() -> None:

@@ -1388,11 +1388,12 @@ flags since the W2 pass, §31; this run does not need them.)
 
 ## 30. The Talos 1B presets are NOT a T4 training target (added with the 1B-preset PR)
 
-The owner-directed 1B presets (``talos_1b`` **1,000,933,376 params / 16 layers /
-FFN 7,808** — the owner's 2026-11-04 FFN-adjusted primary; ``talos_1b_21l``
-995,973,120 params / 21 layers at FFN 5,504 — the earlier depth-adjusted build;
-``talos_1b_spec16`` 774,440,960 params / 16 layers at FFN 5,504 — the literal
-spec; all vocab 32,000, seq 2,048, hidden 2,048, 16/4 GQA heads, head_dim 128,
+The owner-directed 1B presets (``talos_1b`` **1,036,060,672 params / 16 layers /
+FFN 7,808 / vocab 49,152** — the owner's 2026-11-04 FFN-adjusted primary at the
+owner's 2026-11-07 vocabulary; ``talos_1b_21l`` 995,973,120 params / 21 layers
+at FFN 5,504 — the earlier depth-adjusted build; ``talos_1b_spec16``
+774,440,960 params / 16 layers at FFN 5,504 — the literal spec; the two siblings
+stay vocab 32,000; all: seq 2,048, hidden 2,048, 16/4 GQA heads, head_dim 128,
 no biases, TIED embeddings) exist as registered, meta-device-validated configs.
 This document's T4/Colab reference does **not** apply to them:
 
