@@ -215,9 +215,9 @@ def test_default_preset_is_the_ffn_adjusted_1b_primary():
     """The default preset is the owner's 2026-11-04 FFN-adjusted ``talos_1b``.
 
     ``talos_1b`` is the literal 16-layer spec with the SwiGLU FFN widened to
-    7,808 (1,000,933,376 params); the depth-adjusted build lives on as
-    ``talos_1b_21l`` and must stay a benchmarkable 1B preset with the same 32K
-    tokenizer asset.
+    7,808 at vocab 49,152 (1,036,060,672 params); the depth-adjusted build
+    lives on as ``talos_1b_21l`` and must stay a benchmarkable 1B preset on the
+    32K tokenizer asset.
     """
     from configs.canonical import CANONICAL_PRESETS
     from configs.presets import talos_1b_config
@@ -226,7 +226,7 @@ def test_default_preset_is_the_ffn_adjusted_1b_primary():
     assert args.preset == "talos_1b"
     cfg = talos_1b_config().derive()
     assert (cfg.num_layers, cfg.intermediate_size) == (16, 7808)
-    assert CANONICAL_PRESETS["talos_1b"][0] == 1_000_933_376
+    assert CANONICAL_PRESETS["talos_1b"][0] == 1_036_060_672
     assert CANONICAL_PRESETS["talos_1b_21l"][0] == 995_973_120
     # All three 1B presets are gated/configured as 1B (32K asset, CPU refusal).
     assert set(TOKENIZER_ASSET_PRESETS) == {
@@ -460,8 +460,8 @@ def test_estimated_rate_is_labelled_differently_from_a_measured_one():
 # 6. checkpoint storage + retention
 # ---------------------------------------------------------------------------
 def test_checkpoint_storage_counts_optimizer_state():
-    report = checkpoint_storage_report(1_000_933_376, amp="bf16")
-    params = 1_000_933_376
+    report = checkpoint_storage_report(1_036_060_672, amp="bf16")
+    params = 1_036_060_672
     assert report["weights_bytes"] == params * 4
     assert report["optimizer_bytes"] == params * 8  # AdamW: two fp32 moments
     assert report["total_bytes"] > report["weights_bytes"]

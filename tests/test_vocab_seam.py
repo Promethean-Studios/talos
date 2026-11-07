@@ -15,17 +15,23 @@ named — making a deliberate vocab change a one-line edit to
 ``configs.vocab.VOCAB_SIZE`` plus this test's update, and anything else an
 error.
 
-**The one deliberate divergence:** the owner-directed Talos 1B track
-(``talos_1b`` / ``talos_1b_21l`` / ``talos_1b_spec16``) uses its own
-**32,000**-vocab tokenizer — an explicit owner decision to move off the 1024
-prototype contract. Those three
+**The deliberate divergence:** the owner-directed Talos 1B track
+(``talos_1b`` / ``talos_1b_21l`` / ``talos_1b_spec16``) uses real-tokenizer
+vocabularies — an explicit owner decision to move off the 1024 prototype
+contract. After the owner's **2026-11-07** decision the primary ``talos_1b``
+carries **49,152** (the ``talos_1b_49k`` asset) while ``talos_1b_21l`` /
+``talos_1b_spec16`` keep **32,000**. All three
 presets are pinned below as *intentionally different*, and every seam that
 would silently reuse the 1024 constant for them (the tokenizer-config registry
-pull, model↔tokenizer pairing) is asserted to use 32,000 instead.
+pull, model↔tokenizer pairing) is asserted to use each preset's own vocab.
 """
 from __future__ import annotations
 
-from configs.canonical import CANONICAL_PRESETS, TALOS_1B_VOCAB_SIZE
+from configs.canonical import (
+    CANONICAL_PRESETS,
+    TALOS_1B_PRIMARY_VOCAB_SIZE,
+    TALOS_1B_VOCAB_SIZE,
+)
 from configs.presets import (
     ALL_PRESETS,
     TOKENIZER_CONFIGS,
@@ -81,41 +87,71 @@ def test_canonical_registry_vocab_reads_vocab_size() -> None:
         assert isinstance(params, int) and params > 0
 
 
-def test_talos_1b_track_deliberately_uses_32000_vocab() -> None:
+#: preset -> the vocabulary its model, tokenizer config and registry entry must
+#: all carry. The owner's 2026-11-07 decision moved ONLY the primary to 49,152.
+TALOS_1B_EXPECTED_VOCABS = {
+    "talos_1b": TALOS_1B_PRIMARY_VOCAB_SIZE,
+    "talos_1b_21l": TALOS_1B_VOCAB_SIZE,
+    "talos_1b_spec16": TALOS_1B_VOCAB_SIZE,
+}
+
+
+def test_talos_1b_track_deliberately_uses_its_own_vocabs() -> None:
     """The 1B presets must NOT silently reuse the 1024 contract.
 
     Every 1B seam — model config, tokenizer config (registry + direct), and
-    the canonical-registry entry — must agree on 32,000, and the pairing guard
+    the canonical-registry entry — must agree per preset (49,152 for the
+    primary ``talos_1b``; 32,000 for ``talos_1b_21l`` / ``talos_1b_spec16``),
+    and the pairing guard
     (:func:`configs.presets._assert_tokenizer_model_pairing`) must refuse a
     mismatched (e.g. the 1024) config.
     """
-    assert TALOS_1B_VOCAB_SIZE == 32_000  # sanity-pin the 1B constant itself
+    assert TALOS_1B_PRIMARY_VOCAB_SIZE == 49_152  # owner decision 2026-11-07
+    assert TALOS_1B_VOCAB_SIZE == 32_000  # sanity-pin the sibling constant
     assert TALOS_1B_VOCAB_SIZE != VOCAB_SIZE  # the divergence is deliberate
     for name in TALOS_1B_NAMES:
+        expected = TALOS_1B_EXPECTED_VOCABS[name]
+        assert expected != VOCAB_SIZE  # never the canonical contract
         model_cfg = ALL_PRESETS[name]().derive()
-        assert model_cfg.vocab_size == TALOS_1B_VOCAB_SIZE, (
+        assert model_cfg.vocab_size == expected, (
             f"1B preset {name} vocab_size={model_cfg.vocab_size} must be "
-            f"{TALOS_1B_VOCAB_SIZE}, never the canonical {VOCAB_SIZE}"
+            f"{expected}, never the canonical {VOCAB_SIZE}"
         )
         assert model_cfg.tie_word_embeddings is True
         tok = preset_tokenizer_config(name)  # registry path (model-compat seam)
-        assert tok.vocab_size == TALOS_1B_VOCAB_SIZE
+        assert tok.vocab_size == expected
         assert tok.vocab_size <= model_cfg.vocab_size  # the ≤ contract still holds
         # The canonical registry entry agrees.
         params, vocab = CANONICAL_PRESETS[name]
-        assert vocab == TALOS_1B_VOCAB_SIZE
+        assert vocab == expected
         assert isinstance(params, int) and params > 0
     # The pairing guard itself observes real differences (not a vacuous pass).
     from configs.presets import _assert_tokenizer_model_pairing
 
-    try:
+    for bad_vocab in (VOCAB_SIZE, 32_000):
+        try:
+            _assert_tokenizer_model_pairing(
+                TokenizerConfig(vocab_size=bad_vocab), ALL_PRESETS["talos_1b"]()
+            )
+        except ValueError as exc:
+            assert "does not match" in str(exc)
+        else:  # pragma: no cover - the guard must fire
+            raise AssertionError(
+                f"pairing guard accepted a {bad_vocab}-vocab tokenizer for talos_1b"
+            )
+    # The siblings still accept their own 32,000 contract and refuse the 49K one.
+    for name in ("talos_1b_21l", "talos_1b_spec16"):
         _assert_tokenizer_model_pairing(
-            TokenizerConfig(vocab_size=VOCAB_SIZE), ALL_PRESETS["talos_1b"]()
+            TokenizerConfig(vocab_size=32_000), ALL_PRESETS[name]()
         )
-    except ValueError as exc:
-        assert "1024" in str(exc) or "does not match" in str(exc)
-    else:  # pragma: no cover - the guard must fire
-        raise AssertionError("pairing guard accepted a 1024 tokenizer for talos_1b")
+        try:
+            _assert_tokenizer_model_pairing(
+                TokenizerConfig(vocab_size=49_152), ALL_PRESETS[name]()
+            )
+        except ValueError as exc:
+            assert "does not match" in str(exc)
+        else:  # pragma: no cover - the guard must fire
+            raise AssertionError(f"pairing guard accepted a 49K tokenizer for {name}")
 
 
 def test_tokenizer_trainer_cli_default_reads_vocab_size() -> None:

@@ -62,9 +62,10 @@ Nothing here reads the owner's packed corpus. The measured benchmarks feed
 **synthetic** token ids (a seeded generator) — throughput and VRAM do not
 depend on token *content*. The resume harness writes its own small synthetic
 JSONL corpus (generic English filler words generated deterministically) into
-its work directory. The 1B presets use the committed, sha256-verified
-``talos_1b_32k`` tokenizer asset from ``assets/tokenizers/MANIFEST.json``; no
-data fetch is required.
+its work directory. The 1B presets use their committed, sha256-verified
+tokenizer asset from ``assets/tokenizers/MANIFEST.json`` (``talos_1b_49k`` for
+the primary ``talos_1b``, ``talos_1b_32k`` for ``talos_1b_21l`` /
+``talos_1b_spec16``); no data fetch is required.
 
 Safety
 ------
@@ -149,9 +150,30 @@ TOKEN_BUDGETS: Tuple[int, ...] = (
 #: Gradient-accumulation values exercised by the default activation matrix.
 DEFAULT_MATRIX_ACCUM: Tuple[int, ...] = (1, 4)
 
-#: The 1B presets that require the dedicated 32K tokenizer asset.
+#: The 1B presets that require a committed tokenizer asset.
 TOKENIZER_ASSET_PRESETS = ("talos_1b", "talos_1b_21l", "talos_1b_spec16")
-TOKENIZER_ASSET_NAME = "talos_1b_32k"
+
+#: Fallback asset name when the manifest cannot be read (reported as unverified).
+_FALLBACK_TOKENIZER_ASSET = "talos_1b_32k"
+
+
+def tokenizer_asset_for(preset: str) -> str:
+    """The committed tokenizer asset ``preset`` pairs with.
+
+    Resolved from ``assets/tokenizers/MANIFEST.json``'s ``presets`` lists rather
+    than hard-coded: the owner's 2026-11-07 decision gives the primary
+    ``talos_1b`` the 49,152-vocab asset (``talos_1b_49k``) while
+    ``talos_1b_21l`` / ``talos_1b_spec16`` keep ``talos_1b_32k`` (32,000). A
+    manifest that cannot be read falls back to the 32K name; the caller's own
+    verification step then reports ``sha256_verified: false`` instead of
+    silently claiming a pairing.
+    """
+    from tokenizer.assets import asset_for_preset  # noqa: PLC0415 - lazy import
+
+    try:
+        return asset_for_preset(preset) or _FALLBACK_TOKENIZER_ASSET
+    except (OSError, ValueError, KeyError):
+        return _FALLBACK_TOKENIZER_ASSET
 
 #: Exit codes.
 EXIT_OK = 0
@@ -2460,21 +2482,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return EXIT_GUARD
 
     if args.preset in TOKENIZER_ASSET_PRESETS and not dry_run:
-        # Report the sha-verified tokenizer asset the 1B track trains with.
+        # Report the sha-verified tokenizer asset the 1B preset trains with.
         from tokenizer.assets import get_asset  # noqa: PLC0415 - lazy import
 
+        asset_name = tokenizer_asset_for(args.preset)
         try:
-            asset = get_asset(TOKENIZER_ASSET_NAME)
+            asset = get_asset(asset_name)
             asset.verify()  # sha256 against assets/tokenizers/MANIFEST.json
             model_info["tokenizer_asset"] = {
-                "name": TOKENIZER_ASSET_NAME,
+                "name": asset_name,
                 "sha256_verified": True,
                 "sha256": asset.sha256,
                 "vocab_size": asset.vocab_size,
             }
         except (OSError, ValueError, KeyError) as exc:  # pragma: no cover - env dep
             model_info["tokenizer_asset"] = {
-                "name": TOKENIZER_ASSET_NAME,
+                "name": asset_name,
                 "sha256_verified": False,
                 "error": str(exc),
             }
@@ -2505,7 +2528,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             loss_rtol=args.resume_loss_rtol,
             run_timeout_s=args.resume_timeout_s,
             tokenizer_asset=(
-                TOKENIZER_ASSET_NAME
+                tokenizer_asset_for(resume_preset)
                 if resume_preset in TOKENIZER_ASSET_PRESETS else None
             ),
         )

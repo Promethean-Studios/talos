@@ -8,7 +8,6 @@
       "merges": 31740,
       "sha256": "9777034aec31f864ddc2f14114556d8042ab91df92f08720980d1e45a4f27863",
       "presets": [
-        "talos_1b",
         "talos_1b_21l",
         "talos_1b_spec16"
       ],
@@ -87,10 +86,10 @@
       "vocab_size": 49152,
       "merges": 48892,
       "sha256": "c7d26acebad67be04af9b16cb72a812156cf3a708121a8ee9bf794d6a95c8684",
-      "presets": [],
-      "asset_only": true,
-      "paired_with_any_model": false,
-      "why_unpaired": "Asset-only option for the owner's vocab-upgrade decision. No preset in configs/ uses vocab 49,152, and the trainer builds this asset from a plain TokenizerConfig so the model-pairing guard can never accept it. Pairing it with talos_1b would need a 1,036M-param model config, which is an owner decision, not a code change.",
+      "presets": [
+        "talos_1b"
+      ],
+      "paired_with_any_model": true,
       "special_ids": {
         "<|beginoftext|>": 49148,
         "<|endoftext|>": 49149,

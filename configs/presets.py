@@ -206,7 +206,8 @@ def tiny_100m_tokenizer_config() -> TokenizerConfig:
 # Talos 1B presets (owner-directed, 2026-10): a NEW architecture track.
 # ------------------------------------------------------------------------------
 # The 1B presets deliberately diverge from the tiny family on THREE knobs, each
-# an explicit owner decision: vocab_size 32,000 (the real tokenizer track), a
+# an explicit owner decision: a real-tokenizer vocabulary (49,152 for the
+# primary ``talos_1b``, 32,000 for its two siblings), a
 # 4:1 GQA ratio (16/4 heads instead of 2:1), head_dim 128 instead of 16, and a
 # SwiGLU FFN at 2.6875x hidden (5504/2048 instead of 4x) for the *literal*
 # spec. The per-layer shape is otherwise the classic small-LLM recipe: pre-norm
@@ -219,6 +220,11 @@ def tiny_100m_tokenizer_config() -> TokenizerConfig:
 # the FFN width moved; every other number is the literal spec. The earlier
 # depth-adjusted build (21 layers, FFN 5,504) is kept as ``talos_1b_21l``, and
 # the untouched literal spec as ``talos_1b_spec16``.
+#
+# Owner decision 2026-11-07: the primary ``talos_1b`` moves to **vocab 49,152**
+# (the measured ``talos_1b_49k`` tokenizer asset, ~3% fewer tokens than the 32K
+# v2 on identical held-out text). Only ``talos_1b`` moves: ``talos_1b_21l`` and
+# ``talos_1b_spec16`` keep vocab 32,000 and every other current spec.
 
 #: The literal spec's SwiGLU FFN width (2.6875x hidden: 5504/2048).
 TALOS_1B_INTERMEDIATE_SIZE = 5504
@@ -226,7 +232,13 @@ TALOS_1B_INTERMEDIATE_SIZE = 5504
 #: (3.8125x hidden: 7808/2048) — the 2026-11-04 adjustment axis.
 TALOS_1B_FFN_ADJUSTED_INTERMEDIATE_SIZE = 7808
 
-TALOS_1B_EMBEDDING_PARAMS = 32_000 * 2048  # tied: one 32000x2048 matrix
+#: Vocabulary of the **primary** ``talos_1b`` (owner decision 2026-11-07):
+#: 49,152 = 256 base bytes + 4 specials + 48,892 merges (``talos_1b_49k``).
+TALOS_1B_PRIMARY_VOCAB_SIZE = 49_152
+#: Vocabulary of ``talos_1b_21l`` / ``talos_1b_spec16`` (unchanged, 32,000).
+TALOS_1B_VOCAB_SIZE = 32_000
+
+TALOS_1B_EMBEDDING_PARAMS = 49_152 * 2048  # tied: one 49152x2048 matrix
 TALOS_1B_FINAL_NORM_PARAMS = 2048
 
 #: Per-layer parameter arithmetic (attention + 2 RMSNorms + SwiGLU FFN), one
@@ -238,41 +250,48 @@ TALOS_1B_FFN_ADJUSTED_LAYER_PARAMS = 58_462_208  # I = 7,808: primary talos_1b
 def talos_1b_config() -> ModelConfig:
     """The Talos ~1B preset — the owner's spec with the **FFN** adjusted.
 
-    Owner's target architecture (verbatim): decoder-only, vocab 32,000, seq
-    2,048, hidden 2,048, **16 heads / 4 KV heads (4:1 GQA), head_dim 128**,
-    SwiGLU FFN intermediate **5,504**, RMSNorm pre-norm, RoPE, no biases,
-    TIED input/output embeddings, standard stable init (``initializer_range``
-    0.02, ``rope_theta`` 1e4).
+    Owner's target architecture (verbatim): decoder-only, seq 2,048, hidden
+    2,048, **16 heads / 4 KV heads (4:1 GQA), head_dim 128**, SwiGLU FFN
+    intermediate **5,504**, RMSNorm pre-norm, RoPE, no biases, TIED
+    input/output embeddings, standard stable init (``initializer_range`` 0.02,
+    ``rope_theta`` 1e4). The vocabulary is **49,152** — the owner's 2026-11-07
+    decision (see below).
 
     The owner pre-authorized adjusting dims to approach 1B, and **on 2026-11-04
     chose the FFN axis**: the spec's 16 layers are kept exactly and the SwiGLU
     FFN is widened 5,504 -> **7,808** (3.8125x hidden). Depth, head geometry and
-    every other number stay exactly as specified. Parameter count, verified
-    programmatically (see ``tests/test_talos_1b.py`` and the meta-device
-    construction in docs/SCALING.md §7):
+    every other number stay exactly as specified. **On 2026-11-07 the owner
+    raised the vocabulary 32,000 -> 49,152**, pairing the model with the
+    measured ``talos_1b_49k`` tokenizer asset (~3% fewer tokens than the 32K v2
+    on identical held-out text). Parameter count, verified programmatically
+    (see ``tests/test_talos_1b.py`` and the meta-device construction in
+    docs/SCALING.md §7):
 
-    * embedding (tied, single copy) = ``V·H`` = 32,000·2,048 = **65,536,000**
-      (tied ⇒ no separate lm_head);
+    * embedding (tied, single copy) = ``V·H`` = 49,152·2,048 =
+      **100,663,296** (tied ⇒ no separate lm_head);
     * per layer: attention = ``H·H + H·(H/4) + H·(H/4) + H·H`` =
       2,048² + 2·2,048·512 + 2,048² = 4,194,304 + 2·1,048,576 + 4,194,304
       = **10,485,760**; 2 RMSNorms = 2·2,048 = **4,096**; SwiGLU FFN =
       3·H·I = 3·2,048·7,808 = **47,972,352**; per layer total
       = **58,462,208**;
     * 16 layers = 935,395,328; final norm = **2,048**;
-    * **total = 65,536,000 + 935,395,328 + 2,048 = 1,000,933,376**
-      (≈1,000.9M — the closest the owner's architecture gets to 1B from the
-      spec's own 16 layers).
+    * **total = 100,663,296 + 935,395,328 + 2,048 = 1,036,060,672**
+      (≈1,036.1M).
+
+    History: at the 2026-11-04 vocab of 32,000 the same shape was
+    65,536,000 + 935,395,328 + 2,048 = 1,000,933,376 — **superseded** by the
+    2026-11-07 vocab decision.
 
     Sibling presets on the same track: :func:`talos_1b_21l_config` (the earlier
-    depth-adjusted build, 21 layers at FFN 5,504, 995,973,120 params) and
-    :func:`talos_1b_spec16_config` (the untouched literal spec, 16 layers at
-    FFN 5,504, 774,440,960 params).
+    depth-adjusted build, 21 layers at FFN 5,504, vocab 32,000, 995,973,120
+    params) and :func:`talos_1b_spec16_config` (the untouched literal spec,
+    16 layers at FFN 5,504, vocab 32,000, 774,440,960 params).
 
-    ``vocab_size=32_000`` ≠ the canonical 1024 constant deliberately — see
+    ``vocab_size=49_152`` ≠ the canonical 1024 constant deliberately — see
     :func:`talos_1b_tokenizer_config` for the tokenizer pairing guard.
     """
     return ModelConfig(
-        vocab_size=32_000,
+        vocab_size=TALOS_1B_PRIMARY_VOCAB_SIZE,
         hidden_size=2048,
         num_layers=16,
         num_attention_heads=16,
@@ -340,8 +359,9 @@ def talos_1b_spec16_config() -> ModelConfig:
 
     The spec's literal shape lands ~23% under 1B. The owner's chosen approach to
     1B is the FFN-adjusted :func:`talos_1b_config` (16 layers, FFN 7,808,
-    1,000,933,376); this variant keeps the literal FFN width available as the
-    reference point and pins its arithmetic by tests either way.
+    vocab 49,152, 1,036,060,672); this variant keeps the literal FFN width
+    available as the reference point and pins its arithmetic by tests either
+    way.
     """
     return ModelConfig(
         vocab_size=32_000,
@@ -366,8 +386,8 @@ def _assert_tokenizer_model_pairing(tok_config: TokenizerConfig, model: ModelCon
 
     ``tokenizer/model_compat.py`` enforces ``tokenizer_vocab_size <=
     model_vocab_size`` generically, but that alone would let a stray vocab-1024
-    tokenizer config pair silently with a 1B model (1024 ≤ 32000 passes). Each
-    1B preset is defined together with its 32,000-vocab tokenizer config; this
+    tokenizer config pair silently with a 1B model (1024 ≤ 49152 passes). Each
+    1B preset is defined together with its own-vocab tokenizer config; this
     guard makes the pairing **exact and loud**: the tokenizer config and its
     paired model config must agree on the vocab size, or constructing the
     tokenizer config raises. (The model keeps the standard ``<=`` contract for
@@ -383,49 +403,53 @@ def _assert_tokenizer_model_pairing(tok_config: TokenizerConfig, model: ModelCon
 
 
 def talos_1b_tokenizer_config() -> TokenizerConfig:
-    """Tokenizer config for ``talos_1b``: vocab 32,000, paired and guarded.
+    """Tokenizer config for ``talos_1b``: vocab 49,152, paired and guarded.
 
-    vocab 32,000 = 256 base bytes + 4 default specials + **31,740 merge slots**
+    vocab 49,152 = 256 base bytes + 4 default specials + **48,892 merge slots**
     (LLaMA-style specials at the top). This is a **deliberate divergence** from
-    the canonical 1024 contract (``configs.vocab.VOCAB_SIZE``) — the 1B track
-    uses its own 32,000-vocab tokenizer asset (a later delegation trains it);
+    the canonical 1024 contract (``configs.vocab.VOCAB_SIZE``) — the owner's
+    2026-11-07 decision moved the primary 1B preset onto the measured
+    ``talos_1b_49k`` tokenizer asset;
     :func:`_assert_tokenizer_model_pairing` refuses to construct this config
     beside a model config with any other vocab, so a silent reuse of the
-    canonical 1024 tokenizer cannot happen at the config seam.
+    canonical 1024 tokenizer (or of the 32,000-vocab 1B sibling asset) cannot
+    happen at the config seam.
     """
-    tok = TokenizerConfig(vocab_size=32_000)
+    tok = TokenizerConfig(vocab_size=TALOS_1B_PRIMARY_VOCAB_SIZE)
     _assert_tokenizer_model_pairing(tok, talos_1b_config())
     return tok
 
 
 def talos_1b_21l_tokenizer_config() -> TokenizerConfig:
-    """Tokenizer config for ``talos_1b_21l``: identical (vocab 32,000).
+    """Tokenizer config for ``talos_1b_21l``: vocab 32,000 (unchanged).
 
-    All three 1B presets (``talos_1b`` / ``talos_1b_21l`` / ``talos_1b_spec16``)
-    share the one 32,000-vocab contract exactly — they differ only in depth and
-    FFN width, never in vocabulary — so this reuses the same guarded config via
-    :func:`_assert_tokenizer_model_pairing`.
+    ``talos_1b_21l`` and ``talos_1b_spec16`` keep the one 32,000-vocab contract
+    exactly — they differ from each other only in depth and FFN width, never in
+    vocabulary — so this reuses the same guarded config via
+    :func:`_assert_tokenizer_model_pairing`. The primary ``talos_1b`` moved to
+    49,152 on 2026-11-07; these two did not.
     """
-    tok = TokenizerConfig(vocab_size=32_000)
+    tok = TokenizerConfig(vocab_size=TALOS_1B_VOCAB_SIZE)
     _assert_tokenizer_model_pairing(tok, talos_1b_21l_config())
     return tok
 
 
 def talos_1b_spec16_tokenizer_config() -> TokenizerConfig:
-    """Tokenizer config for ``talos_1b_spec16``: identical (vocab 32,000).
+    """Tokenizer config for ``talos_1b_spec16``: vocab 32,000 (unchanged).
 
-    ``talos_1b_spec16`` shares the other 1B presets' vocabulary exactly (they
+    ``talos_1b_spec16`` shares ``talos_1b_21l``'s vocabulary exactly (they
     differ only in depth / FFN width), so this reuses the same guarded 32,000
     vocab config via :func:`_assert_tokenizer_model_pairing`.
     """
-    tok = TokenizerConfig(vocab_size=32_000)
+    tok = TokenizerConfig(vocab_size=TALOS_1B_VOCAB_SIZE)
     _assert_tokenizer_model_pairing(tok, talos_1b_spec16_config())
     return tok
 
 
 #: canonical preset name -> tokenizer-config builder. All four tiny-family
-#: presets reuse the sole vocab-1024 contract (their rows stay 1024); the three
-#: 1B presets deliberately register a 32,000-vocab contract. The registry
+#: presets reuse the sole vocab-1024 contract (their rows stay 1024); the 1B
+#: presets register a real-tokenizer contract — 49,152 for the primary
+#: ``talos_1b``, 32,000 for ``talos_1b_21l`` / ``talos_1b_spec16``. The registry
 #: exists so a future preset with a different vocab is a one-line deliberate
 #: change, not a silent re-wire — and ``tests/test_vocab_seam.py`` pins the
 #: exact membership.

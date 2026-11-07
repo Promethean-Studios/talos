@@ -2,15 +2,17 @@
 
 ``talos_1b`` (primary), ``talos_1b_21l`` and ``talos_1b_spec16``.
 
-Architecture (all, verbatim owner spec): vocab **32,000**, seq **2,048**,
+Architecture (all, verbatim owner spec): seq **2,048**,
 hidden **2,048**, **16 query heads / 4 KV heads (4:1 GQA), head_dim 128**,
 SwiGLU dense FFN, RMSNorm pre-norm, RoPE (theta 1e4), **no biases**, **TIED
 input/output embeddings**, ``initializer_range`` 0.02. The owner's 2026-11-04
 decision makes ``talos_1b`` the **FFN-adjusted** variant: the spec's 16 layers
-with the SwiGLU FFN widened 5,504 -> **7,808** (1,000,933,376 params). The
+with the SwiGLU FFN widened 5,504 -> **7,808**; the owner's 2026-11-07 decision
+raises its vocabulary 32,000 -> **49,152** (**1,036,060,672 params**). The
 earlier depth-adjusted build is preserved as ``talos_1b_21l`` (21 layers at the
-literal FFN 5,504 — 995,973,120 params) and the untouched literal spec as
-``talos_1b_spec16`` (16 layers at FFN 5,504 — 774,440,960 params). The exact
+literal FFN 5,504, vocab 32,000 — 995,973,120 params) and the untouched literal
+spec as ``talos_1b_spec16`` (16 layers at FFN 5,504, vocab 32,000 —
+774,440,960 params). The exact
 counts below are verified on the **meta device** — this file never instantiates
 a 1B model in memory (the CPU box cannot hold a 4 GiB fp32 model; see
 docs/SCALING.md §7 for the memory model).
@@ -20,7 +22,8 @@ What is tested here:
      (model + ``configs.compute`` + ``ModelConfig.param_count_breakdown`` +
      the canonical registry all agree), full tensor-shape assertions on every
      module, no bias parameters anywhere, tied embeddings (no ``lm_head`` key);
-  2. the tokenizer configs pair exactly with their models (32,000) and the
+  2. the tokenizer configs pair exactly with their models (49,152 for
+     ``talos_1b``, 32,000 for its siblings) and the
      pairing guard refuses the canonical 1024 config (the full seam coverage
      lives in ``tests/test_vocab_seam.py``);
   3. the functional suite runs on a small-dim config exercising the SAME
@@ -74,13 +77,21 @@ from scripts.train_oasst1 import (
 )
 from tests.fixture_corpus import FIXTURE_CORPUS
 
-#: talos_1b — the owner's 2026-11-04 FFN-adjusted primary (16 layers, FFN 7,808).
-TALOS_1B_PARAMS = 1_000_933_376
+#: talos_1b — the owner's 2026-11-04 FFN-adjusted primary (16 layers, FFN 7,808)
+#: at the owner's 2026-11-07 vocabulary of 49,152.
+TALOS_1B_PARAMS = 1_036_060_672
 #: talos_1b_21l — the earlier depth-adjusted build (21 layers, FFN 5,504).
 TALOS_1B_21L_PARAMS = 995_973_120
 #: talos_1b_spec16 — the literal 16-layer spec (FFN 5,504).
 TALOS_1B_SPEC16_PARAMS = 774_440_960
-TALOS_1B_VOCAB = 32_000
+#: Per-preset vocabulary: the owner's 2026-11-07 decision moved ONLY the primary
+#: ``talos_1b`` to 49,152 (the ``talos_1b_49k`` asset); the two siblings keep
+#: 32,000 and every other spec.
+TALOS_1B_VOCABS = {
+    "talos_1b": 49_152,
+    "talos_1b_21l": 32_000,
+    "talos_1b_spec16": 32_000,
+}
 LOGIT_ATOL = 1e-4  # established fp32 guardrail (tests/test_inference.py)
 
 #: (name, builder, exact params, layers, FFN intermediate, per-layer params).
@@ -127,7 +138,7 @@ def test_talos_1b_meta_device_exact_parameter_count(
     assert estimate(cfg).total_params == expected
     assert cfg.param_count_breakdown()["total"] == expected
     assert cfg.param_count_breakdown()["lm_head"] == 0  # tied: no separate head
-    assert CANONICAL_PRESETS[resolve_preset(cfg)] == (expected, TALOS_1B_VOCAB)
+    assert CANONICAL_PRESETS[resolve_preset(cfg)] == (expected, TALOS_1B_VOCABS[name])
     assert resolve_preset(cfg) == name
     assert expected_params(cfg) == expected
     # Analytic per-layer arithmetic from the preset docstrings.
@@ -135,8 +146,9 @@ def test_talos_1b_meta_device_exact_parameter_count(
     assert cfg.intermediate_size == ffn
     assert cfg.param_count_breakdown()["per_layer_attention"] == 10_485_760
     assert cfg.param_count_breakdown()["per_layer_ffn"] == 3 * 2048 * ffn
-    assert cfg.param_count_breakdown()["embedding"] == TALOS_1B_VOCAB * 2048 == 65_536_000
-    assert 65_536_000 + cfg.num_layers * layer_params + 2048 == expected
+    embedding = TALOS_1B_VOCABS[name] * 2048  # tied: V·H, one copy
+    assert cfg.param_count_breakdown()["embedding"] == embedding
+    assert embedding + cfg.num_layers * layer_params + 2048 == expected
 
 
 @pytest.mark.parametrize(
@@ -179,7 +191,7 @@ def test_talos_1b_meta_device_shapes_and_no_bias_and_tied(
     assert tuple(ffn_mod.gate_proj.weight.shape) == (ffn, 2048)
     assert tuple(ffn_mod.up_proj.weight.shape) == (ffn, 2048)
     assert tuple(ffn_mod.down_proj.weight.shape) == (2048, ffn)
-    assert tuple(model.embed_tokens.weight.shape) == (TALOS_1B_VOCAB, 2048)
+    assert tuple(model.embed_tokens.weight.shape) == (TALOS_1B_VOCABS[name], 2048)
     assert tuple(model.final_norm.weight.shape) == (2048,)
     assert model.lm_head is None  # tied embeddings
 
@@ -221,20 +233,27 @@ def test_talos_1b_primary_is_the_ffn_adjusted_variant() -> None:
                     "tie_word_embeddings", "layer_norm_eps", "intermediate_size")
         if getattr(primary, f) != getattr(literal, f)
     }
-    assert diffs == {"intermediate_size"}, f"primary moved more than the FFN: {diffs}"
+    # The primary differs from the literal spec on exactly two axes: the FFN
+    # width (owner, 2026-11-04) and the vocabulary (owner, 2026-11-07).
+    assert diffs == {"intermediate_size", "vocab_size"}, (
+        f"primary moved beyond the FFN + vocab decisions: {diffs}"
+    )
     # The preserved depth-adjusted preset is the old primary, unchanged.
     assert depth_adj.num_layers == 21 and depth_adj.intermediate_size == 5504
     assert primary.param_count_breakdown()["total"] == TALOS_1B_PARAMS
     assert depth_adj.param_count_breakdown()["total"] == TALOS_1B_21L_PARAMS
-    # The new primary is the closest to the 1B mark of the three.
-    assert abs(TALOS_1B_PARAMS - 1_000_000_000) < abs(TALOS_1B_21L_PARAMS - 1_000_000_000)
+    # With vocab 49,152 the primary now clears the 1B mark (+3.6%); the
+    # 21-layer depth build stays just under it (−0.4%).
+    assert TALOS_1B_PARAMS > 1_000_000_000
+    assert TALOS_1B_21L_PARAMS < 1_000_000_000
+    assert abs(TALOS_1B_PARAMS - 1_000_000_000) / 1_000_000_000 < 0.05
 
 
 def test_talos_1b_config_flags() -> None:
     """Every knob from the owner's spec is present on the derived configs."""
     for name, builder, expected, layers, ffn, layer_params in TALOS_1B_VARIANTS:
         cfg = builder().derive()
-        assert cfg.vocab_size == TALOS_1B_VOCAB, name
+        assert cfg.vocab_size == TALOS_1B_VOCABS[name], name
         assert cfg.max_seq_len == 2048, name
         assert cfg.hidden_size == 2048, name
         assert cfg.num_layers == layers, name
@@ -250,19 +269,22 @@ def test_talos_1b_config_flags() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 2. Tokenizer pairing (32,000 guard; the broad seam coverage is test_vocab_seam)
+# 2. Tokenizer pairing (49K/32K guard; broad seam coverage is test_vocab_seam)
 # ---------------------------------------------------------------------------
 def test_talos_1b_tokenizer_config_pairing() -> None:
-    """TokenizerConfigs are vocab 32,000 and refuse an incompatible pairing."""
+    """TokenizerConfigs match their preset vocab and refuse a bad pairing."""
     for name, builder, *_ in TALOS_1B_VARIANTS:
         tok = preset_tokenizer_config(name)
         model = builder()
-        assert tok.vocab_size == TALOS_1B_VOCAB == model.vocab_size
+        assert tok.vocab_size == TALOS_1B_VOCABS[name] == model.vocab_size
         # The ≤ model-compat contract still holds (trained assets may use fewer
         # merge slots, never more).
         assert tok.vocab_size <= model.vocab_size
-        # max_merges arithmetic: 32,000 = 256 bytes + 4 specials + merge slots.
-        assert tok.max_merges() == TALOS_1B_VOCAB - 256 - 4 == 31_740
+        # max_merges arithmetic: V = 256 bytes + 4 specials + merge slots.
+        # 32,000 -> 31,740 merge slots; 49,152 -> 48,892.
+        assert tok.max_merges() == TALOS_1B_VOCABS[name] - 256 - 4
+        expected_merges = 48_892 if TALOS_1B_VOCABS[name] == 49_152 else 31_740
+        assert tok.max_merges() == expected_merges
 
 
 

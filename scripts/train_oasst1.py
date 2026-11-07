@@ -1771,15 +1771,16 @@ def make_arg_parser() -> argparse.ArgumentParser:
                         "still recorded from the manifest).")
     p.add_argument("--tokenizer-asset", default=None, metavar="NAME",
                    help="load a COMMITTED tokenizer asset from "
-                        "assets/tokenizers/ (e.g. 'talos_1b_32k') instead of "
+                        "assets/tokenizers/ (e.g. 'talos_1b_49k') instead of "
                         "training BPE from --data or reading --tokenizer-json. "
                         "The asset's sha256 is verified against "
                         "assets/tokenizers/MANIFEST.json and its vocab must pair "
-                        "with --preset. The 1B presets (talos_1b / "
-                        "talos_1b_spec16) select their 32,000-vocab asset "
-                        "automatically (this flag is then only needed to be "
-                        "explicit); the canonical tiny presets own no committed "
-                        "asset and reject it.")
+                        "with --preset. Each 1B preset selects its own asset "
+                        "automatically (talos_1b -> talos_1b_49k, vocab 49,152; "
+                        "talos_1b_21l / talos_1b_spec16 -> talos_1b_32k, vocab "
+                        "32,000), so this flag is only needed to be explicit; "
+                        "the canonical tiny presets own no committed asset and "
+                        "reject it.")
     # training
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--seq", type=int, default=None,
@@ -2163,8 +2164,9 @@ def train_run(args: argparse.Namespace) -> dict:
     cfg = ALL_PRESETS[preset]().derive()
 
     # ---- tokenizer ASSET selection (Talos 1B track) ------------------------
-    # The 1B presets own a committed 32,000-vocab tokenizer asset
-    # (assets/tokenizers/, sha256-pinned in MANIFEST.json); the canonical tiny
+    # Each 1B preset owns a committed tokenizer asset (assets/tokenizers/,
+    # sha256-pinned in MANIFEST.json; 49K for talos_1b, 32K for its siblings);
+    # the canonical tiny
     # family trains its vocab-1024 tokenizer inside the run. Resolving the
     # asset HERE — before the data step — means the packed-corpus manifest
     # check, the out_dir sidecar copy and every checkpoint fingerprint all see
@@ -2173,8 +2175,9 @@ def train_run(args: argparse.Namespace) -> dict:
     tokenizer_asset = getattr(args, "tokenizer_asset", None)
     asset_record = None
     if tokenizer_asset is None:
-        # Preset-owned default: 'talos_1b'/'talos_1b_spec16' -> the 32K asset;
-        # the tiny family -> None (train in-run, unchanged behaviour).
+        # Preset-owned default, resolved from the manifest's ``presets`` lists:
+        # 'talos_1b' -> the 49K asset, 'talos_1b_21l'/'talos_1b_spec16' -> the
+        # 32K asset; the tiny family -> None (train in-run, unchanged).
         tokenizer_asset = asset_for_preset(preset)
     if tokenizer_asset:
         assert_asset_preset_pairing(tokenizer_asset, preset)
@@ -2408,7 +2411,8 @@ def train_run(args: argparse.Namespace) -> dict:
 
     # Uniform vocab contract (tokenizer/assets.py): a realized tokenizer's vocab
     # must fit inside the preset model's embedding rows -- and for the Talos 1B
-    # track it must match EXACTLY (32,000), because a 1024-vocab tokenizer
+    # track it must match EXACTLY (49,152 for talos_1b; 32,000 for 21l/spec16),
+    # because a 1024-vocab tokenizer
     # satisfies "<=" but is precisely the silent reuse the owner forbade. Packed
     # rows are additionally range-checked per batch against the model vocab, and
     # the manifest's vocab_size_bound is verified by load_packed_manifest.

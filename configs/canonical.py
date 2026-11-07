@@ -19,12 +19,13 @@ The **tiny family** (the original four-scale ladder, vocab 1024):
   step (hidden 1024 × 6 layers; the audit §13 candidate — see
   :func:`configs.presets.tiny_100m_config` for the arithmetic).
 
-The **Talos 1B track** (owner-directed 2026-10, vocab 32,000 — a deliberate
-divergence from the 1024 constant, tied embeddings):
+The **Talos 1B track** (owner-directed 2026-10; vocabulary decided per preset,
+tied embeddings):
 
-* ``talos_1b``       -> exactly  1,000,933,376 params (vocab 32,000) — the
+* ``talos_1b``       -> exactly  1,036,060,672 params (vocab **49,152**) — the
   owner's 1B spec with the **FFN** adjusted to 7,808 (16 layers, the owner's
-  2026-11-04 decision: the FFN-adjusted variant is the primary 1B);
+  2026-11-04 decision: the FFN-adjusted variant is the primary 1B) and the
+  vocabulary raised from 32,000 on 2026-11-07 (the ``talos_1b_49k`` asset);
 * ``talos_1b_21l``   -> exactly    995,973,120 params (vocab 32,000) — the
   earlier depth-adjusted build (21 layers, literal FFN 5,504);
 * ``talos_1b_spec16``-> exactly    774,440,960 params (vocab 32,000) — the
@@ -49,16 +50,18 @@ from model.config import ModelConfig
 #: preset name -> (canonical parameter count, canonical vocab size).
 #: The four tiny-family entries read the single source of truth
 #: (configs.vocab.VOCAB_SIZE) so a deliberate vocab change is one edit, not
-#: four. The three 1B entries record their own 32,000 vocab inline: their token
-#: configs define a separate, deliberately-larger vocabulary track and
-#: ``tests/test_vocab_seam.py`` pins that divergence explicitly.
+#: four. The 1B entries record their own real-tokenizer vocabulary inline: they
+#: define a separate, deliberately-larger vocabulary track (49,152 for the
+#: primary ``talos_1b`` per the owner's 2026-11-07 decision; 32,000 for the two
+#: siblings) and ``tests/test_vocab_seam.py`` pins that divergence explicitly.
+TALOS_1B_PRIMARY_VOCAB_SIZE = 49_152
 TALOS_1B_VOCAB_SIZE = 32_000
 CANONICAL_PRESETS: dict[str, Tuple[int, int]] = {
     "tiny": (254_272, VOCAB_SIZE),
     "tiny_1m": (1_000_320, VOCAB_SIZE),
     "tiny_10m": (9_952_320, VOCAB_SIZE),
     "tiny_100m": (96_482_304, VOCAB_SIZE),
-    "talos_1b": (1_000_933_376, TALOS_1B_VOCAB_SIZE),
+    "talos_1b": (1_036_060_672, TALOS_1B_PRIMARY_VOCAB_SIZE),
     "talos_1b_21l": (995_973_120, TALOS_1B_VOCAB_SIZE),
     "talos_1b_spec16": (774_440_960, TALOS_1B_VOCAB_SIZE),
 }
