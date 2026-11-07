@@ -12,6 +12,7 @@ read straight from the repo (a committed file — no HF network access).
 """
 from __future__ import annotations
 
+import inspect
 import json
 import os
 
@@ -309,7 +310,7 @@ def test_prepare_corpus_truncates_when_stream_ends(tmp_path, corpus) -> None:
     assert meta["counts"]["total_tokens"] < meta["counts"]["target_tokens"]
 
 
-def test_hf_reader_accepts_config_kwarg_with_dataset_object() -> None:
+def test_hf_reader_accepts_config_kwarg_with_dataset_object(monkeypatch) -> None:
     """HuggingFaceReader forwards config for string ids; objects still work."""
     datasets = pytest.importorskip("datasets")
     ds = datasets.Dataset.from_dict({"text": ["hello world", "second doc"]})
@@ -324,7 +325,7 @@ def test_hf_reader_accepts_config_kwarg_with_dataset_object() -> None:
         {"type": "huggingface", "dataset": ds, "config": "sample-10BT"}
     )
     assert [r["text"] for r in via_config] == ["hello world", "second doc"]
-    # String ids go through load_dataset(..., config=...): assert the kwarg
+    # String ids go through load_dataset(..., name=...): assert the kwarg
     # reaches the loader by stubbing it (no network).
     calls: dict = {}
 
@@ -332,10 +333,11 @@ def test_hf_reader_accepts_config_kwarg_with_dataset_object() -> None:
         calls.update(args=args, kwargs=kwargs)
         return ds
 
-    datasets.load_dataset = fake_load  # type: ignore[method-assign]
+    monkeypatch.setattr(datasets, "load_dataset", fake_load)
     HuggingFaceReader("SomeOrg/fake", config="sample-10BT")
     assert calls["args"][0] == "SomeOrg/fake"
-    assert calls["kwargs"]["config"] == "sample-10BT"
+    assert calls["kwargs"]["name"] == "sample-10BT"
+    assert "config" not in calls["kwargs"]
     assert calls["kwargs"]["streaming"] is True
 
 
@@ -646,4 +648,74 @@ def test_cli_49k_uint16_end_to_end(tmp_path, monkeypatch) -> None:
     data = _load_phase(out, "train")
     assert data.dtype == np.uint16
     assert int(data.max()) < TALOS_1B_49K_VOCAB
+
+
+# --------------------------------------------------------------------------- #
+# load_dataset kwarg contract: the config name is forwarded as ``name=``.
+#
+# ``datasets.load_dataset()`` has no ``config`` parameter — the dataset
+# configuration is ``name``. Forwarding ``config=`` leaked the stray kwarg into
+# the builder config and killed the owner's pre-flight run with
+# ``BuilderConfig ParquetConfig(name='default', ...) doesn't have a 'config' key``
+# on both datasets 5.0.1 and 5.1.0, so it was never version drift.
+# No network here: ``load_dataset`` is replaced by a spy.
+# --------------------------------------------------------------------------- #
+
+def test_hf_reader_forwards_config_as_load_dataset_name(monkeypatch) -> None:
+    """config -> ``name=`` (never ``config=``); revision/streaming unchanged."""
+    datasets = pytest.importorskip("datasets")
+    from data.readers import HuggingFaceReader
+
+    seen: list[tuple[tuple, dict]] = []
+
+    def spy_load_dataset(*args, **kwargs):
+        seen.append((args, dict(kwargs)))
+        return datasets.Dataset.from_dict({"text": ["hello world"]})
+
+    monkeypatch.setattr(datasets, "load_dataset", spy_load_dataset)
+    reader = HuggingFaceReader(
+        "HuggingFaceFW/fineweb-edu",
+        split="train",
+        config="sample-10BT",
+        revision="abc123",
+    )
+
+    assert len(seen) == 1
+    args, kwargs = seen[0]
+    assert args == ("HuggingFaceFW/fineweb-edu",)
+    assert kwargs["name"] == "sample-10BT"
+    assert "config" not in kwargs
+    assert kwargs["revision"] == "abc123"
+    assert kwargs["split"] == "train"
+    assert kwargs["streaming"] is True
+    assert [r["text"] for r in reader] == ["hello world"]
+
+
+def test_hf_reader_omits_optional_load_dataset_kwargs(monkeypatch) -> None:
+    """No config/revision means no name=/revision= keys at all."""
+    datasets = pytest.importorskip("datasets")
+    from data.readers import HuggingFaceReader
+
+    seen: list[tuple[tuple, dict]] = []
+
+    def spy_load_dataset(*args, **kwargs):
+        seen.append((args, dict(kwargs)))
+        return datasets.Dataset.from_dict({"text": ["x"]})
+
+    monkeypatch.setattr(datasets, "load_dataset", spy_load_dataset)
+    HuggingFaceReader("HuggingFaceFW/fineweb-edu", streaming=False)
+
+    _, kwargs = seen[0]
+    assert "name" not in kwargs
+    assert "config" not in kwargs
+    assert "revision" not in kwargs
+    assert kwargs["streaming"] is False
+
+
+def test_load_dataset_signature_takes_name_not_config() -> None:
+    """Pin the upstream contract the fix relies on (catches a future datasets bump)."""
+    datasets = pytest.importorskip("datasets")
+    params = inspect.signature(datasets.load_dataset).parameters
+    assert "name" in params
+    assert "config" not in params
 
