@@ -583,6 +583,40 @@ def make_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _tokenizer_block(
+    *,
+    tokenizer_json: Optional[str],
+    tok_orig: Dict[str, Any],
+    tok_file: Any,
+    sha_resolved: Optional[str],
+    tok_vocab: Any,
+    tok_merges: Any,
+) -> Dict[str, Any]:
+    """Rebuild the metadata ``tokenizer`` block without dropping provenance.
+
+    The core facts (path / sha256 / realized vocab_size / merge_count) are the
+    resolved, cross-checked values. Any *other* key the original metadata
+    recorded — e.g. ``configured_vocab_size`` and ``exact_bpe``, which
+    ``prepare_corpus`` records so a corpus can be verified against the exact
+    tokenizer asset later — is carried over verbatim, so a recovered manifest
+    keeps the full provenance block instead of silently narrowing it. When the
+    real ``--tokenizer-json`` is available it is authoritative for those two
+    facts.
+    """
+    block: Dict[str, Any] = {
+        "path": (os.path.abspath(tokenizer_json) if tokenizer_json else tok_orig.get("path")),
+        "sha256": sha_resolved,
+        "vocab_size": tok_vocab,
+        "merge_count": tok_merges,
+    }
+    for key, value in tok_orig.items():
+        block.setdefault(key, value)
+    if tok_file is not None:
+        block["configured_vocab_size"] = int(tok_file.config.vocab_size)
+        block["exact_bpe"] = bool(getattr(tok_file, "exact_bpe", False))
+    return block
+
+
 def recover_manifest(
     packed_dir: str,
     *,
@@ -695,6 +729,7 @@ def recover_manifest(
     # ---- 4) sources: real tokenizer file / run checkpoint / sibling
     #              run_metadata.json (auto-discovered) ------------------------
     records: List[Dict[str, Any]] = []
+    tok_file: Optional[ByteLevelBPETokenizer] = None
     if tokenizer_json:
         if not os.path.isfile(tokenizer_json):
             raise RecoveryError(f"--tokenizer-json not found: {tokenizer_json}")
@@ -704,12 +739,15 @@ def recover_manifest(
         )
 
         tok = ByteLevelBPETokenizer.from_file(tokenizer_json)
+        tok_file = tok  # kept for the tokenizer block written below
         records.append(
             {
                 "_source": "tokenizer-json",
                 "sha256": tokenizer_file_sha256(tokenizer_json),
                 "vocab_size": tok.vocab_size,
                 "merge_count": tok.merge_count,
+                "configured_vocab_size": int(tok.config.vocab_size),
+                "exact_bpe": bool(getattr(tok, "exact_bpe", False)),
                 "eos_id": int(tok.eos_id),
                 "pad_id": int(tok.pad_id),
             }
@@ -933,12 +971,14 @@ def recover_manifest(
             "revision": _ds_orig.get("revision"),
             "sha": _ds_orig.get("sha"),
         },
-        "tokenizer": {
-            "path": (os.path.abspath(tokenizer_json) if tokenizer_json else _tok_orig.get("path")),
-            "sha256": sha_resolved,
-            "vocab_size": tok_vocab,
-            "merge_count": tok_merges,
-        },
+        "tokenizer": _tokenizer_block(
+            tokenizer_json=tokenizer_json,
+            tok_orig=_tok_orig,
+            tok_file=tok_file,
+            sha_resolved=sha_resolved,
+            tok_vocab=tok_vocab,
+            tok_merges=tok_merges,
+        ),
         "packing": {
             "seq": seq_len,
             "eos_id": eos_resolved,

@@ -259,7 +259,11 @@ class HuggingFaceReader(DatasetReader):
 
     ``config`` selects a named dataset configuration (e.g. ``"sample-10BT"``
     for ``HuggingFaceFW/fineweb-edu``); ``revision`` pins a git revision of
-    the dataset. Both are forwarded to ``load_dataset`` only for string ids.
+    the dataset. Both are forwarded to ``load_dataset`` only for string ids —
+    ``config`` as its ``name=`` parameter (``load_dataset`` has no ``config``
+    kwarg: passing one leaks into the builder config and raises
+    ``BuilderConfig ... doesn't have a 'config' key``), ``revision`` as
+    ``revision=``.
     """
 
     def __init__(
@@ -276,7 +280,11 @@ class HuggingFaceReader(DatasetReader):
         if isinstance(dataset, str):
             kwargs: Dict[str, Any] = {"split": split, "streaming": streaming}
             if config is not None:
-                kwargs["config"] = config
+                # ``load_dataset`` names the dataset configuration ``name``;
+                # a ``config=`` kwarg is not in its signature and gets folded
+                # into the builder config, which has no ``config`` attribute
+                # (``BuilderConfig ... doesn't have a 'config' key``).
+                kwargs["name"] = config
             if revision is not None:
                 kwargs["revision"] = revision
             self._data = self._ds.load_dataset(dataset, **kwargs)
