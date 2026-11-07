@@ -42,19 +42,21 @@ biases, FP32.
 The counts are enforced by `configs/canonical.py` and asserted by the tests, so
 a drift fails CI rather than quietly changing the model.
 
-### Talos 1B (vocab 32,000 track, tied embeddings)
+### Talos 1B (tied embeddings; vocab 49,152 primary / 32,000 siblings)
 
-Common architecture: vocab 32,000 · max sequence 2,048 · hidden 2,048 ·
+Common architecture: max sequence 2,048 · hidden 2,048 ·
 16 query / 4 KV heads (4:1 GQA) · head_dim 128 · RMSNorm pre-norm · RoPE ·
 SwiGLU dense FFN · no biases · **tied** input/output embeddings · SDPA with a
 plain functional fallback · BF16/FP16 AMP, gradient checkpointing and gradient
-accumulation available as opt-in trainer flags.
+accumulation available as opt-in trainer flags. Vocabulary: **49,152** for the
+primary `talos_1b` (owner decision 2026-11-07), **32,000** for `talos_1b_21l`
+and `talos_1b_spec16`.
 
 | preset | layers | FFN | parameters | note |
 |---|---:|---:|---:|---|
-| `talos_1b` | 16 | 7,808 | **1,000,933,376** | **primary** — the owner's FFN-adjusted 1B (2026-11-04) |
-| `talos_1b_21l` | 21 | 5,504 | **995,973,120** | earlier depth-adjusted variant, preserved |
-| `talos_1b_spec16` | 16 | 5,504 | **774,440,960** | the literal 16-layer spec |
+| `talos_1b` | 16 | 7,808 | **1,036,060,672** | **primary** — the owner's FFN-adjusted 1B (2026-11-04) at vocab 49,152 (2026-11-07) |
+| `talos_1b_21l` | 21 | 5,504 | **995,973,120** | earlier depth-adjusted variant, preserved (vocab 32,000) |
+| `talos_1b_spec16` | 16 | 5,504 | **774,440,960** | the literal 16-layer spec (vocab 32,000) |
 
 These are **architecture, not results**: the presets are validated on the meta
 device (the dev box cannot hold a 1B fp32 model), and no training run has been
@@ -65,8 +67,8 @@ memory arithmetic.
 
 | asset | vocab | encoder | paired with | status |
 |---|---:|---|---|---|
-| `talos_1b_32k` (**v2**) | 32,000 | exact BPE | `talos_1b`, `talos_1b_21l`, `talos_1b_spec16` | **primary** for the 1B presets |
-| `talos_1b_49k` | 49,152 | exact BPE | none (`asset_only`) | **experimental, unpaired** alternative |
+| `talos_1b_49k` | 49,152 | exact BPE | `talos_1b` | **primary** 1B tokenizer (owner decision 2026-11-07) |
+| `talos_1b_32k` (**v2**) | 32,000 | exact BPE | `talos_1b_21l`, `talos_1b_spec16` | paired with the two 32K siblings |
 | vocab-1024 BPE | 1,024 | legacy heap encoder (retained) | trained inside each canonical run | unchanged workflow for 254K/1M/10M/100M |
 
 `talos_1b_32k` v2 is trained on a documented 16,000-row FineWeb-Edu sample
@@ -76,19 +78,20 @@ a 200-row held-out slice and 4.5195 on a 1,000-row held-out slice**, versus
 tokens**. Higher chars/token is better. `talos_1b_49k` measures 4.6411 / 4.6525
 (−4.73% / −4.84% tokens vs v1, ~3% fewer tokens than the 32K v2).
 
-Whether the 1B model moves to a 49,152 vocab (which would make it ≈1,036M
-parameters, replacing the owner-ratified 1,000,933,376 count) is an **open owner
-decision** — the 49K asset is built and guarded, but it is not planned and not
-rejected.
+**The owner decided the 1B vocabulary on 2026-11-07:** the primary `talos_1b`
+moves to vocab 49,152 with `talos_1b_49k` (**1,036,060,672 params**), while
+`talos_1b_21l` (995,973,120) and `talos_1b_spec16` (774,440,960) keep vocab
+32,000 and `talos_1b_32k`. Both assets are sha256-pinned and unchanged.
 
 Two rules that matter in practice:
 
 1. **Assets are sha256-verified at load time**, and a tokenizer must pair with
-   its model exactly (the 32K asset refuses every canonical preset; a
-   1,024-vocab tokenizer refuses every 1B preset). Mismatches fail loudly.
+   its model exactly (the 1B assets refuse every canonical preset; a
+   1,024-vocab tokenizer refuses every 1B preset; `talos_1b_49k` and
+   `talos_1b_32k` refuse each other's presets). Mismatches fail loudly.
 2. **Any dataset tokenized with a different tokenizer — including the old
-   1,024-vocab one *and* datasets built with 32K v1 — must be regenerated
-   before use with the 32K v2 asset.** The pairing guard refuses mismatched IDs
+   1,024-vocab one, 32K v1, and the 32K asset itself once you train `talos_1b`
+   — must be regenerated before use.** The pairing guard refuses mismatched IDs
    rather than silently training on them.
 
 Details: [`docs/tokenizer.md`](docs/tokenizer.md).

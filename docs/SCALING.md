@@ -424,9 +424,11 @@ such.
 
 ### 7.1 Architecture (the owner's spec)
 
-vocab **32,000** · seq **2,048** · hidden **2,048** · **16 query heads / 4 KV
+seq **2,048** · hidden **2,048** · **16 query heads / 4 KV
 heads (4:1 GQA)** · **head_dim 128** · SwiGLU dense FFN · RMSNorm pre-norm ·
 RoPE (theta 1e4) · **no biases** · **TIED input/output embeddings** ·
+vocab **49,152** for the primary ``talos_1b`` (owner decision 2026-11-07) and
+**32,000** for ``talos_1b_21l`` / ``talos_1b_spec16`` ·
 ``initializer_range`` 0.02. The literal spec's FFN is **5,504** (2.6875×
 hidden); its 16 layers compute to ≈774M, ~23% under the 1B target. The owner
 pre-authorized adjusting dimensions and, on **2026-11-04, chose the FFN axis**:
@@ -435,14 +437,16 @@ pre-authorized adjusting dimensions and, on **2026-11-04, chose the FFN axis**:
 
 | preset | layers | FFN | exact params | rationale |
 |---|---:|---:|---:|---|
-| ``talos_1b`` | 16 | 7,808 | **1,000,933,376** | **primary** — the owner's 2026-11-04 FFN-adjusted variant (≈1,000.9M) |
+| ``talos_1b`` | 16 | 7,808 | **1,036,060,672** | **primary** — the owner's 2026-11-04 FFN-adjusted variant (≈1,036.1M) at the owner's 2026-11-07 vocab 49,152 |
 | ``talos_1b_21l`` | 21 | 5,504 | **995,973,120** | the earlier depth-adjusted build, preserved unchanged |
 | ``talos_1b_spec16`` | 16 | 5,504 | **774,440,960** | the literal 16-layer spec |
 
 **Parameter arithmetic** (identical code path as ``ModelConfig.param_count_breakdown``,
 all three of meta-device model count / ``configs.compute`` / breakdown agree):
 
-- embedding (TIED, one copy — no lm_head) = ``V·H`` = 32,000·2,048 = **65,536,000**
+- embedding (TIED, one copy — no lm_head) = ``V·H``: 49,152·2,048 =
+  **100,663,296** for ``talos_1b``; 32,000·2,048 = **65,536,000** for
+  ``talos_1b_21l`` / ``talos_1b_spec16``
 - per layer:
   - attention = ``H·H + 2·H·(kv·d) + H·H`` = 2,048² + 2·(2,048·512) + 2,048²
     = 4,194,304 + 2,097,152 + 4,194,304 = **10,485,760**
@@ -451,7 +455,7 @@ all three of meta-device model count / ``configs.compute`` / breakdown agree):
     **33,816,576** at I = 5,504
   - per layer = **58,462,208** (I = 7,808) / **44,306,432** (I = 5,504)
 - final norm = **2,048**
-- ``talos_1b``: 65,536,000 + 16·58,462,208 + 2,048 = **1,000,933,376**
+- ``talos_1b``: 100,663,296 + 16·58,462,208 + 2,048 = **1,036,060,672**
 - ``talos_1b_21l``: 65,536,000 + 21·44,306,432 + 2,048 = **995,973,120**
 - ``talos_1b_spec16``: 65,536,000 + 16·44,306,432 + 2,048 = **774,440,960**
 
@@ -461,7 +465,7 @@ Weights are 2 bytes/param (fp16 or bf16 — same footprint):
 
 | preset | weights (fp16) | KV cache / token | KV @ 2,048 tokens | **total @ 2,048 tok** |
 |---|---:|---:|---:|---:|
-| ``talos_1b`` | 2,001,866,752 B ≈ **1.86 GiB** | 32,768 B (32 KiB) | 67,108,864 B ≈ **64.0 MiB** | ≈ **1.93 GiB** |
+| ``talos_1b`` | 2,072,121,344 B ≈ **1.93 GiB** | 32,768 B (32 KiB) | 67,108,864 B ≈ **64.0 MiB** | ≈ **1.99 GiB** |
 | ``talos_1b_21l`` | 1,991,946,240 B ≈ **1.86 GiB** | 43,008 B (42 KiB) | 88,080,384 B ≈ **84.0 MiB** | ≈ **1.94 GiB** |
 | ``talos_1b_spec16`` | 1,548,881,920 B ≈ **1.44 GiB** | 32,768 B (32 KiB) | 67,108,864 B ≈ **64.0 MiB** | ≈ **1.51 GiB** |
 
@@ -471,9 +475,10 @@ bytes/token (16 L → 32,768 B/token; 21 L → 43,008 B/token). At a full
 2,048-token sequence (batch 1): **64.0 MiB** (16 L) / **84.0 MiB** (21 L).
 
 Add activations: hidden states ≈ a few × ``seq·hidden`` (2,048·2,048·2 B ≈
-8 MiB each live tensor at fp16) plus full-sequence logits 32,000·2,048·2 B ≈
-**125 MiB** (fp16; chunkable). **Verdict: 1B inference is comfortably
-T4-feasible at fp16** — ≈2.1–2.3 GiB total, well inside 16 GB. (SDPA math
+8 MiB each live tensor at fp16) plus full-sequence logits 49,152·2,048·2 B ≈
+**192 MiB** (fp16; chunkable; 125 MiB at the siblings' 32,000 vocab).
+**Verdict: 1B inference is comfortably
+T4-feasible at fp16** — ≈2.1–2.4 GiB total, well inside 16 GB. (SDPA math
 attention avoids materializing the 2048² scores; the plain chunked fallback
 exists but is not needed here.)
 
@@ -503,7 +508,7 @@ memory plan should be sized against.)
 
 | preset | params | fp32-only 16 B/p | mixed 18 B/p | activations* (seq 2048, B=1) no-ckpt / ckpt | + logits (fp32) |
 |---|---:|---:|---:|---:|---:|
-| ``talos_1b`` | 1,000,933,376 | ≈ **14.92 GiB** | ≈ **16.78 GiB** | ≈ 1.1 GiB / ≈ 0.27 GiB | 262 MB |
+| ``talos_1b`` | 1,036,060,672 | ≈ **15.44 GiB** | ≈ **17.37 GiB** | ≈ 1.1 GiB / ≈ 0.27 GiB | 402 MB |
 | ``talos_1b_21l`` | 995,973,120 | ≈ **14.84 GiB** | ≈ **16.70 GiB** | ≈ 1.4 GiB / ≈ 0.35 GiB | 262 MB |
 | ``talos_1b_spec16`` | 774,440,960 | ≈ **11.54 GiB** | ≈ **12.98 GiB** | ≈ 1.1 GiB / ≈ 0.27 GiB | 262 MB |
 
@@ -511,11 +516,12 @@ memory plan should be sized against.)
 K ≈ 4 live tensors per layer without checkpointing (norm copy + post-attn
 residual + FFN inputs ≈ 4 × 2048·2048·4 B ≈ 67 MB/layer) and K ≈ 1 with
 **gradient checkpointing** (only the layer input kept ≈ 17 MB/layer; the rest
-is recomputed in the backward — roughly one extra forward pass). The 32,000×
-2,048 logits (262 MB fp32, 125 MiB fp16) sit on top and can be chunked.
+is recomputed in the backward — roughly one extra forward pass). The
+49,152×2,048 logits of ``talos_1b`` (402 MB fp32, 192 MiB fp16; 262 MB / 125 MiB
+at the siblings' 32,000 vocab) sit on top and can be chunked.
 
 **T4 (16 GB) verdict — explicit:** a 1B variant **cannot be trained on a T4**
-in this layout: ``talos_1b`` alone needs ≈16.8 GiB of weights+optimizer state
+in this layout: ``talos_1b`` alone needs ≈17.4 GiB of weights+optimizer state
 before activations and CUDA overhead (+0.5–1 GiB); ``talos_1b_spec16`` needs
 ≈13.0 GiB + ~1.4 GiB activations + overhead ≈ 15+ GiB — over budget in
 practice (batch ≥ 2 or any fragmentation pushes it out). **Inference on a T4
@@ -537,19 +543,21 @@ ratio, tied embeddings).
 - **None of the presets has been trained, and no 1B checkpoint exists
   anywhere.** The architecture is implemented and tested on the meta device;
   that is the whole of the 1B evidence.
-- The tokenizer is a **committed asset**, not something a run trains:
-  `talos_1b_32k` **version 2** (vocab 32,000, exact-BPE encoder, sha256-pinned)
-  is shared by all three presets. The config seam refuses a mismatched
-  tokenizer (`_assert_tokenizer_model_pairing`; see `tests/test_vocab_seam.py`)
-  and the asset manifest registers exactly the three 1B presets
-  (`tests/test_tokenizer_32k.py`). See `docs/tokenizer.md` §0 for the asset
-  details, the measured held-out compression, and the rule that **any dataset
-  tokenized with a different tokenizer — the old 1,024-vocab one or 32K v1 —
-  must be regenerated before use with v2**.
-- `talos_1b_49k` (vocab 49,152) is a committed **asset-only** option: it pairs
-  with no preset, and whether the 1B model adopts it (which would make
-  `talos_1b` ≈1,036M parameters, replacing the owner-ratified 1,000,933,376) is
-  an **open owner decision**. It is neither planned nor rejected.
+- The tokenizer is a **committed asset**, not something a run trains: the
+  primary `talos_1b` uses `talos_1b_49k` (vocab 49,152), while
+  `talos_1b_21l` / `talos_1b_spec16` use `talos_1b_32k` **version 2** (vocab
+  32,000). Both are exact-BPE, sha256-pinned assets. The config seam refuses a
+  mismatched tokenizer (`_assert_tokenizer_model_pairing`; see
+  `tests/test_vocab_seam.py`) and the asset manifest registers exactly these
+  pairings (`tests/test_tokenizer_32k.py`, `tests/test_tokenizer_49k.py`). See
+  `docs/tokenizer.md` §0 for the asset details, the measured held-out
+  compression, and the rule that **any dataset tokenized with any other
+  tokenizer — the old 1,024-vocab one, 32K v1, or 32K v2 itself for
+  `talos_1b` — must be regenerated before use**.
+- The owner **decided the 1B vocabulary on 2026-11-07**: `talos_1b` moves to
+  49,152, i.e. **1,036,060,672 params** (superseding the 2026-11-04 figure of
+  1,000,933,376 at vocab 32,000). `talos_1b_21l` and `talos_1b_spec16` keep
+  vocab 32,000 and every other spec.
 - **No 1B benchmark has been run.** `scripts/benchmark_1b.py` exists so the
   owner can measure the 1B presets on their RTX 3060 12 GB (OOM microbatch
   ladder, activation matrix, save→kill→resume verification, inference timing,
