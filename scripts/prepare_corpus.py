@@ -72,7 +72,6 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 import numpy as np
-import torch
 
 # Repo-root packages are importable when this module is run from the repo root
 # (conftest.py does the same for pytest); add the root defensively so the script
@@ -83,7 +82,6 @@ if _REPO_ROOT not in sys.path:
 
 from data._logging import get_logger  # noqa: E402
 from data.readers import DatasetReader, HuggingFaceReader  # noqa: E402
-from model.utils import validate_token_ids  # noqa: E402
 from tokenizer.tokenizer import (  # noqa: E402
     ByteLevelBPETokenizer,
     tokenizer_file_sha256,
@@ -114,8 +112,16 @@ class NpyShardWriter:
     Follows :class:`data.writers.ShardedWriter`'s patterns: numbered shards, a
     row-count cap per shard, an eager doc-count flush (the streaming memory
     bound), and atomic writes (``*.tmp`` + ``os.replace``) so an interrupted
-    run never leaves a half-written shard under its real name. The in-RAM
-    buffer holds at most one shard's rows plus whatever the caller stages.
+    run never leaves a half-written shard under its real name.
+
+    Memory is *pre-allocated and bounded*: one ``(rows_per_shard, seq_len)``
+    buffer is reserved once and rows are copied into it, so the writer never
+    holds more than one shard's worth of tokens and never needs the
+    ``np.stack`` copy the old list-of-rows design required (which momentarily
+    doubled the shard buffer). Copying each row also drops the reference the
+    old code kept to the document-sized array a row was sliced from — a row
+    view used to pin its whole source array for as long as the shard buffer
+    lived.
     """
 
     def __init__(
@@ -138,7 +144,9 @@ class NpyShardWriter:
         self.dtype = dtype
         self.rows_per_shard = rows_per_shard
         self.stream_buffer_docs = stream_buffer_docs
-        self._rows: List[np.ndarray] = []
+        #: Fixed-size row buffer — the writer's entire RAM footprint per shard.
+        self._buffer = np.empty((rows_per_shard, seq_len), dtype=dtype)
+        self._pending = 0
         self._docs_since_flush = 0
         self._index = 0
         self._entries: List[Dict[str, Any]] = []
@@ -151,8 +159,11 @@ class NpyShardWriter:
             raise RuntimeError("writer already closed")
         if row.shape != (self.seq_len,):
             raise ValueError(f"row shape {row.shape} != ({self.seq_len},)")
-        self._rows.append(row)
-        if len(self._rows) >= self.rows_per_shard:
+        if self._pending >= self.rows_per_shard:
+            self._flush()
+        self._buffer[self._pending] = row  # copy: never pin the source array
+        self._pending += 1
+        if self._pending >= self.rows_per_shard:
             self._flush()
 
     def doc_seen(self) -> None:
@@ -171,10 +182,12 @@ class NpyShardWriter:
 
     # -- internals ----------------------------------------------------------
     def _flush(self) -> None:
-        if not self._rows:
+        if self._pending == 0:
             self._docs_since_flush = 0
             return
-        array = np.stack(self._rows)  # (n_rows, seq_len)
+        # A view, not a copy: the pre-allocated buffer already holds the rows
+        # contiguously, so flushing costs no extra shard-sized allocation.
+        array = self._buffer[: self._pending]
         final = os.path.join(self.out_dir, _shard_name(self.phase, self._index))
         tmp = final + ".tmp"
         # np.save appends ".npy" to *paths* unless they already end in ".npy",
@@ -191,7 +204,7 @@ class NpyShardWriter:
                 "tokens_incl_padding": int(array.shape[0]) * self.seq_len,
             }
         )
-        self._rows = []
+        self._pending = 0
         self._docs_since_flush = 0
         self._index += 1
 
@@ -301,15 +314,21 @@ class RegionPacker:
     def _validate_ids(self, arr: np.ndarray, where: str) -> None:
         """Range-check numpy token ids against the loaded tokenizer's bound.
 
-        Delegates to ``model.utils.validate_token_ids`` (the repo's canonical
-        guard) via a zero-copy torch view, with ``self.vocab_bound`` as the
-        exclusive upper bound. torch has no uint16 tensor support, so
-        non-``int32``/``int64`` arrays (the ``uint16`` packed layout) are
-        validated through a small ``int64`` copy first.
+        The check is the repo's canonical one — ``model.utils.validate_token_ids``
+        (two reductions, ``[0, vocab_bound)``, ``ValueError`` naming the id) — but
+        it is *reached* only when numpy says something is actually out of range.
+        Importing ``torch`` costs ~250 MB of resident memory and this process
+        packs a 220M-token corpus on a 4 GB box, so the happy path stays in
+        numpy and the canonical guard is imported (and raises) only on a
+        violation. Valid input therefore behaves exactly as before — no error,
+        no torch import; invalid input still raises the canonical
+        ``ValueError`` from ``validate_token_ids`` itself.
         """
-        if arr.dtype not in (np.dtype(np.int32), np.dtype(np.int64)):
-            arr = arr.astype(np.int64)
-        validate_token_ids(torch.from_numpy(arr), self.vocab_bound, where=where)
+        if arr.size == 0:
+            return
+        if int(arr.min()) >= 0 and int(arr.max()) < self.vocab_bound:
+            return
+        _validate_ids_canonical(arr, self.vocab_bound, where)
 
     def add_doc(self, doc_index: int, text: str) -> None:
         """Encode + pack one document; token id bounds are enforced here."""
@@ -367,6 +386,55 @@ class RegionPacker:
             "first_doc": self.first_doc,
             "last_doc": self.last_doc,
         }
+
+
+def _validate_ids_canonical(arr: np.ndarray, vocab_bound: int, where: str) -> None:
+    """Raise the canonical out-of-range ``ValueError`` (slow path only).
+
+    torch has no uint16 tensor support, so non-``int32``/``int64`` arrays (the
+    ``uint16`` packed layout) are widened to ``int64`` first — the same
+    conversion the pre-fix code always performed. Importing torch here (rather
+    than at module scope) is what keeps ~250 MB of RSS out of the packer.
+    """
+    import torch
+
+    from model.utils import validate_token_ids
+
+    if arr.dtype not in (np.dtype(np.int32), np.dtype(np.int64)):
+        arr = arr.astype(np.int64)
+    validate_token_ids(torch.from_numpy(arr), vocab_bound, where=where)
+
+
+def limit_stream_readahead() -> bool:
+    """Make fsspec file reads pass-through, so a sequential scan retains nothing.
+
+    Why: ``datasets`` streams a remote parquet corpus through ``fsspec``, which
+    opens every source file with ``cache_type="readahead"``. That cache keeps
+    the *last fetched chunk* alive on the file object, and a parquet reader
+    asks for a whole column chunk at a time — measured here at ~26–31 MB per
+    source file. ``datasets`` holds those file objects for the life of the
+    stream, so resident memory grew by one multi-MB buffer per source file,
+    i.e. **unboundedly with progress**: packing 761 M characters (≈15 parquet
+    files) reached 1.12 GB RSS on a 3.9 GB box and the full 220 M-token run was
+    OOM-killed at 1.5 GB. The same run with read-ahead disabled peaked at
+    0.96 GB — the remaining growth is ~0.6 bytes per character streamed, well
+    inside the budget.
+
+    Nothing is lost by disabling it: the packer consumes each file strictly
+    forward, so there is no re-read for a cache to serve. ``fsspec`` resolves
+    cache classes through the plain ``fsspec.caching.caches`` registry at file
+    open time; ``BaseCache`` is its documented pass-through ("doesn't keep
+    anything, calls every time").
+
+    Idempotent and a no-op when fsspec is not installed. Returns ``True`` when
+    the override is in place.
+    """
+    try:
+        import fsspec.caching as caching
+    except ImportError:  # pragma: no cover - fsspec ships with datasets
+        return False
+    caching.caches["readahead"] = caching.BaseCache
+    return caching.caches.get("readahead") is caching.BaseCache
 
 
 def _fetch_hf_dataset_meta(dataset_id: str, config: Optional[str]) -> Dict[str, Any]:
@@ -694,6 +762,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             os.path.basename(tokenizer_path), tokenizer.vocab_size, vocab_bound,
             tokenizer.merge_count, args.dtype,
         )
+        # Bound the streaming reader's resident memory before it opens anything:
+        # fsspec's read-ahead cache would otherwise retain a multi-MB buffer per
+        # source file for the life of the stream (see limit_stream_readahead).
+        if limit_stream_readahead():
+            log.info("streaming reads are pass-through (fsspec read-ahead disabled)")
         reader = HuggingFaceReader(
             args.dataset, split=args.split, text_field=args.text_field,
             streaming=True, config=args.config,
