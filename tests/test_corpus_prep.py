@@ -611,10 +611,11 @@ def test_dtype_help_text_states_the_real_rule() -> None:
 def test_cli_49k_uint16_end_to_end(tmp_path, monkeypatch) -> None:
     """The owner's 1B command line runs: 49K asset + uint16 through the real CLI.
 
-    Only the reader is swapped for a local JSONL source (the CLI's
-    ``HuggingFaceReader`` is the remote default and never touched in tests); every
-    other step — arg parsing, tokenizer load, guard, packing, manifests — is the
-    production path.
+    Only the reader is swapped for a local JSONL source: the CLI is invoked with
+    ``--reader datasets`` so the patched ``HuggingFaceReader`` is actually used
+    (the production default is the remote parquet path, which would hit the real
+    HF dataset — a network dependency CI must not have). Every other step — arg
+    parsing, tokenizer load, guard, packing, manifests — is the production path.
     """
     import scripts.prepare_corpus as prepare_corpus_module
 
@@ -632,6 +633,7 @@ def test_cli_49k_uint16_end_to_end(tmp_path, monkeypatch) -> None:
         "--val-skip-docs", str(VAL_SKIP),
         "--out-dir", out,
         "--no-hf-metadata",
+        "--reader", "datasets",
     ])
     assert rc == 0
     manifest = load_packed_manifest(
