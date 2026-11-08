@@ -318,6 +318,9 @@ class HuggingFaceReader(DatasetReader):
 def _import_pyarrow():
     try:
         import pyarrow  # type: ignore
+        import pyarrow.parquet  # noqa: F401  (ParquetFile lives in the submodule; the
+        # bare ``import pyarrow`` above does not load it, and nothing else in the
+        # bounded path imports ``datasets`` — which is what previously loaded it.)
         return pyarrow
     except ImportError as exc:  # pragma: no cover - optional dep
         raise ImportError(
