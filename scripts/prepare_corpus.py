@@ -66,7 +66,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import resource
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional, Sequence
@@ -81,7 +83,11 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from data._logging import get_logger  # noqa: E402
-from data.readers import DatasetReader, HuggingFaceReader  # noqa: E402
+from data.readers import (  # noqa: E402
+    DatasetReader,
+    HuggingFaceParquetReader,
+    HuggingFaceReader,
+)
 from tokenizer.tokenizer import (  # noqa: E402
     ByteLevelBPETokenizer,
     tokenizer_file_sha256,
@@ -437,6 +443,111 @@ def limit_stream_readahead() -> bool:
     return caching.caches.get("readahead") is caching.BaseCache
 
 
+def _rss_kb() -> Optional[int]:
+    """Resident set size of this process in kB (Linux), or ``None`` elsewhere."""
+    try:
+        with open("/proc/self/statm", "rb") as fh:
+            return int(fh.read().split()[1]) * (os.sysconf("SC_PAGE_SIZE") // 1024)
+    except (OSError, IndexError, ValueError):  # pragma: no cover - non-Linux
+        return None
+
+
+class MemoryProbe:
+    """Sample this process's RSS in a daemon thread and log the peak.
+
+    Corpus packing is the one stage whose failure mode is being OOM-killed by
+    the kernel, which leaves no traceback behind — only a log that stops. This
+    probe turns that into a *measured* curve: one ``mem:`` line every
+    ``interval_s`` seconds carrying the live RSS, the peak, and whatever counters
+    the caller supplies (docs/tokens/chars), so the growth rate per million
+    tokens is visible in the run log.
+
+    Deliberately tiny: one thread doing a ``/proc`` read plus ``log.info``.
+    ``start()``/``stop()`` are idempotent, ``stop()`` is safe to call from a
+    ``finally``, and the thread is a daemon so it can never keep the process
+    alive.
+
+    Args:
+        interval_s: seconds between samples (``<= 0`` disables the thread; the
+            probe then only reports on explicit :meth:`checkpoint` calls).
+        label: prefix for the log lines.
+        stats_fn: optional zero-arg callable returning a dict of counters to
+            include in every line.
+    """
+
+    def __init__(
+        self,
+        interval_s: float = 15.0,
+        label: str = "packer",
+        stats_fn: Optional[Any] = None,
+    ) -> None:
+        self.interval_s = float(interval_s)
+        self.label = label
+        self.stats_fn = stats_fn
+        self.peak_kb: int = 0
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._t0 = time.monotonic()
+
+    # -- lifecycle ----------------------------------------------------------
+    def start(self) -> "MemoryProbe":
+        self._t0 = time.monotonic()
+        self.checkpoint("start")
+        if self.interval_s > 0 and self._thread is None:
+            self._thread = threading.Thread(
+                target=self._run, name="talos-mem-probe", daemon=True
+            )
+            self._thread.start()
+        return self
+
+    def stop(self) -> int:
+        """Stop sampling; return the peak RSS seen (kB)."""
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=max(1.0, self.interval_s))
+        self._thread = None
+        self.checkpoint("stop")
+        return self.peak_kb
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_s):
+            self.checkpoint("tick")
+
+    # -- reporting ----------------------------------------------------------
+    def sample(self) -> int:
+        """Record and return the current RSS (kB); peak is tracked internally."""
+        rss = _rss_kb()
+        if rss is None:  # pragma: no cover - non-Linux fallback
+            rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        self.peak_kb = max(self.peak_kb, rss)
+        return rss
+
+    def peak_mb(self) -> float:
+        """Peak RSS in MB, including the process high-water mark."""
+        maxrss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        self.peak_kb = max(self.peak_kb, maxrss)
+        return self.peak_kb / 1024.0
+
+    def checkpoint(self, label: str, **extra: Any) -> Dict[str, Any]:
+        """Log one ``mem:`` line with the current RSS, peak and any counters."""
+        rss = self.sample()
+        fields: Dict[str, Any] = {}
+        if self.stats_fn is not None:
+            try:
+                fields.update(self.stats_fn() or {})
+            except Exception:  # noqa: BLE001 - never let telemetry break packing
+                pass
+        fields.update(extra)
+        tail = " ".join(f"{k}={v}" for k, v in fields.items())
+        log.info(
+            "mem %s[%s] rss=%.0fMB peak=%.0fMB t=%.1fs %s",
+            self.label, label, rss / 1024.0, self.peak_mb(),
+            time.monotonic() - self._t0, tail,
+        )
+        return {"rss_mb": round(rss / 1024.0, 1), "peak_mb": round(self.peak_mb(), 1), **fields}
+
+
 def _fetch_hf_dataset_meta(dataset_id: str, config: Optional[str]) -> Dict[str, Any]:
     """Best-effort HF revision/sha metadata for a *string* dataset id.
 
@@ -743,6 +854,18 @@ def make_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--text-field", default="text", help="record field holding the document text")
     p.add_argument("--no-hf-metadata", action="store_true",
                    help="skip the best-effort HF dataset revision/sha lookup")
+    p.add_argument("--reader", choices=("parquet", "datasets"), default="parquet",
+                   help="source read path: 'parquet' (default) reads the split's "
+                        "parquet files one at a time over HTTP range requests with "
+                        "pyarrow (bounded memory: no datasets layer, no read-ahead, "
+                        "no pre-buffer cache); 'datasets' uses the streaming "
+                        "datasets/HuggingFaceReader path (kept for comparison)")
+    p.add_argument("--batch-docs", type=int, default=1_000,
+                   help="documents per parquet batch on the bounded read path "
+                        "(the transient-memory unit; default 1000)")
+    p.add_argument("--mem-log-interval", type=float, default=15.0,
+                   help="seconds between RSS samples logged by the memory probe "
+                        "(<=0 disables the sampling thread; default 15)")
     return p
 
 
@@ -767,10 +890,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # source file for the life of the stream (see limit_stream_readahead).
         if limit_stream_readahead():
             log.info("streaming reads are pass-through (fsspec read-ahead disabled)")
-        reader = HuggingFaceReader(
-            args.dataset, split=args.split, text_field=args.text_field,
-            streaming=True, config=args.config,
-        )
+        if args.reader == "parquet":
+            # Bounded path: one parquet file at a time, text column only, over
+            # HTTP range reads; no ``datasets`` layer (which also imports torch)
+            # and no read-ahead / pre-buffer cache, so nothing accumulates with
+            # corpus progress. See data.readers.ParquetStreamReader.
+            reader: DatasetReader = HuggingFaceParquetReader(
+                args.dataset, split=args.split, config=args.config,
+                text_field=args.text_field, batch_size=args.batch_docs,
+            )
+        else:
+            reader = HuggingFaceReader(
+                args.dataset, split=args.split, text_field=args.text_field,
+                streaming=True, config=args.config,
+            )
+        probe = MemoryProbe(interval_s=args.mem_log_interval, label="prepare_corpus")
+        probe.start()
         dataset_meta: Dict[str, Any] = {
             "dataset": args.dataset,
             "config": args.config,
@@ -779,21 +914,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not args.no_hf_metadata:
             dataset_meta = _fetch_hf_dataset_meta(args.dataset, args.config)
             dataset_meta["split"] = args.split
-        prepare_corpus(
-            reader,
-            tokenizer,
-            out_dir=args.out_dir,
-            target_tokens=args.target_tokens,
-            val_tokens=args.val_tokens,
-            tokenizer_path=tokenizer_path,
-            seq_len=args.seq,
-            dtype=args.dtype,
-            val_skip_docs=args.val_skip_docs,
-            stream_buffer_docs=args.stream_buffer_docs,
-            rows_per_shard=args.rows_per_shard,
-            text_field=args.text_field,
-            dataset_meta=dataset_meta,
-            args_echo=vars(args),
+        try:
+            metadata = prepare_corpus(
+                reader,
+                tokenizer,
+                out_dir=args.out_dir,
+                target_tokens=args.target_tokens,
+                val_tokens=args.val_tokens,
+                tokenizer_path=tokenizer_path,
+                seq_len=args.seq,
+                dtype=args.dtype,
+                val_skip_docs=args.val_skip_docs,
+                stream_buffer_docs=args.stream_buffer_docs,
+                rows_per_shard=args.rows_per_shard,
+                text_field=args.text_field,
+                dataset_meta=dataset_meta,
+                args_echo=vars(args),
+            )
+        finally:
+            try:
+                reader.close()
+            except Exception:  # noqa: BLE001 - closing must never mask a real error
+                pass
+            peak_mb = probe.peak_mb()
+            probe.stop()
+            log.info("peak RSS over the whole pack: %.0f MB (reader=%s)",
+                     peak_mb, args.reader)
+        log.info(
+            "packed %d tokens total (val %d + train %d), peak RSS %.0f MB",
+            metadata["counts"]["total_tokens"], metadata["counts"]["val_tokens"],
+            metadata["counts"]["train_tokens"], peak_mb,
         )
         return 0
     except (FileNotFoundError, ValueError) as exc:
