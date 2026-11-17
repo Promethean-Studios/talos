@@ -40,8 +40,11 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 
 logger = logging.getLogger("talos.notebook.training_lib")
 
-#: Owner-set Chinchilla budget for ``talos_1b`` (1,036,060,672 params × ~20
-#: tokens/param ≈ 20.7B; the owner pinned the round 20B number).
+#: Legacy default token budget for ``talos_1b`` (1,036,060,672 params × ~20
+#: tokens/param ≈ 20.7B). Kept only as a default for callers that do not pass a
+#: budget: the two-stage notebook derives Stage A's budget from the available
+#: compute and Stage B's from the measured tokens/epoch (see
+#: ``notebooks/talos_stages.py`` and ``docs/training-1b-notebook.md``).
 TOTAL_TOKENS = 20_000_000_000
 
 #: Model facts the notebook prints and records. Pinned by ``configs.presets``
@@ -58,6 +61,7 @@ TALOS_1B_TOKENIZER_ASSET = "talos_1b_49k"
 #: these rows; :func:`render_display_table` is the only place they are spelled.
 DISPLAY_LABELS: tuple = (
     "Token progress",
+    "Stage",
     "Training step",
     "Tokens/sec",
     "Elapsed time",
@@ -138,6 +142,18 @@ def format_loss(value: Optional[float]) -> str:
         return "—"
 
 
+#: Human labels for the two training stages (``notebooks/talos_stages.py``).
+STAGE_LABELS: Dict[str, str] = {
+    "A": "A — language pretraining",
+    "B": "B — conversational tuning",
+}
+
+
+def stage_label(stage: str) -> str:
+    """``'A'`` -> ``'A — language pretraining'``; unknown/blank -> ``'—'``."""
+    return STAGE_LABELS.get(str(stage or "").strip().upper(), str(stage or "—") or "—")
+
+
 def utc_timestamp(when: Optional[datetime] = None) -> str:
     """Exact date+time in UTC, ISO-8601 seconds precision: ``2026-11-17T14:03:22Z``."""
     when = datetime.now(timezone.utc) if when is None else when
@@ -215,6 +231,10 @@ class MetricsRow:
     vocab: int
     seq_len: int
     timestamp_utc: str
+    #: Training stage ("A" = language pretraining, "B" = conversational tuning).
+    #: Additive: every pre-existing field keeps its name and position, so a
+    #: reader of the old schema keeps working and a new row gains one key.
+    stage: str = ""
 
     def as_dict(self) -> Dict[str, Any]:
         """Plain ``dict`` in field order (json-ready)."""
@@ -244,6 +264,7 @@ def build_metrics_row(
     params: int = TALOS_1B_PARAMS,
     vocab: int = TALOS_1B_VOCAB,
     seq_len: int = TALOS_1B_SEQ_LEN,
+    stage: str = "",
     timestamp: Optional[datetime] = None,
 ) -> MetricsRow:
     """Build a validated :class:`MetricsRow`; throughput and ETA are derived.
@@ -291,6 +312,7 @@ def build_metrics_row(
         vocab=int(vocab),
         seq_len=int(seq_len),
         timestamp_utc=utc_timestamp(timestamp),
+        stage=str(stage),
     )
 
 
@@ -306,6 +328,7 @@ def render_display_table(row: MetricsRow) -> str:
     """
     values = (
         format_progress(row.tokens_so_far, row.total_tokens),
+        stage_label(row.stage),
         f"{format_count(row.step)}  ({(row.tokens_so_far / max(row.seq_len, 1)):,.0f} rows seen)",
         f"{row.tokens_per_sec:,.0f} tok/s",
         format_duration(row.elapsed_s),
@@ -600,6 +623,11 @@ TRACKER_STATUS_FIELDS: tuple = (
 #: ``history.json`` keys, in the owner's order.
 TRACKER_HISTORY_FIELDS: tuple = ("checkpoints", "epochs")
 
+#: Extra ``status.json`` keys appended AFTER the owner's. Additive by design:
+#: the owner's 15 keys keep their names, order and types, so their dashboard
+#: keeps parsing, and a two-stage run gains one extra key it can ignore.
+TRACKER_EXTRA_STATUS_FIELDS: tuple = ("stage",)
+
 #: The owner's tracker labels the 100M model ``"Talos 100M"``; the 1B run is
 #: ``"Talos 1B"`` (the display name, not the internal preset key ``talos_1b``).
 TRACKER_MODEL_NAME = "Talos 1B"
@@ -691,6 +719,7 @@ class TrackerPublisher:
         tokens_per_step: int = TALOS_1B_TOKENS_PER_STEP,
         gpu: Optional[str] = None,
         status: str = "training",
+        stage: str = "",
     ) -> None:
         if not repo_id or "/" not in str(repo_id):
             raise ValueError(
@@ -719,6 +748,7 @@ class TrackerPublisher:
         self.tokens_per_step = int(tokens_per_step)
         self.gpu = str(gpu) if gpu is not None else resolve_gpu_name()
         self.status = str(status)
+        self.stage = str(stage)
         self._uploader: Uploader = uploader or _hf_upload
         self._clock = clock
         self._last_push_at: Optional[float] = None
@@ -792,7 +822,10 @@ class TrackerPublisher:
             "sequence_length": self.sequence_length,
             "timestamp": now,
         }
-        return {key: status[key] for key in TRACKER_STATUS_FIELDS}
+        payload = {key: status[key] for key in TRACKER_STATUS_FIELDS}
+        # Additive extras (never reordered into the owner's keys above).
+        payload["stage"] = self.stage
+        return payload
 
     def build_history(
         self,
@@ -910,6 +943,8 @@ __all__ = [
     "MetricsSync",
     "TALOS_1B_NAME",
     "TALOS_1B_TOKENS_PER_STEP",
+    "STAGE_LABELS",
+    "TRACKER_EXTRA_STATUS_FIELDS",
     "TRACKER_HISTORY_FIELDS",
     "TRACKER_MODEL_NAME",
     "TRACKER_REPO_ID",
@@ -931,6 +966,7 @@ __all__ = [
     "linearize_dialog",
     "pack_token_stream",
     "render_display_table",
+    "stage_label",
     "resolve_gpu_name",
     "rows_to_jsonl",
     "utc_display",
