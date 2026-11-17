@@ -32,6 +32,8 @@ REQUIRED_ROW_FIELDS = (
     "step", "epoch", "tokens_so_far", "total_tokens", "tokens_per_sec",
     "elapsed_s", "eta_s", "train_loss", "val_loss", "checkpoint", "gpu",
     "model", "params", "vocab", "seq_len", "timestamp_utc",
+    # Additive: the two-stage run records which stage produced the row.
+    "stage",
 )
 
 
@@ -48,7 +50,7 @@ def _row(**overrides):
         train_loss=2.5,
         val_loss=2.75,
         checkpoint="step-500.pt",
-        gpu="NVIDIA GeForce RTX 3060",
+        gpu="NVIDIA L4",
     )
     kwargs.update(overrides)
     return tlib.build_metrics_row(**kwargs)
@@ -363,7 +365,11 @@ def test_tracker_status_keeps_the_owner_schema_and_adapts_the_1b_values(tmp_path
     assert tracker.push(_row()) is True
 
     status = _read_json(tracker.status_path)
-    assert tuple(status) == OWNER_STATUS_FIELDS == tlib.TRACKER_STATUS_FIELDS
+    # The owner's keys keep their names and order; "stage" is appended after
+    # them (additive), so their dashboard keeps parsing.
+    assert tuple(OWNER_STATUS_FIELDS) == tlib.TRACKER_STATUS_FIELDS
+    assert tuple(status) == OWNER_STATUS_FIELDS + tlib.TRACKER_EXTRA_STATUS_FIELDS
+    assert status["stage"] == ""
     assert status["status"] == "training"
     assert status["model_name"] == "Talos 1B"
     assert status["parameters"] == 1_036_060_672
@@ -528,26 +534,33 @@ def test_every_notebook_code_cell_compiles():
 def test_notebook_carries_the_owner_required_configuration():
     source = "\n".join("".join(cell["source"]) for cell in _load_notebook()["cells"])
     required = (
-        "TOTAL_TOKENS = 20_000_000_000",      # 20B Chinchilla budget
-        "SEQ_LEN         = 2048",
+        # Two-stage config: no hard-coded 20B budget any more.
+        'STAGE = "A"',
+        "STAGE_A_HOURS",
+        "STAGE_B_EPOCHS",
+        "SEQ_LEN = 2048",
         "talos_1b_49k",                       # tokenizer asset
         "TALOS_1B_PARAMS",                    # 1,036,060,672 pinned by assert
         "assert n_params == TALOS_1B_PARAMS",
         "HuggingFaceH4/ultrachat_200k",
-        "set_gradient_checkpointing(True)",
-        "bfloat16",
-        "AdamW8bit",
+        "allenai/c4",
+        "set_gradient_checkpointing(GRADIENT_CHECKPOINTING)",
+        "PRECISION",
+        "USE_8BIT_ADAM",
         "from talos_training_lib import",
         "MetricsSync(",
         "render_display_table",
         "RESUME",
         "list_checkpoint_candidates",
         "validate_resume_checkpoint",
+        "validate_stage_resume",
         "save_checkpoint",
         "step-{step}.pt",
     )
     for needle in required:
         assert needle in source, needle
+    # The old single-stage 20B default must be gone from the notebook.
+    assert "20_000_000_000" not in source
 
 
 def test_notebook_displays_exactly_the_owner_fields():
@@ -566,10 +579,12 @@ def test_notebook_wires_the_public_tracker_and_the_drive_checkpoint_dir():
     assert "tracker.maybe_push(row" in source
     assert "tracker.note_checkpoint(" in source
     assert "tracker.flush()" in source
-    # checkpoints on Drive by default, TALOS_1B_OUT still overrides
-    assert "/content/drive/MyDrive/Talos/Talos_1B/checkpoints" in source
+    # checkpoints on Drive by default, TALOS_1B_OUT still overrides; the stage
+    # directory is appended per stage (stage-a / stage-b).
+    assert "/content/drive/MyDrive/Talos/Talos_1B" in source
     assert '"TALOS_1B_OUT"' in source
-    assert "runs/talos-1b-chat" in source
+    assert "stage-{spec.key.lower()}" in source
+    assert "talos_1b_runs" in source
 
 
 def test_notebook_documents_resume_and_the_corpus_boundary():
@@ -579,5 +594,8 @@ def test_notebook_documents_resume_and_the_corpus_boundary():
         if cell["cell_type"] == "markdown"
     ).lower()
     assert "resume" in text
-    assert "220m" in text and "pretraining" in text
+    assert "stage a" in text and "pretraining" in text
+    assert "stage b" in text and "tuning" in text
     assert "chinchilla" in text
+    # The team's own packed corpus is not the notebook's input.
+    assert "corpus-1b-49k" not in text
