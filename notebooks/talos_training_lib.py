@@ -1,0 +1,591 @@
+"""Testable helpers for ``notebooks/talos_colab_train.ipynb`` (Talos 1B, 20B tokens).
+
+The notebook is the owner's live 1B Chinchilla run (RTX 3060 12 GB). Everything
+in this module is **pure logic** — no ``torch``, no GPU, no network at import
+time — so the notebook's metrics row, ETA math, HTML display and Hugging Face
+Dataset sync can be unit-tested on CI with only ``pytest`` installed:
+
+* :func:`build_metrics_row` / :class:`MetricsRow` — one typed record per log
+  interval, with exactly the fields the notebook displays and pushes.
+* :func:`compute_eta_s` / :func:`compute_tokens_per_sec` — ETA math.
+* :func:`render_display_table` — the single updated HTML table (the owner's
+  exact display fields), not a scrolling text log.
+* :func:`linearize_dialog` / :func:`pack_token_stream` — the chat → packed
+  seq-2048 token stream adapter (dataset format, no torch).
+* :class:`MetricsSync` — append a metrics row locally and push the jsonl to a
+  HF **dataset** repo, throttled, with every failure caught and logged so a
+  broken sync can never kill a 20B-token run.
+
+The previous notebook's sync "never worked"; the reasons this one is different
+are structural, not cosmetic: the row is built from a frozen dataclass with a
+fixed field list (nothing can be silently dropped), the payload is a plain
+``jsonl`` file uploaded as a single file (HF dataset repos have no append RPC),
+``dry_run`` skips the network entirely, and :meth:`MetricsSync.maybe_push`
+returns a bool and stores :attr:`MetricsSync.last_error` instead of raising.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
+
+logger = logging.getLogger("talos.notebook.training_lib")
+
+#: Owner-set Chinchilla budget for ``talos_1b`` (1,036,060,672 params × ~20
+#: tokens/param ≈ 20.7B; the owner pinned the round 20B number).
+TOTAL_TOKENS = 20_000_000_000
+
+#: Model facts the notebook prints and records. Pinned by ``configs.presets``
+#: (``talos_1b_config`` / ``talos_1b_tokenizer_config``) and by
+#: ``tests/test_talos_1b.py``; repeated here so a metrics row can be built and
+#: tested without importing torch.
+TALOS_1B_PARAMS = 1_036_060_672
+TALOS_1B_VOCAB = 49_152
+TALOS_1B_SEQ_LEN = 2048
+TALOS_1B_NAME = "talos_1b"
+TALOS_1B_TOKENIZER_ASSET = "talos_1b_49k"
+
+#: Display labels, in the owner's requested order. The notebook renders exactly
+#: these rows; :func:`render_display_table` is the only place they are spelled.
+DISPLAY_LABELS: tuple = (
+    "Token progress",
+    "Training step",
+    "Tokens/sec",
+    "Elapsed time",
+    "ETA",
+    "Train loss",
+    "Val loss",
+    "Checkpoint",
+    "GPU",
+    "Model",
+    "Parameters",
+    "Vocab",
+    "Sequence length",
+    "Epoch",
+    "Last update",
+)
+
+
+# ---------------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------------
+def format_count(n: int) -> str:
+    """``1234567`` -> ``'1,234,567'``."""
+    return f"{int(n):,}"
+
+
+def format_billions(n: float) -> str:
+    """``20_000_000_000`` -> ``'20.00B'``; ``49_152`` -> ``'49.15K'``."""
+    n = float(n)
+    if abs(n) >= 1e9:
+        return f"{n / 1e9:.2f}B"
+    if abs(n) >= 1e6:
+        return f"{n / 1e6:.2f}M"
+    if abs(n) >= 1e3:
+        return f"{n / 1e3:.2f}K"
+    return f"{n:.0f}"
+
+
+def format_progress(tokens_so_far: int, total_tokens: int) -> str:
+    """``'3,000,000,000 out of 20.00B (15.0%)'`` — the token-progress cell."""
+    if total_tokens <= 0:
+        raise ValueError("total_tokens must be positive")
+    pct = 100.0 * float(tokens_so_far) / float(total_tokens)
+    return f"{format_count(tokens_so_far)} out of {format_billions(total_tokens)} ({pct:.1f}%)"
+
+
+def format_duration(seconds: Optional[float]) -> str:
+    """Human duration: ``'3d 04h 12m'``, ``'1h 02m 09s'``, ``'07m 41s'``.
+
+    ``None`` / non-finite / negative renders as ``'—'`` (used for an ETA that
+    cannot be estimated yet, e.g. before the first log interval).
+    """
+    if seconds is None:
+        return "—"
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return "—"
+    if value != value or value in (float("inf"), float("-inf")) or value < 0:
+        return "—"
+    total = int(round(value))
+    days, rem = divmod(total, 86_400)
+    hours, rem = divmod(rem, 3_600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours:02d}h {minutes:02d}m"
+    if hours:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    return f"{minutes:02d}m {secs:02d}s"
+
+
+def format_loss(value: Optional[float]) -> str:
+    """``4.1234`` -> ``'4.1234'``; ``None`` -> ``'—'`` (not evaluated yet)."""
+    if value is None:
+        return "—"
+    try:
+        return f"{float(value):.4f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def utc_timestamp(when: Optional[datetime] = None) -> str:
+    """Exact date+time in UTC, ISO-8601 seconds precision: ``2026-11-17T14:03:22Z``."""
+    when = datetime.now(timezone.utc) if when is None else when
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def utc_display(timestamp: str) -> str:
+    """``'2026-11-17T14:03:22Z'`` -> ``'2026-11-17 14:03:22 UTC'``."""
+    try:
+        when = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError):
+        return str(timestamp)
+    return when.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+# ---------------------------------------------------------------------------
+# ETA / throughput math
+# ---------------------------------------------------------------------------
+def compute_tokens_per_sec(tokens_so_far: int, elapsed_s: float) -> float:
+    """Mean tokens/sec since run start (0.0 while nothing has been counted)."""
+    if tokens_so_far < 0:
+        raise ValueError("tokens_so_far must be >= 0")
+    if elapsed_s <= 0:
+        return 0.0
+    return float(tokens_so_far) / float(elapsed_s)
+
+
+def compute_eta_s(tokens_so_far: int, total_tokens: int, elapsed_s: float) -> Optional[float]:
+    """Seconds remaining at the run's *mean* throughput so far.
+
+    Returns ``None`` when no estimate exists yet (no tokens counted, no elapsed
+    time, or a non-finite throughput) — the display then shows ``—`` rather than
+    a fabricated number. Returns ``0.0`` once the budget is reached.
+    """
+    if total_tokens <= 0:
+        raise ValueError("total_tokens must be positive")
+    if tokens_so_far < 0:
+        raise ValueError("tokens_so_far must be >= 0")
+    if tokens_so_far >= total_tokens:
+        return 0.0
+    if tokens_so_far == 0 or elapsed_s <= 0:
+        return None
+    rate = float(tokens_so_far) / float(elapsed_s)
+    if rate != rate or rate <= 0 or rate == float("inf"):
+        return None
+    return (float(total_tokens) - float(tokens_so_far)) / rate
+
+
+# ---------------------------------------------------------------------------
+# Metrics row
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class MetricsRow:
+    """One log interval's metrics — the display row *and* the synced payload.
+
+    Field order is the push order (and the jsonl key order), so a row on the
+    HF dataset reads the same as a row on screen.
+    """
+
+    step: int
+    epoch: int
+    tokens_so_far: int
+    total_tokens: int
+    tokens_per_sec: float
+    elapsed_s: float
+    eta_s: Optional[float]
+    train_loss: float
+    val_loss: Optional[float]
+    checkpoint: str
+    gpu: str
+    model: str
+    params: int
+    vocab: int
+    seq_len: int
+    timestamp_utc: str
+
+    def as_dict(self) -> Dict[str, Any]:
+        """Plain ``dict`` in field order (json-ready)."""
+        return asdict(self)
+
+    def to_jsonl(self) -> str:
+        """One JSON line, no trailing newline."""
+        return json.dumps(self.as_dict(), ensure_ascii=False, allow_nan=False)
+
+    @property
+    def eta_display(self) -> str:
+        return format_duration(self.eta_s)
+
+
+def build_metrics_row(
+    *,
+    step: int,
+    epoch: int,
+    tokens_so_far: int,
+    elapsed_s: float,
+    train_loss: float,
+    total_tokens: int = TOTAL_TOKENS,
+    val_loss: Optional[float] = None,
+    checkpoint: str = "",
+    gpu: str = "",
+    model: str = TALOS_1B_NAME,
+    params: int = TALOS_1B_PARAMS,
+    vocab: int = TALOS_1B_VOCAB,
+    seq_len: int = TALOS_1B_SEQ_LEN,
+    timestamp: Optional[datetime] = None,
+) -> MetricsRow:
+    """Build a validated :class:`MetricsRow`; throughput and ETA are derived.
+
+    Raises ``ValueError`` on impossible inputs (negative step/tokens, a
+    non-positive budget, a non-finite loss) so a corrupt log line is caught at
+    the source instead of silently polluting the metrics dataset.
+    """
+    if step < 0:
+        raise ValueError("step must be >= 0")
+    if epoch < 1:
+        raise ValueError("epoch is 1-based and must be >= 1")
+    if tokens_so_far < 0:
+        raise ValueError("tokens_so_far must be >= 0")
+    if total_tokens <= 0:
+        raise ValueError("total_tokens must be positive")
+    if seq_len <= 0:
+        raise ValueError("seq_len must be positive")
+    if params <= 0 or vocab <= 0:
+        raise ValueError("params and vocab must be positive")
+    if elapsed_s < 0:
+        raise ValueError("elapsed_s must be >= 0")
+    train = float(train_loss)
+    if train != train or train in (float("inf"), float("-inf")):
+        raise ValueError(f"train_loss must be finite, got {train_loss!r}")
+    if val_loss is not None:
+        val = float(val_loss)
+        if val != val or val in (float("inf"), float("-inf")):
+            raise ValueError(f"val_loss must be finite when set, got {val_loss!r}")
+        val_loss = val
+    return MetricsRow(
+        step=int(step),
+        epoch=int(epoch),
+        tokens_so_far=int(tokens_so_far),
+        total_tokens=int(total_tokens),
+        tokens_per_sec=compute_tokens_per_sec(tokens_so_far, elapsed_s),
+        elapsed_s=float(elapsed_s),
+        eta_s=compute_eta_s(tokens_so_far, total_tokens, elapsed_s),
+        train_loss=train,
+        val_loss=val_loss,
+        checkpoint=str(checkpoint),
+        gpu=str(gpu),
+        model=str(model),
+        params=int(params),
+        vocab=int(vocab),
+        seq_len=int(seq_len),
+        timestamp_utc=utc_timestamp(timestamp),
+    )
+
+
+# ---------------------------------------------------------------------------
+# HTML display
+# ---------------------------------------------------------------------------
+def render_display_table(row: MetricsRow) -> str:
+    """The notebook's single live output: one HTML table, all owner fields.
+
+    Returned as a string so the training cell can update *one* display handle
+    per log interval (``handle.update(HTML(...))``) instead of printing a
+    scrolling text log. Renders identically in Jupyter, Colab and VS Code.
+    """
+    values = (
+        format_progress(row.tokens_so_far, row.total_tokens),
+        f"{format_count(row.step)}  ({(row.tokens_so_far / max(row.seq_len, 1)):,.0f} rows seen)",
+        f"{row.tokens_per_sec:,.0f} tok/s",
+        format_duration(row.elapsed_s),
+        row.eta_display,
+        format_loss(row.train_loss),
+        format_loss(row.val_loss),
+        row.checkpoint or "—",
+        row.gpu or "—",
+        row.model,
+        format_count(row.params),
+        format_count(row.vocab),
+        format_count(row.seq_len),
+        f"epoch {row.epoch}",
+        utc_display(row.timestamp_utc),
+    )
+    rows_html = "\n".join(
+        f'<tr><th style="text-align:left;padding:3px 14px 3px 0;'
+        f'font-weight:600;color:#444;">{label}</th>'
+        f'<td style="text-align:left;padding:3px 0;font-family:ui-monospace,'
+        f'Menlo,monospace;">{value}</td></tr>'
+        for label, value in zip(DISPLAY_LABELS, values)
+    )
+    return (
+        '<div style="border:1px solid #d0d7de;border-radius:6px;padding:10px 14px;'
+        'display:inline-block;background:#fafbfc;">'
+        '<div style="font-weight:700;margin-bottom:6px;color:#0b3d91;">'
+        "Talos 1B — training</div>"
+        f'<table style="border-collapse:collapse;font-size:13px;">{rows_html}</table>'
+        "</div>"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Chat dataset → packed token stream
+# ---------------------------------------------------------------------------
+def linearize_dialog(
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    eos: str = "\n\n",
+) -> str:
+    """Linearize one chat dialog into a single document.
+
+    ``[{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]``
+    becomes ``"User: hi\\n\\nAssistant: hello"``. Unknown roles are kept
+    (capitalised) rather than dropped, and non-string / missing content yields
+    an empty turn, so a malformed row degrades instead of crashing the stream.
+    """
+    lines: List[str] = []
+    for message in messages or ():
+        if not isinstance(message, Mapping):
+            continue
+        role = str(message.get("role") or "unknown").strip() or "unknown"
+        content = message.get("content")
+        text = content if isinstance(content, str) else ""
+        lines.append(f"{role.capitalize()}: {text.strip()}")
+    return eos.join(lines).strip()
+
+
+def pack_token_stream(
+    token_lists: Iterable[Sequence[int]],
+    *,
+    seq_len: int,
+    vocab_size: int = TALOS_1B_VOCAB,
+    pad_id: int = 0,
+    drop_last: bool = True,
+) -> Iterable[List[int]]:
+    """Concatenate per-document token id lists into fixed ``seq_len`` rows.
+
+    Documents are joined end-to-end (no padding between documents — a packed
+    stream, as the 1B pretraining corpus is packed) and sliced into rows of
+    ``seq_len``; a short trailing row is padded with ``pad_id`` when
+    ``drop_last`` is false and dropped otherwise. **Every** id is bounds-checked
+    against ``vocab_size`` before it is emitted: the repo convention
+    (``data.tokenized.validate_id_array``) is that an out-of-range id must fail
+    at the data source with context, never as a device-side assert mid-step.
+    """
+    if seq_len <= 0:
+        raise ValueError("seq_len must be positive")
+    if vocab_size <= 0:
+        raise ValueError("vocab_size must be positive")
+    if not (0 <= pad_id < vocab_size):
+        raise ValueError(f"pad_id {pad_id} outside [0, {vocab_size})")
+
+    buffer: List[int] = []
+    for ids in token_lists:
+        for token_id in ids:
+            value = int(token_id)
+            if value < 0 or value >= vocab_size:
+                raise ValueError(
+                    f"token id {value} outside [0, {vocab_size}) — refusing to "
+                    "pack a document whose tokenizer does not match the model vocab"
+                )
+            buffer.append(value)
+        while len(buffer) >= seq_len:
+            yield buffer[:seq_len]
+            buffer = buffer[seq_len:]
+    if buffer and not drop_last:
+        yield buffer + [pad_id] * (seq_len - len(buffer))
+
+
+# ---------------------------------------------------------------------------
+# HF Dataset metrics sync
+# ---------------------------------------------------------------------------
+def rows_to_jsonl(rows: Iterable[MetricsRow]) -> str:
+    """Serialize rows as newline-delimited JSON (trailing newline included)."""
+    return "".join(row.to_jsonl() + "\n" for row in rows)
+
+
+#: Uploader signature: ``(repo_id, local_path, path_in_repo, token) -> None``.
+Uploader = Callable[[str, str, str, Optional[str]], None]
+
+
+def _hf_upload(repo_id: str, local_path: str, path_in_repo: str,
+               token: Optional[str]) -> None:
+    """Default uploader: create the dataset repo if missing, then upload the file.
+
+    HF dataset repos have no "append a row" RPC, so the notebook keeps the full
+    metrics history in one local ``jsonl`` (appended every log interval) and
+    uploads that single file — the remote copy is always the complete history,
+    which is also what makes a resumed run's metrics continuous.
+    """
+    from huggingface_hub import HfApi  # imported lazily: CI has no HF client
+
+    api = HfApi(token=token)
+    api.create_repo(repo_id=repo_id, repo_type="dataset", exist_ok=True,
+                    private=False, token=token)
+    api.upload_file(
+        path_or_fileobj=local_path,
+        path_in_repo=path_in_repo,
+        repo_id=repo_id,
+        repo_type="dataset",
+        token=token,
+        commit_message=f"talos-1b metrics: +{os.path.basename(local_path)}",
+    )
+
+
+class MetricsSync:
+    """Append metrics rows locally and push them to a HF dataset repo.
+
+    Guarantees, in order of importance:
+
+    1. **A sync failure never kills training.** :meth:`maybe_push` and
+       :meth:`flush` catch everything, log a warning, record
+       :attr:`last_error` and return ``False``.
+    2. **``dry_run=True`` touches no network at all** (used by the notebook's
+       smoke run and by the test suite).
+    3. **Throttled.** :meth:`maybe_push` uploads at most once per
+       ``min_interval_s`` (default 300 s = 5 min); ``LOG_EVERY`` steps at 20B
+       tokens is minutes apart, so the default is "every 5 min, whichever is
+       coarser" in practice. :meth:`flush` forces a final upload.
+
+    Args:
+        repo_id: dataset repo, e.g. ``"<whoami>/talos-1b-training-metrics"``.
+        token: HF token; ``None`` lets ``huggingface_hub`` use the ambient
+            login (``notebook_login()`` / ``HF_TOKEN``).
+        dry_run: skip all network calls (rows are still appended locally).
+        min_interval_s: minimum seconds between uploads.
+        local_path: jsonl history file; defaults to ``talos-1b-metrics.jsonl``
+            in the current directory.
+        path_in_repo: filename inside the dataset repo.
+        uploader: injectable upload function (tests pass a recorder).
+        clock: injectable monotonic clock (tests advance it by hand).
+    """
+
+    def __init__(
+        self,
+        repo_id: str,
+        *,
+        token: Optional[str] = None,
+        dry_run: bool = False,
+        min_interval_s: float = 300.0,
+        local_path: Optional[str] = None,
+        path_in_repo: str = "metrics.jsonl",
+        uploader: Optional[Uploader] = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if not repo_id or "/" not in str(repo_id):
+            raise ValueError(
+                f"repo_id must look like '<user>/<dataset-name>', got {repo_id!r}"
+            )
+        if min_interval_s < 0:
+            raise ValueError("min_interval_s must be >= 0")
+        self.repo_id = str(repo_id)
+        self.token = token
+        self.dry_run = bool(dry_run)
+        self.min_interval_s = float(min_interval_s)
+        self.path_in_repo = path_in_repo
+        self.local_path = local_path or "talos-1b-metrics.jsonl"
+        self._uploader: Uploader = uploader or _hf_upload
+        self._clock = clock
+        self._last_push_at: Optional[float] = None
+        self.rows: List[MetricsRow] = []
+        self.push_count = 0
+        self.last_error: Optional[str] = None
+
+    # -- local history ------------------------------------------------------
+    def append(self, row: MetricsRow) -> None:
+        """Append one row to the in-memory history and to the local jsonl."""
+        self.rows.append(row)
+        try:
+            parent = os.path.dirname(os.path.abspath(self.local_path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(self.local_path, "a", encoding="utf-8") as handle:
+                handle.write(row.to_jsonl() + "\n")
+        except OSError as exc:  # a read-only dir must not stop training
+            self.last_error = f"local append failed: {exc}"
+            logger.warning("metrics local append failed (%s): %s",
+                           self.local_path, exc)
+
+    # -- uploads ------------------------------------------------------------
+    def push(self, rows: Optional[Sequence[MetricsRow]] = None) -> bool:
+        """Upload the metrics jsonl now; never raises.
+
+        ``rows`` may be a single :class:`MetricsRow`, a sequence (they are added
+        to the history first, so nothing is lost), or ``None`` to publish the
+        full history. Returns ``True`` on success (or on a dry run, where the
+        network step is skipped by design), ``False`` when the upload failed.
+        """
+        if isinstance(rows, MetricsRow):
+            rows = [rows]
+        if rows is not None:
+            for row in rows:
+                if row not in self.rows:
+                    self.rows.append(row)
+        if self.dry_run:
+            logger.info("metrics sync dry_run=True — %d row(s) not uploaded",
+                        len(self.rows))
+            return True
+        if not self.rows:
+            return True
+        try:
+            parent = os.path.dirname(os.path.abspath(self.local_path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(self.local_path, "w", encoding="utf-8") as handle:
+                handle.write(rows_to_jsonl(self.rows))
+            self._uploader(self.repo_id, self.local_path, self.path_in_repo, self.token)
+        except Exception as exc:  # noqa: BLE001 — sync must never kill training
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            logger.warning("metrics sync to %s failed (%s) — training continues",
+                           self.repo_id, self.last_error)
+            return False
+        self._last_push_at = self._clock()
+        self.push_count += 1
+        self.last_error = None
+        logger.info("metrics sync: pushed %d row(s) to %s", len(self.rows), self.repo_id)
+        return True
+
+    def maybe_push(self, row: MetricsRow) -> bool:
+        """Append ``row`` and upload only if the throttle interval has elapsed."""
+        self.append(row)
+        now = self._clock()
+        if (self._last_push_at is not None
+                and (now - self._last_push_at) < self.min_interval_s):
+            return False
+        return self.push()
+
+    def flush(self) -> bool:
+        """Force a final upload (end of run / before resume); never raises."""
+        return self.push()
+
+
+__all__ = [
+    "DISPLAY_LABELS",
+    "MetricsRow",
+    "MetricsSync",
+    "TALOS_1B_NAME",
+    "TALOS_1B_PARAMS",
+    "TALOS_1B_SEQ_LEN",
+    "TALOS_1B_TOKENIZER_ASSET",
+    "TALOS_1B_VOCAB",
+    "TOTAL_TOKENS",
+    "build_metrics_row",
+    "compute_eta_s",
+    "compute_tokens_per_sec",
+    "format_billions",
+    "format_count",
+    "format_duration",
+    "format_loss",
+    "format_progress",
+    "linearize_dialog",
+    "pack_token_stream",
+    "render_display_table",
+    "rows_to_jsonl",
+    "utc_display",
+    "utc_timestamp",
+]

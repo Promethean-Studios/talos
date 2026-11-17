@@ -1,74 +1,53 @@
-# Talos Colab Notebooks
+# Talos Notebooks
 
-This directory holds ready-to-run Google Colab notebooks for Talos's
-development workflow.
+This directory holds the ready-to-run training notebook and its testable
+helpers.
 
-## `talos_colab_train.ipynb` — First GPU training run (tiny prototype)
+## `talos_colab_train.ipynb` — Talos 1B, 20B-token Chinchilla run
 
-This is the basic end-to-end acceptance test for the Talos **`tiny` prototype**
-(~254,272 params). It trains the canonical `tiny` preset on the Colab GPU and
-confirms the training pipeline genuinely learns.
+Trains the project's primary 1B model (`talos_1b`: **1,036,060,672 params**,
+vocab **49,152**, context 2,048, 16Q/4KV GQA, head_dim 128, RMSNorm pre-norm,
+RoPE, no biases, tied embeddings) for a **20,000,000,000-token** Chinchilla
+budget on the owner's local **NVIDIA GeForce RTX 3060 12GB** (not Colab T4).
 
-### 3 steps to run it
+- **Tokenizer:** `assets/tokenizers/talos_1b_49k.json`, sha256 recorded in every
+  checkpoint and metrics row.
+- **Data:** `HuggingFaceH4/ultrachat_200k`, streamed, linearized to
+  `User: … / Assistant: …` documents and packed into seq-2048 rows. Epochs loop
+  until the token budget is met. This is the chat / continued-pretraining path;
+  the 220M-token FineWeb-Edu packed corpus is the separate pretraining corpus.
+- **Loop:** bf16 autocast, gradient checkpointing, gradient accumulation,
+  8-bit AdamW (bitsandbytes; plain AdamW fallback), bf16 (no GradScaler).
+- **Display:** one live HTML table updated every `LOG_EVERY` steps — token
+  progress out of 20B, step, tok/s, elapsed, ETA, train/val loss, checkpoint
+  filename, GPU, model, parameters, vocab, sequence length, epoch, UTC timestamp.
+- **Metrics sync:** every log interval appends a row to `OUT_DIR/metrics.jsonl`
+  and pushes it (throttled) to a HF **dataset** repo,
+  default `<whoami>/talos-1b-training-metrics`. A failed push is logged and
+  swallowed — it never stops training.
+- **Checkpoints:** `step-<N>.pt` every `CHECKPOINT_EVERY` steps in the repo's
+  `talos-training-checkpoint-v1` schema (weights + optimizer + RNG + losses +
+  tokenizer sha256 + token counters), so `scripts/eval_checkpoint.py` reads them
+  and `RESUME = True` continues bit-exactly.
 
-1. **Open the notebook in Colab** —
-   `File → Upload notebook` (drag `talos_colab_train.ipynb` in) or `GitHub` →
-   `Promethean-Studios/talos` → `notebooks/talos_colab_train.ipynb`.
-2. **Choose a GPU runtime** — Runtime → Change runtime type → Hardware
-   accelerator → **GPU** → Save. (A CPU runtime also works; the scripts detect
-   the device automatically and fall back, just slower.)
-3. **Run all** — Runtime → Run all. Each cell explains itself; no `pip install`
-   is needed because Colab already ships `torch` + `numpy`, which are Talos's
-   only runtime dependencies.
+### Running it
 
-### What a successful run looks like
+1. Open the notebook locally (Jupyter / VS Code) on the 3060 box.
+2. Cell 1 installs the Python extras; torch is left alone (a `pip install torch`
+   would replace the CUDA build with a CPU wheel).
+3. Set `HF_TOKEN` (or run `huggingface-cli login`) so the metrics dataset repo
+   can be created and pushed. With no token the rows still land in
+   `OUT_DIR/metrics.jsonl`; set `SYNC_DRY_RUN = True` to skip the network.
+4. Run the cells top to bottom. Cell 8 is the training loop; interrupt it
+   whenever — it writes a checkpoint and flushes metrics before stopping.
 
-The training cell ends with a line like:
+A 20B-token budget on a 3060 is a long run: the live table reports measured
+tok/s and a real ETA, and the run can be stopped and resumed at any checkpoint.
 
-```
-OK: dense tiny (254272 params, device=cuda) loss 6.9170 -> 0.12XX over 300 steps (peak drop 6.8XXX)
-```
+## `talos_training_lib.py`
 
-- **Initial loss ≈ 6.9** ≈ `log(vocab)` for vocab=1024 (model starts guessing
-  uniformly).
-- **Final loss well below 1** — the model has learned and overfit the fixed
-  corpus, proving forward + backward + AdamW actually work.
-- **`device=cuda`** confirms the GPU was used.
-
-The last cell sanity-checks inference: it prefills a prompt in one pass and
-decodes token-by-token via the KV cache, ending with `OK: generated 8 tokens:
-[...]`.
-
-### Pointing it at real data later
-
-The notebook trains on a small **fixed synthetic corpus**
-(`training.synthetic.build_recurrent_corpus`) — a deliberate, fast,
-deterministic way to prove the loop learns; it is *not* real language data.
-
-To train on real data, replace the synthetic corpus with tokens produced by the
-Phase 3 data pipeline:
-
-```bash
-python -m data.pipeline \
-    --config data/configs/example.json --out /tmp/mycorp \
-    --max-docs 10000 --seed 0
-```
-
-That writes sharded JSONL under `output.dir`. Since this notebook was written,
-the real-dataset trainer exists: `scripts/train_oasst1.py` trains from JSONL
-(`--data`) or from a packed corpus (`--packed-dir`), writes resumable
-checkpoints and a `metrics.json`, and `scripts/eval_checkpoint.py` /
-`scripts/generate.py` score and sample the result (see `docs/trainer.md`).
-
-### Notes / gotchas
-
-- The example scripts (`examples/tiny_train.py`, `examples/run_inference.py`)
-  auto-detect CUDA and are runnable directly as scripts (they put the repo root
-  on `sys.path` themselves), so the notebook's `!python examples/...` calls
-  work with no extra setup.
-- The training script is deterministic for a fixed `--seed` (default `0`), so
-  repeated runs reproduce the same loss curve.
-- This notebook is the **validated vehicle** for the prototype (Phase 4): a
-  smoke test that the training loop learns on synthetic data. It is *not* how
-  any documented run was produced — those use `scripts/train_oasst1.py`.
-  Distributed training remains unimplemented (`distributed/PLAN.md`).
+The notebook's pure-Python helpers — metrics row construction, ETA math, the
+HTML display table, the chat→packed-token adapter and the HF Dataset sync.
+No torch, no GPU, no network at import time, so it is unit-tested on CI by
+`tests/test_training_lib.py` (which also validates the notebook's JSON, its
+code cells, and the config/display fields it must carry).
