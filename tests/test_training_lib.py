@@ -328,6 +328,177 @@ def test_rows_to_jsonl_round_trips():
 
 
 # ---------------------------------------------------------------------------
+# Public training tracker (status.json + history.json)
+# ---------------------------------------------------------------------------
+#: The owner's 100M ``status.json`` keys, in their order — the 1B publisher must
+#: emit exactly these, so the existing dashboard keeps parsing.
+OWNER_STATUS_FIELDS = (
+    "status", "model_name", "parameters", "step", "step_target",
+    "tokens_consumed", "token_target", "train_loss", "val_loss", "checkpoint",
+    "checkpoint_timestamp", "gpu", "vocab_size", "sequence_length", "timestamp",
+)
+
+
+def _publisher(tmp_path, **kwargs):
+    kwargs.setdefault("local_dir", str(tmp_path))
+    kwargs.setdefault("min_interval_s", 0)
+    return tlib.TrackerPublisher(**kwargs)
+
+
+def _read_json(path):
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def test_tracker_defaults_to_the_owner_public_repo():
+    tracker = tlib.TrackerPublisher()
+    assert tracker.repo_id == "PrometheanStudio/talos-training-tracker"
+    assert tlib.TRACKER_REPO_ID == tracker.repo_id
+    assert tracker.model_name == "Talos 1B"
+
+
+def test_tracker_status_keeps_the_owner_schema_and_adapts_the_1b_values(tmp_path):
+    recorder = _Recorder()
+    tracker = _publisher(tmp_path, uploader=recorder)
+    assert tracker.push(_row()) is True
+
+    status = _read_json(tracker.status_path)
+    assert tuple(status) == OWNER_STATUS_FIELDS == tlib.TRACKER_STATUS_FIELDS
+    assert status["status"] == "training"
+    assert status["model_name"] == "Talos 1B"
+    assert status["parameters"] == 1_036_060_672
+    assert status["vocab_size"] == 49_152
+    assert status["sequence_length"] == 2048
+    assert status["token_target"] == 20_000_000_000
+    assert status["step_target"] == 305_176        # ceil(20B / 65,536)
+    # counters come from the row, not from step * tokens_per_step
+    assert status["step"] == 500
+    assert status["tokens_consumed"] == 5_000_000_000
+    assert status["train_loss"] == pytest.approx(2.5)
+    assert status["val_loss"] == pytest.approx(2.75)
+    assert status["checkpoint"] == "step-500.pt"
+    assert status["gpu"] == tracker.gpu and status["gpu"]
+    # both timestamps are ISO-8601 wall clock, and the same instant
+    assert status["timestamp"] == status["checkpoint_timestamp"]
+    parsed = datetime.fromisoformat(status["timestamp"])
+    assert parsed.tzinfo is not None
+
+
+def test_tracker_reports_the_visible_gpu_or_cpu(tmp_path):
+    tracker = _publisher(tmp_path, uploader=_Recorder())
+    assert isinstance(tlib.resolve_gpu_name(), str)
+    assert tracker.gpu == tlib.resolve_gpu_name() and tracker.gpu
+    tracker.push(_row())
+    assert _read_json(tracker.status_path)["gpu"] == tracker.gpu
+
+
+def test_tracker_history_carries_checkpoints_and_the_epoch_rows(tmp_path):
+    tracker = _publisher(tmp_path, uploader=_Recorder())
+    tracker.note_checkpoint(1000, 65_536_000)
+    tracker.note_checkpoint(500, 32_768_000)          # out of order on purpose
+    tracker.push(_row())
+
+    history = _read_json(tracker.history_path)
+    assert tuple(history) == ("checkpoints", "epochs") == tlib.TRACKER_HISTORY_FIELDS
+    assert history["checkpoints"] == [
+        {"step": 500, "tokens_consumed": 32_768_000},
+        {"step": 1000, "tokens_consumed": 65_536_000},
+    ]
+    assert history["epochs"] == [_row().as_dict()]
+
+
+def test_tracker_history_takes_the_full_metric_history_when_given_it(tmp_path):
+    sync = _sync(tmp_path, dry_run=True, min_interval_s=0)
+    sync.maybe_push(_row(step=1))
+    sync.maybe_push(_row(step=2))
+    tracker = _publisher(tmp_path, uploader=_Recorder())
+    tracker.push(_row(step=2), history_rows=sync.rows)
+    history = _read_json(tracker.history_path)
+    assert [row["step"] for row in history["epochs"]] == [1, 2]
+
+
+def test_tracker_uploads_only_when_something_changed(tmp_path):
+    recorder = _Recorder()
+    tracker = _publisher(tmp_path, uploader=recorder)
+    row = _row()
+
+    assert tracker.push(row) is True
+    assert [call[2] for call in recorder.calls] == ["status.json", "history.json"]
+    assert tracker.published is True and tracker.push_count == 1
+    assert recorder.calls[0][0] == "PrometheanStudio/talos-training-tracker"
+
+    # same content on a later tick: nothing is uploaded (the wall clock moved)
+    assert tracker.push(row) is True
+    assert len(recorder.calls) == 2
+    assert tracker.skipped_unchanged == 1
+    assert tracker.published is False and tracker.push_count == 1
+
+    # a new step is a change -> both files go out again
+    assert tracker.push(_row(step=520, tokens_so_far=5_100_000_000)) is True
+    assert len(recorder.calls) == 4
+    assert tracker.published is True and tracker.push_count == 2
+    assert _read_json(tracker.status_path)["step"] == 520
+
+
+def test_tracker_is_throttled_like_the_metrics_sync(tmp_path):
+    recorder = _Recorder()
+    now = [0.0]
+    tracker = _publisher(tmp_path, uploader=recorder, min_interval_s=60.0,
+                         clock=lambda: now[0])
+    assert tracker.maybe_push(_row(step=1)) is True       # first tick publishes
+    now[0] = 30.0
+    assert tracker.maybe_push(_row(step=2)) is False      # too soon
+    assert tracker.push_count == 1
+    now[0] = 90.0
+    assert tracker.maybe_push(_row(step=3)) is True       # interval elapsed
+    assert tracker.push_count == 2
+    # every row is remembered even while throttled (history.json is complete)
+    assert [row["step"] for row in tracker.epoch_rows] == [1, 2, 3]
+    assert tracker.flush() is True                        # forced final publish
+    assert tracker.push_count == 2                        # ...nothing had changed
+
+
+def test_tracker_failure_never_raises_and_is_recorded(tmp_path):
+    recorder = _Recorder(fail=True)
+    tracker = _publisher(tmp_path, uploader=recorder)
+    assert tracker.push(_row()) is False                  # no exception escapes
+    assert tracker.last_error is not None and "hub is down" in tracker.last_error
+    assert len(recorder.calls) == 1
+    # the local copies are written first, so the payload survives a bad push
+    assert _read_json(tracker.status_path)["step"] == 500
+    assert _read_json(tracker.history_path)["epochs"]
+
+    recorder.fail = False
+    assert tracker.push() is True                         # next tick recovers
+    assert tracker.last_error is None
+    assert tracker.push_count == 1
+
+
+def test_tracker_dry_run_writes_locally_and_never_uploads(tmp_path):
+    recorder = _Recorder()
+    tracker = _publisher(tmp_path, uploader=recorder, dry_run=True)
+    assert tracker.push(_row()) is True
+    assert recorder.calls == []
+    assert tracker.push_count == 0
+    assert os.path.isfile(tracker.status_path)
+    assert os.path.isfile(tracker.history_path)
+    assert _read_json(tracker.status_path)["model_name"] == "Talos 1B"
+
+
+def test_tracker_rejects_a_repo_id_that_is_not_owner_slash_name(tmp_path):
+    with pytest.raises(ValueError):
+        _publisher(tmp_path, repo_id="talos-training-tracker")
+
+
+def test_tracker_creates_the_local_directory(tmp_path):
+    target = tmp_path / "nested" / "dir"
+    tracker = _publisher(tmp_path, dry_run=True, local_dir=str(target))
+    assert tracker.push(_row()) is True
+    assert (target / "status.json").is_file()
+    assert (target / "history.json").is_file()
+
+
+# ---------------------------------------------------------------------------
 # The notebook itself
 # ---------------------------------------------------------------------------
 def _load_notebook():
@@ -385,6 +556,20 @@ def test_notebook_displays_exactly_the_owner_fields():
     for label in tlib.DISPLAY_LABELS:
         # labels live in the lib's renderer, which the notebook calls per interval
         assert label in tlib.render_display_table(_row())
+
+
+def test_notebook_wires_the_public_tracker_and_the_drive_checkpoint_dir():
+    source = "\n".join("".join(cell["source"]) for cell in _load_notebook()["cells"])
+    # the owner's existing tracker repo, built from the lib and fed from the loop
+    assert "PrometheanStudio/talos-training-tracker" in source
+    assert "TrackerPublisher(" in source
+    assert "tracker.maybe_push(row" in source
+    assert "tracker.note_checkpoint(" in source
+    assert "tracker.flush()" in source
+    # checkpoints on Drive by default, TALOS_1B_OUT still overrides
+    assert "/content/drive/MyDrive/Talos/Talos_1B/checkpoints" in source
+    assert '"TALOS_1B_OUT"' in source
+    assert "runs/talos-1b-chat" in source
 
 
 def test_notebook_documents_resume_and_the_corpus_boundary():
