@@ -527,10 +527,11 @@ before activations and CUDA overhead (+0.5–1 GiB); ``talos_1b_spec16`` needs
 practice (batch ≥ 2 or any fragmentation pushes it out). **Inference on a T4
 at fp16 is feasible** (§7.2: ≈2.3 GiB for the full 2,048-token sequence).
 Minimum training hardware: ≈24 GB-class GPU for the 1B presets (A10G/3090/A100),
-≈20 GB-class for ``talos_1b_spec16``; the owner's **RTX 3060 12 GB** runs the
-bf16 + gradient-checkpointing + grad-accumulation configuration that
-``scripts/benchmark_1b.py`` measures (the measured microbatch ladder, not an
-estimate, decides what fits). A full-size fwd/bwd numerical smoke needs an
+≈20 GB-class for ``talos_1b_spec16``. GPU support is **Colab-only** (owner
+directive), with a per-GPU plan: **T4 → fp16 + GradScaler**, **L4/A100 → bf16**,
+each with gradient checkpointing + gradient accumulation as configured by
+``scripts/benchmark_1b.py`` (the measured microbatch ladder, not an estimate,
+decides what fits). A full-size fwd/bwd numerical smoke needs an
 A100-class GPU or a small batch (e.g. batch 1 × seq ≤ 128). **The team CPU box
 (3.9 GB RAM) cannot instantiate a 1B fp32 model (≈4 GB weights alone)**: that
 is exactly why the 1B validation in ``tests/test_talos_1b.py`` builds on the
@@ -559,7 +560,8 @@ ratio, tied embeddings).
   1,000,933,376 at vocab 32,000). `talos_1b_21l` and `talos_1b_spec16` keep
   vocab 32,000 and every other spec.
 - **No 1B benchmark has been run.** `scripts/benchmark_1b.py` exists so the
-  owner can measure the 1B presets on their RTX 3060 12 GB (OOM microbatch
+  owner can measure the 1B presets on a Colab GPU — T4 (fp16 + GradScaler) or
+  L4/A100 (bf16) — (OOM microbatch
   ladder, activation matrix, save→kill→resume verification, inference timing,
   runtime projections); it has not been executed and this repo contains no GPU
   results. Every VRAM/time number in §7.2–§7.3 is an **estimate**.

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""W4 — Talos 1B on-device benchmark harness (owner's RTX 3060 12 GB).
+"""W4 — Talos 1B on-device benchmark harness (owner's Colab GPU).
+
+Per-GPU plan (owner directive): **T4 → fp16 + GradScaler**, **L4/A100 → bf16**.
 
 One command, run by the OWNER on their own GPU. The team has no GPU access, so
 this module is written to be *fully structured and CPU-verifiable*: every
@@ -74,8 +76,8 @@ work at 10 optimizer steps by default, and the resume harness runs a handful
 of steps at a short sequence length. Nothing in this module deletes a
 checkpoint.
 
-Usage (owner, on the RTX 3060)
-------------------------------
+Usage (owner, on a Colab GPU: T4 fp16 + GradScaler, L4/A100 bf16)
+----------------------------------------------------------------
     python -m scripts.benchmark_1b --preset talos_1b --device cuda
 
 Usage (team, CPU wiring validation)
@@ -952,7 +954,7 @@ def build_matrix_plan(
     tens of minutes on a 1B model:
 
     1. baseline (amp=none, sdpa, no checkpointing)
-    2. bf16 (the 3060's fast path)
+    2. bf16 (the L4/A100 fast path)
     3. fp16 (the T4 path, kept for comparison)
     4. bf16 + grad-checkpoint (the VRAM lever)
     5. plain attention (SDPA off)
@@ -2336,7 +2338,8 @@ def make_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m scripts.benchmark_1b",
         description=(
-            "One-command Talos 1B benchmark for the owner's RTX 3060 12 GB: "
+            "One-command Talos 1B benchmark for a Colab GPU (T4 fp16 + GradScaler, "
+            "L4/A100 bf16): "
             "VRAM/utilisation/power, OOM microbatch ladder, activation matrix, "
             "save->kill->resume verification, runtime projections."
         ),
@@ -2354,7 +2357,7 @@ def make_arg_parser() -> argparse.ArgumentParser:
                    help="largest microbatch tried by the OOM ladder (halved to 1)")
     p.add_argument("--amp", default="bf16", choices=AMP_CHOICES,
                    help="AMP mode for the headline measured run "
-                        "(bf16 is the 3060's fast path)")
+                        "(bf16 on L4/A100; a T4 uses fp16 + GradScaler)")
     p.add_argument("--attention-backend", default="sdpa",
                    choices=ATTENTION_BACKEND_CHOICES,
                    help="attention backend for the headline measured run")

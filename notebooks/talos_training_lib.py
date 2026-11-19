@@ -1,6 +1,7 @@
 """Testable helpers for ``notebooks/talos_colab_train.ipynb`` (Talos 1B, 20B tokens).
 
-The notebook is the owner's live 1B Chinchilla run (RTX 3060 12 GB). Everything
+The notebook is the owner's live 1B Chinchilla run (Colab GPU: T4 fp16 +
+GradScaler, L4/A100 bf16). Everything
 in this module is **pure logic** — no ``torch``, no GPU, no network at import
 time — so the notebook's metrics row, ETA math, HTML display and Hugging Face
 Dataset sync can be unit-tested on CI with only ``pytest`` installed:

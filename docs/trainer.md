@@ -14,10 +14,10 @@
 >    `assets/tokenizers/talos_1b_32k.json` (vocab 32,000, v2) plus the
 >    asset-only `talos_1b_49k`. The vocab-1024 tokenizer this document uses for
 >    `tiny_100m` is still **not** in the repo.
-> 3. **The Colab/T4 path is no longer the target box.** The owner's local
->    **RTX 3060 12 GB** is the 1B benchmark/training machine, driven by
->    `scripts/benchmark_1b.py` — which has **not been run**, so no GPU results
->    exist anywhere. §29's "benchmark mode" item is satisfied by that sibling
+> 3. **GPU support is Colab-only** (owner directive). The 1B benchmark/training
+>    box is a Colab runtime with a per-GPU plan — **T4: fp16 + GradScaler**,
+>    **L4/A100: bf16** — driven by `scripts/benchmark_1b.py`, which has **not been
+>    run**, so no GPU results exist anywhere. §29's "benchmark mode" item is satisfied by that sibling
 >    script, not by a trainer flag.
 >
 > Project-level status lives in [`docs/STATUS.md`](STATUS.md); this document does
@@ -42,35 +42,35 @@ script. Those are stated as MISSING and specified, not implied to exist.**
 
 | # | Component | Status | Source (file:line) |
 |---|---|---|---|
-| 1 | `tiny_100m` preset config = exactly **96,482,304 params** | CURRENT (verified live) | `configs/presets.py:96-126` (`tiny_100m_config`) |
-| 2 | Canonical preset registry (`CANONICAL_PRESETS`, exact (params, vocab) tuples) | CURRENT | `configs/canonical.py:28-35` |
-| 3 | Single vocab source of truth `VOCAB_SIZE = 1024` | CURRENT | `configs/vocab.py:44` |
+| 1 | `tiny_100m` preset config = exactly **96,482,304 params** | CURRENT (verified live) | `configs/presets.py:151-191` (`tiny_100m_config`) |
+| 2 | Canonical preset registry (`CANONICAL_PRESETS`, exact (params, vocab) tuples) | CURRENT | `configs/canonical.py:59` |
+| 3 | Single vocab source of truth `VOCAB_SIZE = 1024` | CURRENT | `configs/vocab.py:35` |
 | 4 | Model constructor `TalosGPT(config)` with GQA/RoPE/dense-SwiGLU, un-tied, bias-free | CURRENT | `model/gpt.py:24-66`, `model/block.py:26-40`, `model/ffn.py:33-48` |
 | 5 | `ModelConfig` + `derive()` (head_dim / FFN width derived, validated) | CURRENT | `model/config.py:17-159` |
 | 6 | `num_parameters()` exact count | CURRENT | `model/gpt.py:168-170` |
-| 7 | Hard parameter-count guard in trainer (fails fast on drift) | CURRENT | `scripts/train_oasst1.py:503-533` (`check_preset_compat`), wired at `:1212-1215` |
-| 8 | Token-ID bounds guards (batch assembly + embedding seam, 3 layers) | CURRENT | `model/gpt.py:100-104`, `model/utils.py:57`, `scripts/train_oasst1.py:717/448`, `data/packed.py:58-86` |
-| 9 | Established tokenizer loaded via `--tokenizer-json`, sha256 fingerprint machinery | CURRENT | `scripts/train_oasst1.py:927-941, 977-991, 1140-1208` |
-| 10 | Tokenizer identity (sha256) recorded in every checkpoint + `metrics.json`; verified on resume | CURRENT | `scripts/train_oasst1.py:626-683, 1308-1317` |
-| 11 | Packed-corpus preparation CLI (`scripts/prepare_corpus.py`, HF streaming → `.npy` shards + manifest) | CURRENT | `scripts/prepare_corpus.py:557-591` (CLI), `:333-548` (core) |
-| 12 | Packed dataset + manifest validation (`data/packed.py`) | CURRENT | `data/packed.py:87-268` (`load_packed_manifest`, `manifest_identity`, `packed_phase_shard_paths`), `:270-` (`PackedTokenDataset`) |
-| 13 | Token-budget stop (`--token-budget`), warmup, cosine decay (min 10 %) | CURRENT | `scripts/train_oasst1.py:127-198` (`TokenSchedule`), `:950-962` (flags), `:828-840` (stop) |
-| 14 | Resume: explicit `step-<N>.pt` OR directory with numeric-newest + corrupt-fallback | CURRENT | `scripts/train_oasst1.py:206-221, 993-1015` |
-| 15 | Resume identity rejections (preset/params, tokenizer fp, data source, packed corpus identity) | CURRENT | `scripts/train_oasst1.py:222-252, 1060-1105, 1178-1208` |
-| 16 | Checkpoint v1 format (weights+optimizer+RNG+counters+run metadata embedded) | CURRENT | `scripts/train_oasst1.py:626-683` |
-| 17 | `train_run_metadata.json` sidecar (atomic write, same dict as in-checkpoint) | CURRENT | `scripts/train_oasst1.py:282-340` |
-| 18 | `metrics.json` run report (losses, tokens, wall, peak RSS, tokenizer identity…) | CURRENT | `scripts/train_oasst1.py:1426-1494` |
-| 19 | Validation per epoch (held-out val loss; mean CE → perplexity via eval harness) | CURRENT | `scripts/train_oasst1.py:588-625`, `evaluation/harness.py:80-99` |
-| 20 | Eval CLI (`scripts/eval_checkpoint.py`) + generation CLI (`scripts/generate.py`) | CURRENT | `scripts/eval_checkpoint.py:47-85`, `scripts/generate.py:265-291` |
-| 21 | Safetensors release export for the 100M preset | CURRENT | `scripts/export_safetensors.py:309-312` (+ tests `tests/test_safetensors_io.py`) |
-| 22 | Grad clipping / NaN-Inf detection in the trainer loop | **CURRENT** (hardening pass) — loss finiteness checked before `backward`, gradient finiteness after, on EVERY step; a bad step skips the optimizer update, logs a structured event into `metrics.json`, writes a safety checkpoint, and aborts after `--max-consecutive-bad-steps` (default 3). `--grad-clip` bounds the total grad norm and records the pre-clip norm | `scripts/train_oasst1.py:979-1018` (loop guards), `:895-950` (`handle_bad_step`), `:606-620` (`BadStepsAbort`), metadata `:1573-1582` |
-| 23 | Super-save / intra-epoch checkpointing | **CURRENT** — `--save-every-tokens N` writes an atomic v1 checkpoint at every absolute multiple of N tokens since run start (restored on resume), through the same single checkpoint writer; epoch-end checkpoints unchanged | `scripts/train_oasst1.py:1015-1039` (periodic), `:661-734` (single writer + atomic `os.replace`), flag `:1162-1170` |
+| 7 | Hard parameter-count guard in trainer (fails fast on drift) | CURRENT | `scripts/train_oasst1.py:766-797` (`check_preset_compat`), wired at `:829` |
+| 8 | Token-ID bounds guards (batch assembly + embedding seam, 3 layers) | CURRENT | `model/gpt.py:100-104`, `model/utils.py:57`, `scripts/train_oasst1.py:1395/939`, `data/packed.py:58-86` |
+| 9 | Established tokenizer loaded via `--tokenizer-json`, sha256 fingerprint machinery | CURRENT | `scripts/train_oasst1.py:1924-1939, 2374-2390` |
+| 10 | Tokenizer identity (sha256) recorded in every checkpoint + `metrics.json`; verified on resume | CURRENT | `scripts/train_oasst1.py:1013-1032, 2374-2390` |
+| 11 | Packed-corpus preparation CLI (`scripts/prepare_corpus.py`, HF streaming → `.npy` shards + manifest) | CURRENT | `scripts/prepare_corpus.py:821-871` (CLI), `:582-812` (core) |
+| 12 | Packed dataset + manifest validation (`data/packed.py`) | CURRENT | `data/packed.py:93-275` (`load_packed_manifest`, `manifest_identity`, `packed_phase_shard_paths`), `:432-542` (`PackedTokenDataset`) |
+| 13 | Token-budget stop (`--token-budget`), warmup, cosine decay (min 10 %) | CURRENT | `scripts/train_oasst1.py:359-437` (`TokenSchedule`), `:1793-1805` (flags), `:1206-1212` (stop) |
+| 14 | Resume: explicit `step-<N>.pt` OR directory with numeric-newest + corrupt-fallback | CURRENT | `scripts/train_oasst1.py:438-453, 1160-1180` |
+| 15 | Resume identity rejections (preset/params, tokenizer fp, data source, packed corpus identity) | CURRENT | `scripts/train_oasst1.py:454-518, 2207-2260` |
+| 16 | Checkpoint v1 format (weights+optimizer+RNG+counters+run metadata embedded) | CURRENT | `scripts/train_oasst1.py:974-1063` |
+| 17 | `train_run_metadata.json` sidecar (atomic write, same dict as in-checkpoint) | CURRENT | `scripts/train_oasst1.py:575-603` |
+| 18 | `metrics.json` run report (losses, tokens, wall, peak RSS, tokenizer identity…) | CURRENT | `scripts/train_oasst1.py:2604-2700` |
+| 19 | Validation per epoch (held-out val loss; mean CE → perplexity via eval harness) | CURRENT | `scripts/train_oasst1.py:913-950`, `evaluation/harness.py:80-112` |
+| 20 | Eval CLI (`scripts/eval_checkpoint.py`) + generation CLI (`scripts/generate.py`) | CURRENT | `scripts/eval_checkpoint.py:47-85`, `scripts/generate.py:349-420` |
+| 21 | Safetensors release export for the 100M preset | CURRENT | `scripts/export_safetensors.py:302-330` (+ tests `tests/test_safetensors_io.py`) |
+| 22 | Grad clipping / NaN-Inf detection in the trainer loop | **CURRENT** (hardening pass) — loss finiteness checked before `backward`, gradient finiteness after, on EVERY step; a bad step skips the optimizer update, logs a structured event into `metrics.json`, writes a safety checkpoint, and aborts after `--max-consecutive-bad-steps` (default 3). `--grad-clip` bounds the total grad norm and records the pre-clip norm | `scripts/train_oasst1.py:1576-1620` (loop guards), `:1270-1326` (`handle_bad_step`), `:896-912` (`BadStepsAbort`), metadata `:2643-2668` |
+| 23 | Super-save / intra-epoch checkpointing | **CURRENT** — `--save-every-tokens N` writes an atomic v1 checkpoint at every absolute multiple of N tokens since run start (restored on resume), through the same single checkpoint writer; epoch-end checkpoints unchanged | `scripts/train_oasst1.py:1524-1560` (periodic), `:974-1063` (single writer + atomic `os.replace`), flag `:1806-1814` |
 | 24 | Benchmark mode (s/step, tok/s, peak VRAM) | **PARTIAL** — there is still no *trainer-side* benchmark flag, but `scripts/benchmark_1b.py` (PR #39) is the standalone one-command benchmark (VRAM, OOM microbatch ladder, activation matrix, resume check, inference timing). **It has not been run; no GPU result exists.** | `scripts/benchmark_1b.py`, §29 item 1 |
 | 25 | Preflight gate script (`scripts/preflight.py`) | **MISSING** — proposed in §16 | n/a |
 | 26 | GPU-memory / ETA logging in the trainer | **MISSING (partially improved)** — still no VRAM/ETA sampling, ONLY host peak RSS + wall time; the hardening pass DID add grad-norm / bad-step / abort records to `metrics.json` (see §15.2) | `scripts/train_oasst1.py:1704-1739` (stability metrics) — GPU/ETA itself remains n/a |
 | 27 | FP16/AMP training | **IMPLEMENTED (W2, §31.1)** — opt-in `--amp fp16`/`--amp bf16`; default none = legacy fp32 bit-identical. BF16 still unavailable on T4 (SM7.5) — use fp16 there. The old owner-reported fp16 failure (§11, §28) is historical (pre-SDPA). | `scripts/train_oasst1.py` §31.1; `tests/test_trainer_engine_w2.py` |
 | 28 | Google Drive layout / Drive storage preflight | **PROPOSED** — a deployment convention, not code (§14) | n/a |
-| 29 | Colab T4 tool / path (platform) | SUPERSEDED — the owner's local **RTX 3060 12 GB** replaced Colab T4 as the 1B benchmark/training box; the team has no GPU access. Kept only as the historical record of why this document targets a T4 shape. | `docs/STATUS.md` |
+| 29 | Colab T4 tool / path (platform) | SUPERSEDED — GPU support is now **Colab-only** (owner directive), and the T4 shape this document targets is one of its two per-GPU plans (T4: fp16 + GradScaler; L4/A100: bf16). The team has no GPU access. Kept as the historical record. | `docs/STATUS.md` |
 | 30 | OASST1 data preserved for later SFT | CURRENT (untouched in repo; see §24) | plan §24 |
 
 Legend: **CURRENT** = verified in this repo at `d8bfbdd` · **PARTIAL** = exists with gaps ·
@@ -221,20 +221,20 @@ Verified values (construct + forward on CPU; `logits.shape == (B, S, 1024)`):
 
 | Field | Value | Where defined |
 |---|---|---|
-| `vocab_size` | 1024 | `configs/vocab.py:44` → `presets.py:97` |
-| `hidden_size` | 1024 | `presets.py:98` |
-| `num_layers` | 6 | `presets.py:99` |
-| `num_attention_heads` (Q) | 64 | `presets.py:100` |
-| `num_kv_heads` (KV) | 32 (2:1 GQA) | `presets.py:101` |
-| `head_dim` | 16 | `presets.py:102` |
-| `ffn_type` | `"dense"` (SwiGLU) | `presets.py:103` |
-| `intermediate_size` | 4096 (4× hidden) | `presets.py:104` |
-| `max_seq_len` | 512 | `presets.py:105` |
-| `attention_type` | `"full"` (causal) | `presets.py:106` |
-| `rope_theta` | 10000.0 | `presets.py:107` |
-| `layer_norm_eps` | 1e-5 | `presets.py:108` |
-| `tie_word_embeddings` | False (un-tied; `lm_head` exists `gpt.py:37`) | config default `config.py:105` |
-| biases | **None** — every `nn.Linear` is `bias=False` | `gpt.py:37`, `block.py:36-39` |
+| `vocab_size` | 1024 | `configs/vocab.py:35` → `presets.py:177` |
+| `hidden_size` | 1024 | `presets.py:178` |
+| `num_layers` | 6 | `presets.py:179` |
+| `num_attention_heads` (Q) | 64 | `presets.py:180` |
+| `num_kv_heads` (KV) | 32 (2:1 GQA) | `presets.py:181` |
+| `head_dim` | 16 | `presets.py:182` |
+| `ffn_type` | `"dense"` (SwiGLU) | `presets.py:183` |
+| `intermediate_size` | 4096 (4× hidden) | `presets.py:184` |
+| `max_seq_len` | 512 | `presets.py:185` |
+| `attention_type` | `"full"` (causal) | `presets.py:186` |
+| `rope_theta` | 10000.0 | `presets.py:187` |
+| `layer_norm_eps` | 1e-5 | `presets.py:188` |
+| `tie_word_embeddings` | False (un-tied; `lm_head` exists `gpt.py:41`) | config default `config.py:88` |
+| biases | **None** — every `nn.Linear` is `bias=False` | `gpt.py:41`, `block.py:36-39` |
 | `dropout` | 0.0 | config default |
 | init | `normal_(0, 0.02)` on Linear/Embedding, RMSNorm weight=1, `embed_scale = sqrt(hidden)` | `gpt.py:48-66` |
 | Param count | **96,482,304** (`2·V·H + L·(15H²+2H) + H` = 2·1024·1024 + 6·15,730,688 + 1024) | `presets.py:110-113` docstring; **verified live** |
@@ -246,9 +246,9 @@ match the registry entry for `--preset tiny_100m`:
 
 - `check_preset_compat(preset, cfg, n_params)` (`scripts/train_oasst1.py:503-533`) raises
   `ValueError` on any mismatch and prints the expected count before training. Wired at
-  `train_run()` step 2 (`:1212-1215`: `build_preset_model` → guard).
+  `train_run()` step 2 (`:809-832`: `build_preset_model` → guard).
 - The same exact-count check runs again on **resume** (`validate_resume_checkpoint`,
-  `:222-252`, checks `n_params` and resolves the checkpoint's preset).
+  `:454-518`, checks `n_params` and resolves the checkpoint's preset).
 - The canonical registry itself is `configs/canonical.py:28-35`; `expected_params(cfg)` and
   `resolve_preset(cfg)` are the programmatic entrypoints.
 
@@ -261,7 +261,7 @@ For an external preflight script (§16) this check should be **re-run explicitly
   format `talos-training-checkpoint-v1`, fields in §13.
 - **Load**: `load_checkpoint(path)` (`:684-687`) → `torch.load(map_location="cpu",
   weights_only=False)`. Loading a checkpoint **does not** by itself rebuild the model — the trainer
-  builds the preset model first and `load_state_dict` at resume (`:759`).
+  builds the preset model first and `load_state_dict` at resume (`:1167`).
 - Eval/generation load via `evaluation/harness.py` / `inference/generate.py` + CLI wrappers.
 
 ---
@@ -276,10 +276,10 @@ trainer on this path and NOT regenerated from the corpus.
 | Established artifact | `tokenizer.json` published at `https://huggingface.co/PrometheanStudio/talos-mini-254k-oasst1/resolve/main/tokenizer.json` | public, no token; per research memo §1 |
 | sha256 (canonical identity) | `58e4ad40b174c9fde3cec8e86188115bcdee173e7fcd188e7ba139a04b549e48` (26,108 bytes) | research memo §1; byte-identical to team-trained tokenizer (`benchmarks/phase-b/data-provenance.json`) |
 | vocab size | 1024 | verified via `ByteLevelBPETokenizer` |
-| merges | 764 (vocab 1024 = 256 base byte tokens + 4 specials + 764 BPE merges) | `configs/vocab.py:44` docstring; `tokenizer/vocab.py:93` |
+| merges | 764 (vocab 1024 = 256 base byte tokens + 4 specials + 764 BPE merges) | `configs/vocab.py:35` docstring; `tokenizer/vocab.py:93` |
 | Load | `tokenizer.tokenizer.ByteLevelBPETokenizer.from_file(path)` | `tokenizer/tokenizer.py:284` |
 | Special-token ids | BOS `<|beginoftext|>`=1020, **EOS `<|endoftext|>`=1021**, PAD `<|pad|>`=1022, UNK `<|unk|>`=1023 (specials at the top, `vocab_size-n_special..vocab_size-1`) | `tokenizer/vocab.py:130-135` (+ `:26-31`); audit §14 |
-| EOS use in packing | every doc is stored as `encode(text) + [eos_id]` (incl. the last); `pad_id` fills the final partial row | `scripts/prepare_corpus.py:25-31` docstring; `data/tokenized.py` pack mode |
+| EOS use in packing | every doc is stored as `encode(text) + [eos_id]` (incl. the last); `pad_id` fills the final partial row | `scripts/prepare_corpus.py:42-47` docstring; `data/tokenized.py` pack mode |
 
 ### 6.1 How the trainer consumes it (CURRENT)
 
@@ -289,16 +289,16 @@ trainer on this path and NOT regenerated from the corpus.
   still verified from the manifest sha256) — `scripts/train_oasst1.py:927-941` (help text)
   and `:1140-1208` (resolution logic).
 - **Fingerprint machinery**: `tokenizer_file_sha256(path)` (`tokenizer/tokenizer.py:35`) hashes the
-  serialized file. The trainer records it in every checkpoint (`tokenizer_fingerprint`, `:655-657`)
-  and in `metrics.json` (`tokenizer_sha256`, `:1437`); the preparation manifest records it too
+  serialized file. The trainer records it in every checkpoint (`tokenizer_fingerprint`, `train_oasst1.py:1013-1032`)
+  and in `metrics.json` (`tokenizer_sha256`, `:2604`); the preparation manifest records it too
   (`prepare_corpus.py:345-350`, `:378-383`).
 - **Mismatch detection (all CURRENT, all loud)**:
-  - fresh run: `_verify_and_load_tokenizer(path, expected_sha=None)` (`:977-991`) just loads; the
-    vocab-fit contract `tokenizer.vocab_size <= model_vocab` is enforced at `:1200-1207`;
-  - resume: the sidecar's sha256 must equal the checkpoint's recorded fingerprint (`:1178-1196`);
-    `--tokenizer-json` on resume must match the checkpoint fingerprint too (`:1186-1192`);
+  - fresh run: `_verify_and_load_tokenizer(path, expected_sha=None)` (`:1924-1939`) just loads; the
+    vocab-fit contract `tokenizer.vocab_size <= model_vocab` is enforced at `:745-754`;
+  - resume: the sidecar's sha256 must equal the checkpoint's recorded fingerprint (`:2374-2390`);
+    `--tokenizer-json` on resume must match the checkpoint fingerprint too (`:2382-2390`);
   - packed path: the manifest's recorded tokenizer sha256 must equal the provided file's, and on
-    resume the checkpoint's fingerprint must equal the manifest's (`:1198-1208`).
+    resume the checkpoint's fingerprint must equal the manifest's (`:2403-2410`).
 - **Proposed Colab location (PROPOSED, configurable — pick any path, pass it to both scripts)**:
   `/content/drive/MyDrive/Talos/Styx_100M/tokenizer/tokenizer.json`. Nothing in the repo hard-codes
   this path; it is a deployment convention from the plan. **Verify `sha256sum` after download.**
@@ -309,7 +309,7 @@ trainer on this path and NOT regenerated from the corpus.
 
 | Property | Value | Source / status |
 |---|---|---|
-| Dataset | `HuggingFaceFW/fineweb-edu`, config **`sample-10BT`**, split **`train`** | research memo §3.1 (measured); default of `prepare_corpus.py:562-566` |
+| Dataset | `HuggingFaceFW/fineweb-edu`, config **`sample-10BT`**, split **`train`** | research memo §3.1 (measured); default of `prepare_corpus.py:826-830` |
 | Access | **Streaming via `datasets`, ungated, NO auth token** (verified 2026-09-27 on this box; HF API `gated:false`) | research memo §1-2, §5 |
 | Format | 14 parquet files, 28.5 GB on disk; 9,672,101 docs; fields include `text`, `token_count`, `score`/`int_score` | memo §3.1 |
 | License | **ODC-By v1.0** (+ Common Crawl ToU) — attribution-only; redistributing checkpoints trained on it is fine | memo §3.1 |
@@ -332,7 +332,7 @@ Caveats (stated by the research memo, keep when quoting numbers):
 Run once (per desired corpus slice), streamed end-to-end; output is the **`--packed-dir`** the
 trainer consumes. **BPE is NOT trained here** — `--tokenizer-json` is required.
 
-### 8.1 Exact CLI (from `make_arg_parser`, `prepare_corpus.py:557-591`)
+### 8.1 Exact CLI (from `make_arg_parser`, `prepare_corpus.py:821-871`)
 
 | Flag | Type | Default | Required | Meaning |
 |---|---|---|---|---|
@@ -377,7 +377,7 @@ python -m scripts.prepare_corpus \
   `train_tokens_incl_padding` (`rows*seq`) and `val_pad_tokens`/`train_pad_tokens`.
 - **Atomicity**: all `.npy` shards are written via `NpyShardWriter` using temp file +
   `os.replace`; both JSON outputs (`manifest.json`, `run_metadata.json`) are written via
-  `_atomic_write_json` (tmp + `os.replace`) — `prepare_corpus.py:99-186`, `:549-555`.
+  `_atomic_write_json` (tmp + `os.replace`) — `prepare_corpus.py:813-820`.
 - **Manifest** (`manifest.json`, format `talos-packed-tokens-v1`): top-level `format`, `dtype`,
   `seq_len`, `eos_id`, `pad_id`, `num_shards`, `shards` (val shards listed first, then train;
   each entry = `{name, phase, rows, ...}` from the writer), and a `metadata` block = the same dict
@@ -385,7 +385,7 @@ python -m scripts.prepare_corpus \
   (dataset/config/split/revision/sha), `tokenizer` (path/sha256/vocab_size/configured_vocab_size/merge_count/exact_bpe), `packing`
   (seq/eos_id/pad_id/dtype/vocab_size_bound/rows_per_shard/stream_buffer_docs), `val_region`,
   `train_region`, `counts` (full token/row/char/pad counters incl. `total_tokens`, `truncated`),
-  `wall_s` — `prepare_corpus.py:344-548`.
+  `wall_s` — `prepare_corpus.py:582-812`.
 - **Disk/RAM**: bounded — at most `stream_buffer_docs` docs' tokens + one shard in RAM; a
   16 384-row × seq-512 int32 shard is ~32 MiB (`data/packed.py:25-36`). 2 B real tokens ≈
   7.7 GB int32 / 3.9 GB uint16 on disk (research memo §3.1).
@@ -408,12 +408,12 @@ opt.zero_grad(); loss.backward(); opt.step()
 
 - `loss_fn = torch.nn.CrossEntropyLoss()` (`:751`) — **mean reduction** over `B*(S-1)` tokens.
   (Note the eval path uses `CrossEntropyLoss(reduction="sum")` and normalizes externally — §9.2.)
-- Every batch is token-id-range-checked before the model (`validate_token_ids`, `:717`), and the
+- Every batch is token-id-range-checked before the model (`validate_token_ids`, `:1395`), and the
   model re-checks at the embedding seam (`model/gpt.py:100-104`).
 - One optimizer step = one batch **by default**. Gradient accumulation is available as an
   opt-in flag (`--grad-accum N`, W2 pass): with N > 1 the dataloader yields N micro-batches per
   optimizer step, each loss scaled by 1/N — see §31.3.
-- Per-epoch mean train loss: `sum(epoch_losses)/len(epoch_losses)` (`:841-843`), recorded per epoch.
+- Per-epoch mean train loss: `sum(epoch_losses)/len(epoch_losses)` (`:1528-1536`), recorded per epoch.
 
 ### 9.1 Shapes
 
@@ -426,10 +426,10 @@ opt.zero_grad(); loss.backward(); opt.step()
 
 ### 9.2 Validation loss / perplexity
 
-`evaluate()` (`:588-625`) computes mean NLL over the val stream: `sum(loss)/count` over all full
+`evaluate()` (`:913-950`) computes mean NLL over the val stream: `sum(loss)/count` over all full
 batches; `val_max_steps` caps the number of val batches (CI/smoke). It returns `None` for an empty
 val stream. Perplexity is **not computed by the trainer**; the eval harness reports
-`val_perplexity` (`evaluation/harness.py:90`) — `exp(val_loss)` on the same mean-NLL basis. Use
+`val_perplexity` (`evaluation/harness.py:94`) — `exp(val_loss)` on the same mean-NLL basis. Use
 `scripts/eval_checkpoint.py` for the official per-checkpoint loss/ppl/acc numbers (§27).
 
 ---
@@ -455,21 +455,21 @@ Only `lr` is configurable. **Everything else is torch AdamW default**:
 | gradient clipping | `--grad-clip N` default **0 = off** (§12) | **CURRENT** — `torch.nn.utils.clip_grad_norm_` after backward; pre-clip norm recorded |
 | gradient accumulation | `--grad-accum N` default **1** (= batch is the optimizer step, legacy path) | **CURRENT** (W2, §31.3) — `--batch` becomes the micro-batch; accounting counts optimizer steps |
 
-### 10.2 LR schedule (CURRENT; `TokenSchedule`, `:127-198`)
+### 10.2 LR schedule (CURRENT; `TokenSchedule`, `:359-437`)
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--lr` | `3e-3` | peak LR; linear warmup 0→lr over `--warmup-tokens`, then decay per `--lr-decay`; step LR is a pure function of tokens consumed so far (pre-step count) |
 | `--warmup-tokens` | `0` | linear warmup span; 0 = no warmup (fixed LR). Must be `< token budget` when budget set |
 | `--lr-decay` | `"none"` | `none` (fixed LR) or `cosine` — cosine from `lr` down to `min_lr_ratio × lr = 10 %` over `budget - warmup`; **cosine requires `--token-budget`** |
-| `MIN_LR_RATIO` | `0.1` (code constant `:120`) | floor for cosine decay, not a flag |
+| `MIN_LR_RATIO` | `0.1` (code constant `:129`) | floor for cosine decay, not a flag |
 
 ### 10.3 Batch / sequence / tokens
 
 | Quantity | Value | Notes |
 |---|---|---|
-| `--batch` | default 4 (`:948-949`) | for `tiny_100m` on a T4 use 32 at S=64 (plan/§11); batch 4 is the CLI default, mirror of tiny A/B runs |
-| `--seq` | JSONL default 64; **packed: manifest `seq_len` wins** (`:1066-1079`); explicit `--seq` must equal the manifest or it errors | `--packed-dir` rows are used verbatim |
+| `--batch` | default 4 (`:1791`) | for `tiny_100m` on a T4 use 32 at S=64 (plan/§11); batch 4 is the CLI default, mirror of tiny A/B runs |
+| `--seq` | JSONL default 64; **packed: manifest `seq_len` wins** (`:2235-2242`); explicit `--seq` must equal the manifest or it errors | `--packed-dir` rows are used verbatim |
 | tokens/step | `B × (S-1)` (e.g. 32×63 = 2,016 at B=32/S=64; 4×511 = 2,044 at B=4/S=512) | counts toward `--token-budget` |
 
 ### 10.4 Frequencies (what exists TODAY)
@@ -545,15 +545,15 @@ detection. Verified by reading the loop + the tests in
 
 | Guard | Status | Where |
 |---|---|---|
-| NaN/Inf **loss** detection (BEFORE `backward`) | **CURRENT** — `if not torch.isfinite(loss)` → bad step | `:978-985` |
-| NaN/Inf **gradient** detection (AFTER `backward`) | **CURRENT** — first param with a non-finite `.grad` is identified by name | `:986-1001` |
-| bad-step handling | skip the optimizer step **entirely** (no `backward` for a bad loss, no `opt.step()` for a bad grad — weights keep the last-good state) | `:895-950` (`handle_bad_step`) |
-| loud structured events | one dict per bad step in `history.bad_step_events` → `metrics.json["bad_steps"]`: `{step, tokens_consumed, tensor, stat (nan/inf), loss, consecutive_bad_steps, checkpoint}` + an `ERROR` log line | `:919-938` |
-| safety checkpoint | written IMMEDIATELY on every bad step, same v1 format/atomic writer, named `step-<N>.pt` (N = the attempted step), holding the **last-good** weights/optimizer/RNG + the pre-step `tokens_consumed` | `:907-918` |
-| abort after K consecutive | `--max-consecutive-bad-steps` (default 3; `0` = never abort): after K consecutive bad steps `train_epochs` raises `BadStepsAbort`; `train_run` still writes `metrics.json` + finish-stamps the sidecar, then exits non-zero (code 3). The last safety checkpoint is the recoverable state and passes every resume-validation rule | `:939-950`, `:1742-1776`, `main` `:1819-1831` |
-| consecutive counter | reset to 0 by every good step | `:1008` |
-| gradient clipping | `--grad-clip N` → `torch.nn.utils.clip_grad_norm_` after the finiteness check, BEFORE `opt.step()`; the **PRE-clip** total norm is recorded in `history.last_grad_norm`, every subsequent checkpoint (`last_grad_norm` payload key) and `metrics.json`; `0` (default) = off, step untouched | `:1002-1006`, payload `:727-730` |
-| metadata self-report | `training_config.gradient_clip_type` = `"max_grad_norm"` (or `None` when off), `grad_clip_max_norm` = the numeric value, `nan_inf_detection: True`, `max_consecutive_bad_steps`, `save_every_tokens` — the OLD `None`/`False` literal is gone | `:1573-1582` |
+| NaN/Inf **loss** detection (BEFORE `backward`) | **CURRENT** — `if not torch.isfinite(loss)` → bad step | `:1576-1592` |
+| NaN/Inf **gradient** detection (AFTER `backward`) | **CURRENT** — first param with a non-finite `.grad` is identified by name | `:1601-1612` |
+| bad-step handling | skip the optimizer step **entirely** (no `backward` for a bad loss, no `opt.step()` for a bad grad — weights keep the last-good state) | `:1270-1326` (`handle_bad_step`) |
+| loud structured events | one dict per bad step in `history.bad_step_events` → `metrics.json["bad_steps"]`: `{step, tokens_consumed, tensor, stat (nan/inf), loss, consecutive_bad_steps, checkpoint}` + an `ERROR` log line | `:1285-1310` |
+| safety checkpoint | written IMMEDIATELY on every bad step, same v1 format/atomic writer, named `step-<N>.pt` (N = the attempted step), holding the **last-good** weights/optimizer/RNG + the pre-step `tokens_consumed` | `:1248-1269` |
+| abort after K consecutive | `--max-consecutive-bad-steps` (default 3; `0` = never abort): after K consecutive bad steps `train_epochs` raises `BadStepsAbort`; `train_run` still writes `metrics.json` + finish-stamps the sidecar, then exits non-zero (code 3). The last safety checkpoint is the recoverable state and passes every resume-validation rule | `:1315-1326`, `:2726-2745`, `main` `:2770-2782` |
+| consecutive counter | reset to 0 by every good step | `:1625` |
+| gradient clipping | `--grad-clip N` → `torch.nn.utils.clip_grad_norm_` after the finiteness check, BEFORE `opt.step()`; the **PRE-clip** total norm is recorded in `history.last_grad_norm`, every subsequent checkpoint (`last_grad_norm` payload key) and `metrics.json`; `0` (default) = off, step untouched | `:1613-1622`, payload `:1044-1046` |
+| metadata self-report | `training_config.gradient_clip_type` = `"max_grad_norm"` (or `None` when off), `grad_clip_max_norm` = the numeric value, `nan_inf_detection: True`, `max_consecutive_bad_steps`, `save_every_tokens` — the OLD `None`/`False` literal is gone | `:2643-2668` |
 
 **Behavior on a bad step** (identical for a NaN/Inf loss and a non-finite
 gradient): the step is *attempted* (it consumes a step number, so checkpoint
@@ -574,7 +574,7 @@ run this pass describes is still FP32.)
 
 ## 13. Checkpointing
 
-### 13.1 v1 format (`talos-training-checkpoint-v1`) — fields, from `save_checkpoint` (`:661-734`)
+### 13.1 v1 format (`talos-training-checkpoint-v1`) — fields, from `save_checkpoint` (`:974-1063`)
 
 | Field | Content |
 |---|---|
@@ -588,7 +588,7 @@ run this pass describes is still FP32.)
 | `tokenizer_fingerprint` | sha256 of the serialized tokenizer (or manifest-recorded sha on packed runs without sidecar) |
 | `model_state_dict` | full weights — on a safety checkpoint these are the LAST-GOOD weights |
 | `optimizer_state_dict` | AdamW state (resume-enabling, additive; old v1 ckpts lack it → resume refuses) |
-| `rng_state` | torch CPU/GPU + numpy + python RNG snapshots (`capture_rng_state`, `:341-356`) |
+| `rng_state` | torch CPU/GPU + numpy + python RNG snapshots (`capture_rng_state`, `:604-620`) |
 | `epoch` | last completed epoch (`periodic`/safety ckpts record the epoch being trained) |
 | `tokens_consumed` | **tokens since run start, including all prior resumed sessions**; on safety ckpts the pre-bad-step count |
 | `run_metadata` | the SAME dict as `train_run_metadata.json` |
@@ -626,7 +626,7 @@ are **atomic** (`<path>.tmp` + `os.replace`).
 - `--resume <path>` accepts a **file** `step-<N>.pt` or a **directory**; directories are scanned
   for `step-<N>.pt` (regex `:208`) and sorted **numerically descending** (never lexicographic —
   regression-guarded, `:206-221`).
-- Each candidate passes `validate_resume_checkpoint` (`:222-252`: format, preset resolution,
+- Each candidate passes `validate_resume_checkpoint` (`:454-518`: format, preset resolution,
   exact `n_params`, optimizer presence); failing candidates are skipped with a warning and the
   next-newest is tried; if all fail, the run refuses to start.
 - Resume also enforces: same data source, same packed-corpus identity
@@ -641,7 +641,7 @@ are **atomic** (`<path>.tmp` + `os.replace`).
 
 - The **metadata JSON sidecars are atomic** (`tmp` + `os.replace`; `write_run_metadata`).
 - The **`.pt` checkpoint is NOW atomic too** — `save_checkpoint` serializes to `<path>.tmp` and
-  `os.replace`s it into place (`:732-734`), so a crash mid-save can never leave a truncated
+  `os.replace`s it into place (`:1059`), so a crash mid-save can never leave a truncated
   `step-N.pt` for the resume scanner to trip over. The corrupt-fallback scanner stays as a second
   line of defence for pre-hardening artifacts.
 - **Intra-epoch ("super-save") checkpointing: CURRENT.** `--save-every-tokens N` writes periodic
@@ -745,22 +745,22 @@ consecutive_bad_steps, checkpoint}`), `total_bad_steps`, `consecutive_bad_steps`
 |---|---|---|---|
 | 1 | GPU is a T4 and torch sees CUDA | PARTIAL (no script; trivially runnable) | `python -c "import torch; print(torch.cuda.get_device_name(0))"`; notebook asserts T4 (shared/colab) |
 | 2 | CUDA version / driver compatible with torch | PARTIAL | `torch.version.cuda` + `nvidia-smi` — operator check |
-| 3 | Repo checkout at the intended commit, clean | CURRENT | `git_repo_state()` records commit/branch/dirty in metadata (`train_oasst1.py:256-281`); preflight should assert `d8bfbdd` |
+| 3 | Repo checkout at the intended commit, clean | CURRENT | `git_repo_state()` records commit/branch/dirty in metadata (`train_oasst1.py:519-544`); preflight should assert `d8bfbdd` |
 | 4 | No uncommitted drift | CURRENT (recorded) | same `git_repo_state()`; trainer does not refuse on dirty — an explicit preflight `git status --porcelain` assert is NEEDS IMPLEMENTATION |
 | 5 | Deps importable (torch, numpy, datasets, tokenizers) | PARTIAL | `pip check`-style; `datasets` needed only for prep |
-| 6 | `tokenizer.json` exists at the chosen path | CURRENT | `--tokenizer-json` raises `FileNotFoundError` (`train_oasst1.py:977-981`) |
-| 7 | Tokenizer sha256 == `58e4ad40…` | CURRENT | `tokenizer_file_sha256` + compare; on resume checked against checkpoint fp (`:1178-1196`) |
+| 6 | `tokenizer.json` exists at the chosen path | CURRENT | `--tokenizer-json` raises `FileNotFoundError` (`train_oasst1.py:1929`) |
+| 7 | Tokenizer sha256 == `58e4ad40…` | CURRENT | `tokenizer_file_sha256` + compare; on resume checked against checkpoint fp (`:2374-2390`) |
 | 8 | Tokenizer vocab (1024) ≤ model vocab (1024) | CURRENT | `:1200-1207` raises on violation |
-| 9 | Model builds with `--preset tiny_100m` | CURRENT | `build_preset_model` (`:546-557`) |
-| 10 | Param count == 96,482,304 | CURRENT | `check_preset_compat` (`:503-533`); resume re-checks (`:222-252`) |
+| 9 | Model builds with `--preset tiny_100m` | CURRENT | `build_preset_model` (`:809-832`) |
+| 10 | Param count == 96,482,304 | CURRENT | `check_preset_compat` (`:766-797`); resume re-checks (`:454-518`) |
 | 11 | vocab == 1024 from the single source | CURRENT | registry + `configs.vocab.VOCAB_SIZE`; `tests/test_vocab_seam.py` |
 | 12 | Packed corpus manifest loads & validates | CURRENT | `data/packed.py:87-221` (`load_packed_manifest`) — exact `expected_seq/vocab/tokenizer_sha256` |
-| 13 | Manifest seq == trainer seq (no silent reshape) | CURRENT | `:1066-1079` errors on mismatch |
+| 13 | Manifest seq == trainer seq (no silent reshape) | CURRENT | `:2235-2242` errors on mismatch |
 | 14 | Manifest dtype ∈ {int32, uint16} | CURRENT | `VALID_DTYPES` + `_check_rows_and_ids` dtype check (`data/packed.py:58-86`) |
 | 15 | Shard files exist and match manifest rows/shape | CURRENT | header mmap check per shard at stream time (`data/packed.py:52-86`) |
-| 16 | Val region disjoint from train region | CURRENT (by construction) | `--val-skip-docs` carve (`prepare_corpus.py:25-31` docstring); manifest `val_region`/`train_region` records |
+| 16 | Val region disjoint from train region | CURRENT (by construction) | `--val-skip-docs` carve (`prepare_corpus.py:24-29` docstring); manifest `val_region`/`train_region` records |
 | 17 | Target tokens ≥ val tokens + safety margin | PARTIAL | no code check; the stop condition is `val+train >= target` (`prepare_corpus.py`); operator arithmetic — NEEDS IMPLEMENTATION as validation |
-| 18 | Token budget ≥ warmup tokens (schedule sanity) | CURRENT | `TokenSchedule` validation (`train_oasst1.py:118-135`) |
+| 18 | Token budget ≥ warmup tokens (schedule sanity) | CURRENT | `TokenSchedule` validation (`train_oasst1.py:375-407`) |
 | 19 | Checkpoint dir writable / Drive mounted & has space | **MISSING** | no free-space check anywhere — preflight.py NEEDS IMPLEMENTATION (`df`/drive API) |
 | 20 | `--out-dir` writable and empty-or-resumable | PARTIAL | trainer mkdirs (`:1115-1120`); no "refuse to clobber a different run" guard — NEEDS IMPLEMENTATION |
 | 21 | Resume checkpoint valid (format/params/preset) if resuming | CURRENT | `validate_resume_checkpoint` (`:222-252`) + numeric scan (`:206-221`) |
@@ -997,7 +997,7 @@ and the packed corpus prepared (§8) either on Drive or in Colab scratch.
 
 ## 21. CLI — every flag
 
-### 21.1 `scripts/train_oasst1.py` (`make_arg_parser`, `:1082-1194`)
+### 21.1 `scripts/train_oasst1.py` (`make_arg_parser`, `:1717-1917`)
 
 | Flag | Type | Default | Required | Valid values / notes |
 |---|---|---|---|---|
@@ -1092,9 +1092,9 @@ never part of the generated text.
 **No hidden overrides exist.** Three documented, intentional exceptions (all in code, all loud):
 
 1. **Packed `seq`**: the manifest's `seq_len` is authoritative; `--seq` may only *equal* it
-   (`:1066-1079`). (`effective_seq` is the manifest value unless `--seq` matches.)
-2. **Resume LR**: the CLI `--lr` replaces the checkpoint's stored LR after resume (`:762-763`).
-3. **Resume epochs**: `--epochs` is the target total, not additional (`:741-747`).
+   (`:2235-2242`). (`effective_seq` is the manifest value unless `--seq` matches.)
+2. **Resume LR**: the CLI `--lr` replaces the checkpoint's stored LR after resume (`:2109`).
+3. **Resume epochs**: `--epochs` is the target total, not additional (`:1196-1199`).
 
 Everything a run *did* is recorded (not enforced) in `train_run_metadata.json`
 (`training_config` + `model_config` + `data_provenance` + `tokenizer` + `git`) and in the manifest
@@ -1111,7 +1111,7 @@ metadata (`args` echo) — so a post-hoc audit can always tell which precedence 
   `tests/test_training.py::test_resume_bit_exact`). Same `(src, ratio, seed)` → identical JSONL
   split (`split_jsonl`); same packed rows → identical train order (rows stream verbatim).
 - Per-checkpoint RNG snapshots (torch CPU/GPU + numpy + python random) are captured and restored
-  (`capture_rng_state`/`restore_rng_state`, `:341-366`).
+  (`capture_rng_state`/`restore_rng_state`, `:604-633`).
 - Identity machinery: tokenizer sha256 (file content), `manifest_identity` (format/seq/dtype/
   tokenizer sha/rows), checkpoint `n_params`/`vocab_size`, `git_repo_state`
   (`{commit, branch, dirty}`, `:256-281`) in the run metadata, and `train_run_metadata.json`
@@ -1202,7 +1202,7 @@ with the checkpoint refuses loudly (this includes the tokens-consumed-vs-corpus-
 
 - **`--token-budget` is the PRIMARY stop target.** The trainer stops mid-epoch as soon as
   `tokens_consumed >= budget`, then still runs validation and writes the epoch checkpoint
-  (`:828-856`). `--epochs` only bounds the loop; whichever limit comes first wins.
+  (`:1206-1212`). `--epochs` only bounds the loop; whichever limit comes first wins.
 - Step-based mode is documented separately and still exists: omitting `--token-budget` gives the
   legacy fixed-LR/epochs behavior (optionally `--max-steps-per-epoch`), exactly the machinery the
   1M/10M ladder runs used.
@@ -1211,9 +1211,9 @@ with the checkpoint refuses loudly (this includes the tokens-consumed-vs-corpus-
   Examples: B=32/S=64 → 2,016 tok/step; B=4/S=512 → 2,044 tok/step.
 - **Resumed tokens are included**: the budget counts tokens since RUN START (all sessions);
   legacy checkpoints without the counter are estimated as `step × B × (S-1)` (exact for
-  constant-shape runs) with a warning (`:765-784`).
+  constant-shape runs) with a warning (`:1176-1180`).
 - LR schedule is token-indexed: warmup spans `[0, W)`, cosine decays over `[W, budget)` to
-  10 % — both computed from `tokens_consumed` pre-step (`TokenSchedule.lr_at`, `:137-153`).
+  10 % — both computed from `tokens_consumed` pre-step (`TokenSchedule.lr_at`, `:409-422`).
 
 ---
 
@@ -1324,7 +1324,7 @@ below is what remains.
 1. ~~**Benchmark mode** (§17)~~ — **DONE as a sibling script**: `scripts/benchmark_1b.py`
    measures s/step, tok/s, `torch.cuda.max_memory_allocated()` VRAM, an OOM microbatch ladder, an
    activation matrix, a save→kill→resume check and inference timing, writing a timestamped results
-   JSON. It targets the 1B presets on the owner's RTX 3060 12 GB and **has not been run**. A
+   JSON. It targets the 1B presets on a Colab GPU (T4: fp16 + GradScaler; L4/A100: bf16) and **has not been run**. A
    trainer-side `--benchmark-steps` flag still does not exist (not needed).
 2. **`scripts/preflight.py`** (§16) — the 32-point gate as a runnable script; must add: disk-free
    check (Drive + scratch), out-dir clobber guard, GPU probe, cargo-cult the repo's existing
@@ -1403,8 +1403,9 @@ This document's T4/Colab reference does **not** apply to them:
   for ``talos_1b_spec16`` (18 B/param layout: fp32 master + fp32 m/v + fp16
   working copy + fp32 grads), before activations (≈1.1 / 1.4 / 1.1 GiB at
   batch 1 × seq 2048) and CUDA overhead. Minimum class: ≈24 GB
-  (A10G/3090/A100) / ≈20 GB. The owner's **RTX 3060 12 GB** is the intended
-  1B box, running the bf16 + grad-checkpoint + grad-accum configuration that
+  (A10G/3090/A100) / ≈20 GB. GPU support is **Colab-only** (owner directive):
+  the intended 1B box is a Colab L4/A100 (bf16) or T4 (fp16 + GradScaler),
+  running the grad-checkpoint + grad-accum configuration that
   ``scripts/benchmark_1b.py`` measures.
 * **Inference on the T4 at fp16 is feasible**: ≈1.86 / 1.86 / 1.44 GiB weights
   + 64.0 / 84.0 / 64.0 MiB KV cache at the full 2,048-token sequence (§7.2 of
