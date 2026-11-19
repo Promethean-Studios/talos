@@ -34,6 +34,8 @@ REQUIRED_ROW_FIELDS = (
     "model", "params", "vocab", "seq_len", "timestamp_utc",
     # Additive: the two-stage run records which stage produced the row.
     "stage",
+    # Additive: optimizer updates skipped on NaN/Inf loss or gradients.
+    "skipped_updates",
 )
 
 
@@ -356,7 +358,7 @@ def test_tracker_defaults_to_the_owner_public_repo():
     tracker = tlib.TrackerPublisher()
     assert tracker.repo_id == "PrometheanStudio/talos-training-tracker"
     assert tlib.TRACKER_REPO_ID == tracker.repo_id
-    assert tracker.model_name == "Talos 1B"
+    assert tracker.model_name == "Argo 1B"
 
 
 def test_tracker_status_keeps_the_owner_schema_and_adapts_the_1b_values(tmp_path):
@@ -371,7 +373,7 @@ def test_tracker_status_keeps_the_owner_schema_and_adapts_the_1b_values(tmp_path
     assert tuple(status) == OWNER_STATUS_FIELDS + tlib.TRACKER_EXTRA_STATUS_FIELDS
     assert status["stage"] == ""
     assert status["status"] == "training"
-    assert status["model_name"] == "Talos 1B"
+    assert status["model_name"] == "Argo 1B"
     assert status["parameters"] == 1_036_060_672
     assert status["vocab_size"] == 49_152
     assert status["sequence_length"] == 2048
@@ -488,7 +490,7 @@ def test_tracker_dry_run_writes_locally_and_never_uploads(tmp_path):
     assert tracker.push_count == 0
     assert os.path.isfile(tracker.status_path)
     assert os.path.isfile(tracker.history_path)
-    assert _read_json(tracker.status_path)["model_name"] == "Talos 1B"
+    assert _read_json(tracker.status_path)["model_name"] == "Argo 1B"
 
 
 def test_tracker_rejects_a_repo_id_that_is_not_owner_slash_name(tmp_path):
@@ -555,7 +557,7 @@ def test_notebook_carries_the_owner_required_configuration():
         "validate_resume_checkpoint",
         "validate_stage_resume",
         "save_checkpoint",
-        "step-{step}.pt",
+        "step-{info.step}.pt",
     )
     for needle in required:
         assert needle in source, needle
@@ -581,10 +583,10 @@ def test_notebook_wires_the_public_tracker_and_the_drive_checkpoint_dir():
     assert "tracker.flush()" in source
     # checkpoints on Drive by default, TALOS_1B_OUT still overrides; the stage
     # directory is appended per stage (stage-a / stage-b).
-    assert "/content/drive/MyDrive/Talos/Talos_1B" in source
+    assert "/content/drive/MyDrive/Talos/Argo_1B" in source
     assert '"TALOS_1B_OUT"' in source
     assert "stage-{spec.key.lower()}" in source
-    assert "talos_1b_runs" in source
+    assert "argo_1b_runs" in source
 
 
 def test_notebook_documents_resume_and_the_corpus_boundary():

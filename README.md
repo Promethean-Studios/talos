@@ -13,9 +13,12 @@ documenting exactly what has and has not been measured at each scale.
   parameter counts.
 - **Trained:** the 254K and 1M presets, on small public corpora. Both produce
   incoherent text — they are pipeline validations, not useful models.
-- **Talos 1B: implemented, not trained.** No 1B checkpoint exists, and no
-  1B-scale measurement (loss, throughput, VRAM) exists. The architecture is
-  tested on the meta device.
+- **Argo (the Talos 1B model): implemented, not trained.** **Argo** is the
+  display name of the Talos 1B model — the training notebook, the live display
+  table and the training tracker all call it Argo, while every code identifier
+  (`talos_1b` preset, `talos_1b_49k` tokenizer asset, checkpoint filenames)
+  stays as it is. No 1B checkpoint exists, and no 1B-scale measurement (loss,
+  throughput, VRAM) exists. The architecture is tested on the meta device.
 - **Not trained:** the 10M and 100M presets (configs only), and every larger
   design config.
 
@@ -42,7 +45,10 @@ biases, FP32.
 The counts are enforced by `configs/canonical.py` and asserted by the tests, so
 a drift fails CI rather than quietly changing the model.
 
-### Talos 1B (tied embeddings; vocab 49,152 primary / 32,000 siblings)
+### Argo — the Talos 1B model (tied embeddings; vocab 49,152 primary / 32,000 siblings)
+
+*Argo* is the display name of the Talos 1B model; `talos_1b` remains the preset
+key, and `talos_1b_49k` the tokenizer asset.
 
 Common architecture: max sequence 2,048 · hidden 2,048 ·
 16 query / 4 KV heads (4:1 GQA) · head_dim 128 · RMSNorm pre-norm · RoPE ·

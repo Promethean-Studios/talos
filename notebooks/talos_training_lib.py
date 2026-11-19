@@ -58,6 +58,17 @@ TALOS_1B_SEQ_LEN = 2048
 TALOS_1B_NAME = "talos_1b"
 TALOS_1B_TOKENIZER_ASSET = "talos_1b_49k"
 
+#: **Argo** is the owner's display name for the Talos 1B model: it is what the
+#: notebook, the live display table and the public tracker call the model. The
+#: code-level identifiers stay ``talos_1b`` / ``talos_1b_49k`` — they are baked
+#: into preset names, checkpoint filenames and the tokenizer manifest, and
+#: renaming them would break checkpoint, tracker and CLI compatibility. Display
+#: identity and code identity are deliberately separate.
+MODEL_DISPLAY_NAME = "Argo 1B"
+
+#: Shorter display form, for places with little room (the intro line).
+MODEL_DISPLAY_SHORT = "Argo"
+
 #: Display labels, in the owner's requested order. The notebook renders exactly
 #: these rows; :func:`render_display_table` is the only place they are spelled.
 DISPLAY_LABELS: tuple = (
@@ -77,6 +88,9 @@ DISPLAY_LABELS: tuple = (
     "Sequence length",
     "Epoch",
     "Last update",
+    # Additive: the owner's original rows keep their labels and order, and the
+    # skip counter (NaN/Inf handling) is appended at the end.
+    "Skipped updates",
 )
 
 
@@ -236,6 +250,9 @@ class MetricsRow:
     #: Additive: every pre-existing field keeps its name and position, so a
     #: reader of the old schema keeps working and a new row gains one key.
     stage: str = ""
+    #: Optimizer updates skipped because the loss or the gradients were not
+    #: finite. Additive, and 0 on every healthy run.
+    skipped_updates: int = 0
 
     def as_dict(self) -> Dict[str, Any]:
         """Plain ``dict`` in field order (json-ready)."""
@@ -267,6 +284,7 @@ def build_metrics_row(
     seq_len: int = TALOS_1B_SEQ_LEN,
     stage: str = "",
     timestamp: Optional[datetime] = None,
+    skipped_updates: int = 0,
 ) -> MetricsRow:
     """Build a validated :class:`MetricsRow`; throughput and ETA are derived.
 
@@ -288,6 +306,8 @@ def build_metrics_row(
         raise ValueError("params and vocab must be positive")
     if elapsed_s < 0:
         raise ValueError("elapsed_s must be >= 0")
+    if skipped_updates < 0:
+        raise ValueError("skipped_updates must be >= 0")
     train = float(train_loss)
     if train != train or train in (float("inf"), float("-inf")):
         raise ValueError(f"train_loss must be finite, got {train_loss!r}")
@@ -314,6 +334,7 @@ def build_metrics_row(
         seq_len=int(seq_len),
         timestamp_utc=utc_timestamp(timestamp),
         stage=str(stage),
+        skipped_updates=int(skipped_updates),
     )
 
 
@@ -344,6 +365,8 @@ def render_display_table(row: MetricsRow) -> str:
         format_count(row.seq_len),
         f"epoch {row.epoch}",
         utc_display(row.timestamp_utc),
+        f"{format_count(row.skipped_updates)}"
+        + ("  (non-finite loss/grad — updates skipped)" if row.skipped_updates else ""),
     )
     rows_html = "\n".join(
         f'<tr><th style="text-align:left;padding:3px 14px 3px 0;'
@@ -356,7 +379,7 @@ def render_display_table(row: MetricsRow) -> str:
         '<div style="border:1px solid #d0d7de;border-radius:6px;padding:10px 14px;'
         'display:inline-block;background:#fafbfc;">'
         '<div style="font-weight:700;margin-bottom:6px;color:#0b3d91;">'
-        "Talos 1B — training</div>"
+        f"{MODEL_DISPLAY_NAME} — training</div>"
         f'<table style="border-collapse:collapse;font-size:13px;">{rows_html}</table>'
         "</div>"
     )
@@ -626,12 +649,14 @@ TRACKER_HISTORY_FIELDS: tuple = ("checkpoints", "epochs")
 
 #: Extra ``status.json`` keys appended AFTER the owner's. Additive by design:
 #: the owner's 15 keys keep their names, order and types, so their dashboard
-#: keeps parsing, and a two-stage run gains one extra key it can ignore.
-TRACKER_EXTRA_STATUS_FIELDS: tuple = ("stage",)
+#: keeps parsing, and a two-stage run gains keys it can ignore.
+TRACKER_EXTRA_STATUS_FIELDS: tuple = ("stage", "skipped_updates")
 
 #: The owner's tracker labels the 100M model ``"Talos 100M"``; the 1B run is
-#: ``"Talos 1B"`` (the display name, not the internal preset key ``talos_1b``).
-TRACKER_MODEL_NAME = "Talos 1B"
+#: **Argo** — the owner's display name for the model (:data:`MODEL_DISPLAY_NAME`),
+#: not the internal preset key ``talos_1b``. Only the VALUE changes; the key and
+#: every other tracker field stay exactly as the owner's dashboard expects.
+TRACKER_MODEL_NAME = MODEL_DISPLAY_NAME
 
 #: Tokens per optimizer step in the 1B notebook (MICRO_BATCH 2 × GRAD_ACCUM 16 ×
 #: SEQ_LEN 2048). Only used to derive ``step_target``; the notebook passes its
@@ -721,6 +746,7 @@ class TrackerPublisher:
         gpu: Optional[str] = None,
         status: str = "training",
         stage: str = "",
+        skipped_updates: int = 0,
     ) -> None:
         if not repo_id or "/" not in str(repo_id):
             raise ValueError(
@@ -734,6 +760,8 @@ class TrackerPublisher:
             raise ValueError("tokens_per_step must be positive")
         if vocab_size <= 0 or sequence_length <= 0 or parameters <= 0:
             raise ValueError("parameters, vocab_size and sequence_length must be positive")
+        if skipped_updates < 0:
+            raise ValueError("skipped_updates must be >= 0")
         self.repo_id = str(repo_id)
         self.token = token
         self.dry_run = bool(dry_run)
@@ -750,6 +778,7 @@ class TrackerPublisher:
         self.gpu = str(gpu) if gpu is not None else resolve_gpu_name()
         self.status = str(status)
         self.stage = str(stage)
+        self.skipped_updates = int(skipped_updates)
         self._uploader: Uploader = uploader or _hf_upload
         self._clock = clock
         self._last_push_at: Optional[float] = None
@@ -791,6 +820,15 @@ class TrackerPublisher:
         if payload not in self.epoch_rows:
             self.epoch_rows.append(payload)
         self._last_row = row
+        # The row's skip count is the run's truth; keep status.json in step with
+        # it so a burst of skipped updates is visible without reading history.
+        self.skipped_updates = int(row.skipped_updates)
+
+    def note_skipped(self, total: int) -> None:
+        """Set the run's skipped-update count (``status.json`` ``skipped_updates``)."""
+        if int(total) < 0:
+            raise ValueError("skipped_updates must be >= 0")
+        self.skipped_updates = int(total)
 
     # -- payloads -----------------------------------------------------------
     def build_status(
@@ -826,6 +864,7 @@ class TrackerPublisher:
         payload = {key: status[key] for key in TRACKER_STATUS_FIELDS}
         # Additive extras (never reordered into the owner's keys above).
         payload["stage"] = self.stage
+        payload["skipped_updates"] = int(self.skipped_updates)
         return payload
 
     def build_history(
@@ -940,6 +979,8 @@ class TrackerPublisher:
 
 __all__ = [
     "DISPLAY_LABELS",
+    "MODEL_DISPLAY_NAME",
+    "MODEL_DISPLAY_SHORT",
     "MetricsRow",
     "MetricsSync",
     "TALOS_1B_NAME",
