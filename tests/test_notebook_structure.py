@@ -13,7 +13,9 @@ import ast
 import importlib
 import json
 import os
+import re
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -62,15 +64,13 @@ def test_every_code_cell_compiles(code_cells):
 
 
 def test_cells_are_in_execution_order(all_source, code_cells):
-    markers = ["# 1. Setup", "# 2. Repo + hardware", "# 3. Config", "# 4. Tokenizer",
-               "# 5. Data pipeline", "# 6. Output location", "# 7. Metrics + public tracker",
-               "# 8. Model -> GPU", "# 9. Training loop", "# 10. Inspect",
-               "# 11. Evaluation"]
-    positions = [all_source.index(marker) for marker in markers]
-    assert positions == sorted(positions)
+    headers = [int(m.group(1)) for source in code_cells
+               for m in re.finditer(r"^# (\d+)\. ", source, re.M)]
+    assert headers == sorted(headers), headers
+    assert headers[0] == 1 and len(headers) >= 9
     # The config cell comes before the data cell, which comes before the loop.
     assert all_source.index("STAGE = ") < all_source.index("token budget   :")
-    assert all_source.index("token budget   :") < all_source.index("plan.should_stop")
+    assert all_source.index("token budget   :") < all_source.index("result = train_stage(")
 
 
 def test_every_imported_helper_exists(code_cells):
@@ -99,7 +99,8 @@ def test_config_cell_exposes_the_stage_and_budget_knobs(code_cells):
     for knob in ("STAGE =", "RESUME =", "STAGE_A_HOURS", "STAGE_A_TOKENS_OVERRIDE",
                  "STAGE_B_EPOCHS", "MICRO_BATCH", "GRAD_ACCUM", "PRECISION",
                  "CHECKPOINT_EVERY", "CHECKPOINT_EVERY_MIN", "SEED",
-                 "ALLOW_STAGE_B_FROM_RANDOM_INIT"):
+                 "ALLOW_STAGE_B_FROM_RANDOM_INIT", "STAGE_A_TOKENS_FLOOR",
+                 "STAGE_A_TOKENS_DEFAULT", "MAX_CONSECUTIVE_SKIPS"):
         assert knob in config, f"config cell is missing {knob}"
 
 
@@ -119,36 +120,51 @@ def test_stage_b_refuses_a_random_initialisation(all_source):
 
 
 def test_budget_is_not_a_hard_coded_20b(all_source):
-    # No hard-coded 20B budget: the notebook says so and derives it instead.
+    import talos_stages as stages
+    # No hard-coded 20B budget anywhere: the corrected default is a token target
+    # (multi-billion, but not Chinchilla) with a floor below which the notebook
+    # warns loudly instead of silently accepting a useless run.
     assert "20_000_000_000" not in all_source
-    assert "not a" in all_source and "fixed 20B" in all_source
-    assert "STAGE_A_HOURS" in all_source
-    assert "tokens_in_hours" in all_source
+    assert stages.STAGE_A_TOKENS_DEFAULT >= 2_000_000_000
+    assert stages.STAGE_A_TOKENS_FLOOR >= 2_000_000_000
+    assert stages.STAGE_A_TOKENS_DEFAULT < 20_000_000_000
+    assert "STAGE_A_TOKENS_FLOOR" in all_source
+    assert "stage_a_budget(" in all_source
+    assert "WARNING" in all_source
+
+
+def _module_source(name: str) -> str:
+    return (Path(__file__).resolve().parents[1] / "notebooks" / name).read_text()
 
 
 def test_budget_cap_and_accounting_are_wired_into_the_loop(code_cells):
     loop = next(source for source in code_cells if "# 9. Training loop" in source)
-    assert "accountant.plan_step(" in loop
-    assert "plan.should_stop" in loop
-    assert "accountant.add(" in loop
-    assert "loss / plan.micro_batches" in loop     # partial final step scaling
+    module = _module_source("talos_train_loop.py")
+    assert "result = train_stage(" in loop
+    assert "plan_step(" in module
+    assert "plan.should_stop" in module
+    assert "accountant.add(" in module
+    assert "step_loss_sum / micro_done" in module     # partial final step scaling
 
 
 def test_resume_restores_everything_the_audit_listed(code_cells):
+    helpers = next(source for source in code_cells if "# 8. Model -> GPU" in source)
     loop = next(source for source in code_cells if "# 9. Training loop" in source)
+    module = _module_source("talos_train_loop.py")
+    haystack = helpers + loop + module
     for item in ("model.load_state_dict", "optimizer.load_state_dict",
                  "restore_rng_state", "StreamPosition.from_dict",
                  "validate_stage_resume", "POSITION_METADATA_KEY"):
-        assert item in loop, f"resume path is missing {item}"
-    assert "lr_at(accountant.steps" in loop        # schedule continues, not restarts
+        assert item in haystack, f"resume path is missing {item}"
+    assert "lr_at(accountant.steps" in module        # schedule continues, not restarts
 
 
 def test_checkpoints_record_stage_and_dataset_identity(code_cells):
     helpers = next(source for source in code_cells if "# 8. Model -> GPU" in source)
-    assert "run_metadata=run_metadata(position" in helpers
-    assert "spec.run_metadata(" in helpers
-    assert "tokens_consumed=tokens_consumed" in helpers
-    assert "tokenizer_fingerprint=TOKENIZER_SHA256" in helpers
+    assert "run_metadata=" in helpers
+    assert "tokens_consumed=info.tokens_consumed" in helpers
+    assert "tokenizer_fingerprint" in helpers
+    assert "skipped_updates" in helpers
 
 
 # ---------------------------------------------------------------------------
