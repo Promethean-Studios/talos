@@ -172,6 +172,10 @@ next-newest valid one is used.
   tokens/sec, ETA, GPU, checkpoint info and stage are all present. The
   `model_name` **value** is `"Argo 1B"` (the model's display name); the key, the
   schema and every other field are untouched.
+- Two additive keys exist for the non-finite handling: `stage` and
+  `skipped_updates` (the number of optimizer updates dropped because the loss or
+  the gradients were not finite — `0` on every healthy run). No existing key,
+  type or order changes, so the owner's dashboard keeps parsing.
 - Both are failure-isolated: every upload path catches everything, records
   `last_error` and returns `False`. A tracker or network failure cannot stop
   training.
