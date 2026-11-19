@@ -1,4 +1,9 @@
-# Talos 1B — the two-stage training workflow
+# Argo — the Talos 1B model — two-stage training workflow
+
+*Argo* is the display name of the Talos 1B model: the notebook intro, the live
+display table and the tracker's `model_name` say **Argo 1B**
+(`MODEL_DISPLAY_NAME` in `notebooks/talos_training_lib.py`). Code identifiers
+(`talos_1b`, `talos_1b_49k`, `step-<N>.pt`, every tracker *key*) are unchanged.
 
 The 1B model is trained **from its own random initialisation**. No pretrained
 weights, no external foundation model, no distillation from someone else's
@@ -164,7 +169,9 @@ next-newest valid one is used.
 - `status.json` + `history.json` in the owner's
   `PrometheanStudio/talos-training-tracker` schema: the owner's 15 keys in their
   order and types, plus one additive `stage` key at the end. Loss, tokens,
-  tokens/sec, ETA, GPU, checkpoint info and stage are all present.
+  tokens/sec, ETA, GPU, checkpoint info and stage are all present. The
+  `model_name` **value** is `"Argo 1B"` (the model's display name); the key, the
+  schema and every other field are untouched.
 - Both are failure-isolated: every upload path catches everything, records
   `last_error` and returns `False`. A tracker or network failure cannot stop
   training.
