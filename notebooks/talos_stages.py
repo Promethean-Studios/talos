@@ -61,8 +61,49 @@ STAGE_NAMES: Dict[str, str] = {
     STAGE_B: "conversational tuning",
 }
 
+#: Pinned Hub revisions (commit SHAs) for the two datasets. A dataset that moves
+#: under a resumed run silently changes the objective mid-training, so the
+#: revision is part of the dataset identity and is validated on resume.
+#:
+#: Resolved **2026-11-19** from ``https://huggingface.co/api/datasets/<id>``
+#: (``"sha"`` field); bump deliberately, never implicitly.
+#: ``allenai/c4`` last modified 2024-01-09; ``HuggingFaceH4/ultrachat_200k``
+#: last modified 2024-10-16.
+C4_EN_REVISION = "1588ec454efa1a09f29cd18ddd04fe05fc8653a2"
+ULTRACHAT_REVISION = "8049631c405ae6576f93f445c6b8166f76f5505a"
+
+# ---------------------------------------------------------------------------
+# Stage A budget policy (owner audit: "severely insufficient")
+# ---------------------------------------------------------------------------
+#: The smallest Stage-A budget that is worth running at all. A 1B model trained
+#: from scratch on fewer than ~2 tokens/parameter learns token statistics and
+#: word shapes, not language; below this the notebook warns loudly instead of
+#: starting a run that cannot produce a usable model.
+STAGE_A_TOKENS_FLOOR = 2_000_000_000
+
+#: The default Stage-A target: 4B tokens ≈ 3.9 tokens/parameter ≈ 19 % of
+#: Chinchilla-optimal (~20.7B for 1.036B params). Justified in
+#: ``docs/training-1b-notebook.md`` with the per-GPU hours → tokens → capability
+#: table: this is the smallest budget at which a from-scratch 1B produces
+#: grammatical, locally coherent English instead of babble.
+STAGE_A_TOKENS_DEFAULT = 4_000_000_000
+
+#: Chinchilla-optimal tokens for the 1B preset (≈20 tokens/parameter). Documented
+#: as the reference point, **not** imposed as a default: on Colab hardware it is
+#: weeks of wall-clock, and pretending otherwise is what made the old budget lie.
+CHINCHILLA_TOKENS = 20_000_000_000
+
+#: Consecutive skipped optimizer updates (non-finite loss or gradient) after
+#: which the run aborts loudly instead of spinning on a broken model.
+MAX_CONSECUTIVE_SKIPPED = 20
+
 #: Stage-scoped output directory names under the run root.
 STAGE_DIRS: Dict[str, str] = {STAGE_A: "stage-a", STAGE_B: "stage-b"}
+
+#: Sentinel for :func:`stage_spec` overrides: "argument not given" (so ``None``
+#: can be passed *as* a value, e.g. ``dataset_config=None`` for a config-less
+#: dataset).
+_UNSET: Any = object()
 
 
 # ---------------------------------------------------------------------------
@@ -95,13 +136,18 @@ class StageSpec:
     weight_decay: float
     mask_prompt_tokens: bool
     seed: int
+    #: Pinned Hub revision (commit SHA) of ``dataset_id``. Part of the dataset
+    #: identity: a dataset whose ``main`` moved between two sessions would
+    #: otherwise change the corpus under a resumed run without any error.
+    dataset_revision: Optional[str] = None
 
     # -- identity -----------------------------------------------------------
     def dataset_identity(self) -> Dict[str, Any]:
         """The dataset's identity, recorded in every checkpoint.
 
         A resume whose dataset identity differs is rejected: resuming Stage A on
-        a different corpus silently changes the objective mid-run.
+        a different corpus (or on a different *revision* of the same corpus)
+        silently changes the objective mid-run.
         """
         return {
             "id": self.dataset_id,
@@ -109,6 +155,7 @@ class StageSpec:
             "train_split": self.train_split,
             "val_split": self.val_split,
             "seq_len": int(self.seq_len),
+            "revision": self.dataset_revision,
         }
 
     # -- schedule -----------------------------------------------------------
@@ -177,6 +224,7 @@ STAGE_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "objective": "next-token prediction on general English web text",
         "dataset_id": "allenai/c4",
         "dataset_config": "en",
+        "dataset_revision": C4_EN_REVISION,
         "train_split": "train",
         "val_split": "validation",
         "peak_lr": 3e-4,
@@ -192,6 +240,7 @@ STAGE_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "objective": "supervised fine-tuning on assistant turns of chat data",
         "dataset_id": "HuggingFaceH4/ultrachat_200k",
         "dataset_config": None,
+        "dataset_revision": ULTRACHAT_REVISION,
         "train_split": "train_sft",
         "val_split": "test_sft",
         "peak_lr": 5e-5,
@@ -212,12 +261,29 @@ def stage_spec(
     seq_len: int = 2048,
     seed: int = 1234,
     peak_lr: Optional[float] = None,
+    dataset_revision: Optional[str] = None,
+    dataset_id: Any = _UNSET,
+    dataset_config: Any = _UNSET,
+    train_split: Any = _UNSET,
+    val_split: Any = _UNSET,
 ) -> StageSpec:
     """Build the :class:`StageSpec` for ``key`` (``"A"`` or ``"B"``).
 
     ``token_budget`` is required and validated: the budget comes from the
-    *hardware plan* (Stage A) or from a measured tokens-per-epoch estimate times
-    an explicit epoch count (Stage B), never from a hard-coded round number.
+    *budget policy* (:func:`stage_a_budget` for Stage A) or from a measured
+    tokens-per-epoch estimate times an explicit epoch count (Stage B), never
+    from a hard-coded round number.
+
+    ``dataset_revision`` defaults to the stage's pinned Hub revision
+    (:data:`C4_EN_REVISION` / :data:`ULTRACHAT_REVISION`); pass an explicit SHA
+    only to reproduce an older corpus, and note that it becomes part of the
+    checkpoint's dataset identity, so a resume must use the same one.
+
+    The ``dataset_id`` / ``dataset_config`` / split overrides exist for the CPU
+    smoke run (``notebooks/talos_smoke.py``), which trains on a synthetic corpus
+    and must record *that* as its dataset identity rather than claiming c4. They
+    are not a licence to swap corpora in a real run: the identity goes into every
+    checkpoint and a resume with a different one is refused.
     """
     if key not in STAGE_DEFAULTS:
         raise ValueError(f"unknown stage {key!r}: expected one of {STAGES}")
@@ -230,6 +296,17 @@ def stage_spec(
         if peak_lr <= 0:
             raise ValueError("peak_lr must be positive")
         defaults["peak_lr"] = float(peak_lr)
+    if dataset_id is not _UNSET:
+        defaults["dataset_id"] = dataset_id
+    if dataset_config is not _UNSET:
+        defaults["dataset_config"] = dataset_config
+    if train_split is not _UNSET:
+        defaults["train_split"] = train_split
+    if val_split is not _UNSET:
+        defaults["val_split"] = val_split
+    revision = defaults.get("dataset_revision") if dataset_revision is None else dataset_revision
+    if dataset_id is not _UNSET and dataset_revision is None:
+        revision = None
     return StageSpec(
         key=key,
         name=defaults["name"],
@@ -248,6 +325,7 @@ def stage_spec(
         weight_decay=float(defaults["weight_decay"]),
         mask_prompt_tokens=bool(defaults["mask_prompt_tokens"]),
         seed=int(seed),
+        dataset_revision=revision,
     )
 
 
@@ -431,6 +509,243 @@ def simulate_run(
 
 
 # ---------------------------------------------------------------------------
+# Stage A budget policy — hours → tokens → what the model can honestly become
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class StageABudget:
+    """The Stage-A token budget and *why* it is what it is.
+
+    ``source`` is one of ``"default"`` (the corrected default target),
+    ``"hours"`` (the user time-boxed the run: ``STAGE_A_HOURS × tokens/sec``) or
+    ``"override"`` (an explicit token count). ``warning`` is non-``None`` when the
+    resulting budget is below :data:`STAGE_A_TOKENS_FLOOR` — the notebook prints
+    it as a loud WARNING rather than silently starting a run that cannot learn
+    language.
+    """
+
+    tokens: int
+    source: str
+    floor: int
+    warning: Optional[str]
+    wall_clock_hours: Optional[float]
+
+    @property
+    def below_floor(self) -> bool:
+        return self.tokens < self.floor
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "tokens": int(self.tokens),
+            "source": self.source,
+            "floor": int(self.floor),
+            "below_floor": self.below_floor,
+            "warning": self.warning,
+            "wall_clock_hours": (None if self.wall_clock_hours is None
+                                 else round(float(self.wall_clock_hours), 2)),
+        }
+
+
+def tokens_per_parameter(tokens: int, parameters: int) -> float:
+    """``tokens / parameters`` — the ratio that decides what the run can become."""
+    if parameters <= 0:
+        raise ValueError("parameters must be positive")
+    if tokens < 0:
+        raise ValueError("tokens must be >= 0")
+    return float(tokens) / float(parameters)
+
+
+def budget_capability(tokens: int, parameters: int) -> str:
+    """What a from-scratch model of ``parameters`` params can honestly become.
+
+    The bands are deliberately blunt. They describe *language competence*, not
+    chat quality: no Stage-A budget that fits Colab produces a usable assistant
+    on its own, and Stage B cannot invent knowledge the base model never saw.
+    """
+    ratio = tokens_per_parameter(tokens, parameters)
+    if ratio < 1.0:
+        return ("below 1 token/parameter: token statistics and word shapes only — "
+                "the model will emit babble, not language")
+    if ratio < 2.0:
+        return ("1-2 tokens/parameter: grammatical fragments and short memorised "
+                "spans; frequent drift, no reliable syntax across a sentence")
+    if ratio < 8.0:
+        return ("2-8 tokens/parameter: grammatical, locally coherent English for a "
+                "few sentences; unreliable facts, weak long-range coherence")
+    if ratio < 15.0:
+        return ("8-15 tokens/parameter: readable paragraphs and basic instruction "
+                "following after Stage B; still well below Chinchilla, factual "
+                "errors remain common")
+    return ("near-Chinchilla (>=15 tokens/parameter): a genuine small base model; "
+            "quality still bounded by data and tuning")
+
+
+def stage_a_budget(
+    *,
+    tokens_per_sec: Optional[float],
+    hours: float = 0.0,
+    token_override: int = 0,
+    floor: int = STAGE_A_TOKENS_FLOOR,
+    default_tokens: int = STAGE_A_TOKENS_DEFAULT,
+) -> StageABudget:
+    """Derive the Stage-A budget, warning (not silently accepting) a useless run.
+
+    Precedence:
+
+    1. ``token_override > 0`` — an explicit token budget wins outright;
+    2. ``hours > 0`` — a time-boxed run: ``hours × 3600 × tokens_per_sec``;
+    3. otherwise — the corrected default target :data:`STAGE_A_TOKENS_DEFAULT`
+       (multi-billion tokens), independent of the GPU, because the *budget* is
+       what decides whether the model learns language and the *wall clock* is
+       what the GPU decides.
+
+    Any result below ``floor`` carries a ``warning``; the notebook prints it as a
+    WARNING block before training. This is the fix for the owner's finding that
+    ``STAGE_A_HOURS × tokens/sec`` at the old default (10 h) yielded 62M-407M
+    tokens — 0.06-0.39 tokens/parameter, i.e. a run that could not work.
+    """
+    if floor <= 0 or default_tokens <= 0:
+        raise ValueError("floor and default_tokens must be positive")
+    if token_override < 0:
+        raise ValueError("token_override must be >= 0")
+    if hours < 0:
+        raise ValueError("hours must be >= 0")
+
+    wall_clock_hours: Optional[float] = None
+    if token_override:
+        tokens, source = int(token_override), "override"
+    elif hours > 0:
+        if tokens_per_sec is None or tokens_per_sec <= 0:
+            raise ValueError(
+                "hours > 0 needs a positive tokens_per_sec estimate from the "
+                "hardware plan — the runtime reported none"
+            )
+        tokens = int(float(hours) * 3600.0 * float(tokens_per_sec))
+        source = "hours"
+    else:
+        tokens, source = int(default_tokens), "default"
+    if tokens <= 0:
+        raise ValueError(
+            "the derived Stage-A budget is 0 tokens — raise STAGE_A_HOURS or set "
+            "STAGE_A_TOKENS_OVERRIDE"
+        )
+    if tokens_per_sec is not None and float(tokens_per_sec) > 0:
+        wall_clock_hours = float(tokens) / float(tokens_per_sec) / 3600.0
+
+    warning: Optional[str] = None
+    if tokens < floor:
+        warning = (
+            f"Stage-A budget {tokens:,} tokens is BELOW the {floor:,}-token floor "
+            f"(~{tokens_per_parameter(tokens, 1_036_060_672):.2f} tokens/parameter). "
+            f"A from-scratch 1B model at this budget cannot learn language: expect "
+            f"babble. This is what {source} gives you. Raise STAGE_A_HOURS, clear "
+            f"STAGE_A_HOURS to use the {default_tokens:,}-token default, or set "
+            f"STAGE_A_TOKENS_OVERRIDE — the run is allowed, but it is not a "
+            f"language model at the end of it."
+        )
+    return StageABudget(tokens=int(tokens), source=source, floor=int(floor),
+                        warning=warning, wall_clock_hours=wall_clock_hours)
+
+
+def stage_b_budget(
+    *,
+    tokens_per_epoch: int,
+    epochs: int,
+    seq_len: int,
+) -> int:
+    """Stage-B token budget that matches **exactly** what the stream emits.
+
+    The stream packs documents and drops the sub-``seq_len`` remainder at each
+    epoch boundary, so one epoch emits ``floor(tokens_per_epoch / seq_len) ×
+    seq_len`` tokens — not ``tokens_per_epoch``. Budgeting the raw estimate (the
+    previous behaviour) let the cap truncate the final epoch by however much the
+    measured mean was off, which made "2 epochs" quietly mean "1.97 epochs" and
+    made Stage-B token counts not comparable with Stage A's.
+
+    The budget is therefore quantised to whole packed rows, and the loop reports
+    the epochs actually completed (``train_result.epochs_completed``).
+    """
+    if tokens_per_epoch <= 0:
+        raise ValueError("tokens_per_epoch must be positive — measure it")
+    if epochs < 1:
+        raise ValueError("epochs must be >= 1")
+    if seq_len <= 0:
+        raise ValueError("seq_len must be positive")
+    rows_per_epoch = int(tokens_per_epoch) // int(seq_len)
+    if rows_per_epoch < 1:
+        raise ValueError(
+            f"tokens_per_epoch {tokens_per_epoch:,} is smaller than one {seq_len}-token "
+            "row — the dataset is too small to pack even one row"
+        )
+    return rows_per_epoch * int(seq_len) * int(epochs)
+
+
+# ---------------------------------------------------------------------------
+# Non-finite detection: skipped updates
+# ---------------------------------------------------------------------------
+class NonFiniteAbort(RuntimeError):
+    """Raised when too many consecutive optimizer updates were skipped.
+
+    A burst of skipped updates means the run is broken (exploded LR, a corrupt
+    batch, a bad checkpoint); continuing would burn GPU hours producing nothing,
+    so the loop stops with a diagnostic instead of spinning silently.
+    """
+
+
+@dataclass
+class SkipTracker:
+    """Counts skipped optimizer updates and aborts on a consecutive burst.
+
+    A skipped update is one the loop *decided not to apply* because the loss or
+    the gradients were not finite. Skipping is the correct response (one bad
+    batch must not poison the weights), but a long run of them is not — so the
+    tracker raises :class:`NonFiniteAbort` past
+    :data:`MAX_CONSECUTIVE_SKIPPED` in a row.
+
+    Nothing here imports torch: the loop calls :meth:`note_skip` /
+    :meth:`note_update`, and the counters go into the checkpoint metadata, the
+    metrics row and the tracker's ``status.json`` (``skipped_updates``).
+    """
+
+    max_consecutive: int = MAX_CONSECUTIVE_SKIPPED
+    total: int = 0
+    consecutive: int = 0
+    last_reason: str = ""
+
+    def __post_init__(self) -> None:
+        if self.max_consecutive < 1:
+            raise ValueError("max_consecutive must be >= 1")
+
+    def note_skip(self, reason: str) -> None:
+        """Record a skipped update; raise once the consecutive limit is passed."""
+        self.total += 1
+        self.consecutive += 1
+        self.last_reason = str(reason)
+        if self.consecutive >= self.max_consecutive:
+            raise NonFiniteAbort(
+                f"{self.consecutive} consecutive optimizer updates were skipped "
+                f"(last reason: {reason}; {self.total} total). The run is not "
+                "learning anything — the loss or the gradients are not finite. "
+                "Stop and check: (1) the LR schedule and peak LR, (2) the newest "
+                "checkpoint (resume from an older step), (3) the data (a corrupt "
+                "shard produces NaN logits), (4) fp16 overflow on a T4 — set "
+                "PRECISION='bf16' on an L4/A100 or lower the LR. A checkpoint was "
+                "written before this abort."
+            )
+
+    def note_update(self) -> None:
+        """Record an applied update (resets the consecutive counter)."""
+        self.consecutive = 0
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "skipped_updates": int(self.total),
+            "consecutive_skips": int(self.consecutive),
+            "last_skip_reason": self.last_reason,
+        }
+
+
+
+# ---------------------------------------------------------------------------
 # Learning-rate schedule
 # ---------------------------------------------------------------------------
 def warmup_steps(total_steps: int, warmup_ratio: float, *, minimum: int = 20) -> int:
@@ -584,25 +899,38 @@ def resume_position(ckpt: Mapping[str, Any]) -> Dict[str, Any]:
 
 __all__ = [
     "CHECKPOINT_FORMAT",
+    "CHINCHILLA_TOKENS",
+    "C4_EN_REVISION",
     "DATASET_METADATA_KEY",
+    "MAX_CONSECUTIVE_SKIPPED",
+    "NonFiniteAbort",
     "POSITION_METADATA_KEY",
     "STAGES",
     "STAGE_A",
+    "STAGE_A_TOKENS_DEFAULT",
+    "STAGE_A_TOKENS_FLOOR",
     "STAGE_B",
     "STAGE_DEFAULTS",
     "STAGE_DIRS",
     "STAGE_METADATA_KEY",
     "STAGE_NAMES",
+    "SkipTracker",
+    "StageABudget",
     "StageSpec",
     "StepPlan",
     "TokenAccountant",
+    "ULTRACHAT_REVISION",
+    "budget_capability",
     "lr_at",
     "plan_step",
     "resume_position",
     "simulate_run",
+    "stage_a_budget",
+    "stage_b_budget",
     "stage_out_dir",
     "stage_spec",
     "steps_for_budget",
+    "tokens_per_parameter",
     "validate_stage_resume",
     "warmup_steps",
 ]
