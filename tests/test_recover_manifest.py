@@ -429,3 +429,41 @@ def test_manifest_already_present_refuses_without_force(
         recover_manifest(rec["packed_dir"], tokenizer_json=rec["tok_path"])
     # The existing manifest is untouched.
     assert _read_manifest(rec["packed_dir"]) == rec["manifest"]
+
+def test_vocab_preset_exposes_the_1b_49k_bound() -> None:
+    """``--vocab-preset`` names 49,152 (``talos_1b_49k``) and keeps 1024 working.
+
+    The bound must equal the corpus's own packing contract: a 1B 49K corpus
+    packed by ``prepare_corpus`` (which derives the bound from the loaded
+    tokenizer) cannot be integrity-checked against the canonical 1024.
+    """
+    from scripts.recover_manifest import (
+        VOCAB_PRESETS,
+        make_arg_parser,
+        resolve_vocab_bound,
+    )
+
+    assert VOCAB_PRESETS["canonical"] == 1024
+    assert VOCAB_PRESETS["talos_1b_49k"] == 49_152
+
+    # Default (nothing passed) stays the canonical ladder bound.
+    assert resolve_vocab_bound(None) == 1024
+    assert resolve_vocab_bound(1024) == 1024
+    # The named 1B asset, and the same value as a raw integer.
+    assert resolve_vocab_bound(None, "talos_1b_49k") == 49_152
+    assert resolve_vocab_bound(49_152, "talos_1b_49k") == 49_152
+    # A contradiction is loud, never a silent override.
+    with pytest.raises(RecoveryError, match="contradicts"):
+        resolve_vocab_bound(1024, "talos_1b_49k")
+    with pytest.raises(RecoveryError, match="unknown --vocab-preset"):
+        resolve_vocab_bound(None, "no_such_asset")
+
+    # The CLI accepts both spellings and resolves them to the same bound.
+    args = make_arg_parser().parse_args(
+        ["--packed-dir", "x", "--vocab-preset", "talos_1b_49k"]
+    )
+    assert resolve_vocab_bound(args.vocab_size, args.vocab_preset) == 49_152
+    args = make_arg_parser().parse_args(
+        ["--packed-dir", "x", "--vocab-size", "49152"]
+    )
+    assert resolve_vocab_bound(args.vocab_size, args.vocab_preset) == 49_152

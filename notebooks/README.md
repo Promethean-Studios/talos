@@ -8,7 +8,8 @@ helpers.
 Trains the project's primary 1B model (`talos_1b`: **1,036,060,672 params**,
 vocab **49,152**, context 2,048, 16Q/4KV GQA, head_dim 128, RMSNorm pre-norm,
 RoPE, no biases, tied embeddings) for a **20,000,000,000-token** Chinchilla
-budget on the owner's local **NVIDIA GeForce RTX 3060 12GB** (not Colab T4).
+budget on a **Colab GPU** — the only supported GPU path (T4: fp16 +
+GradScaler; L4/A100: bf16).
 
 - **Tokenizer:** `assets/tokenizers/talos_1b_49k.json`, sha256 recorded in every
   checkpoint and metrics row.
@@ -32,7 +33,8 @@ budget on the owner's local **NVIDIA GeForce RTX 3060 12GB** (not Colab T4).
 
 ### Running it
 
-1. Open the notebook locally (Jupyter / VS Code) on the 3060 box.
+1. Open the notebook in Colab on a T4 (fp16 + GradScaler) or L4/A100 (bf16)
+   runtime.
 2. Cell 1 installs the Python extras; torch is left alone (a `pip install torch`
    would replace the CUDA build with a CPU wheel).
 3. Set `HF_TOKEN` (or run `huggingface-cli login`) so the metrics dataset repo
@@ -41,7 +43,7 @@ budget on the owner's local **NVIDIA GeForce RTX 3060 12GB** (not Colab T4).
 4. Run the cells top to bottom. Cell 8 is the training loop; interrupt it
    whenever — it writes a checkpoint and flushes metrics before stopping.
 
-A 20B-token budget on a 3060 is a long run: the live table reports measured
+A 20B-token budget on a Colab GPU is a long run: the live table reports measured
 tok/s and a real ETA, and the run can be stopped and resumed at any checkpoint.
 
 ## `talos_training_lib.py`

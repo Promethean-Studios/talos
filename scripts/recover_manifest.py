@@ -61,9 +61,17 @@ Usage::
 
     python -m scripts.recover_manifest --packed-dir <corpus-dir> \\
         --tokenizer-json <tokenizer.json>            # strongly recommended \\
+        [--vocab-preset talos_1b_49k]                # 49,152-bound (1B 49K) \\
+        [--vocab-size 49152]                         # same bound, raw integer \\
         [--checkpoint runs/fw-edu/step-30000.pt]     # optional cross-check \\
         [--expected-tokens-train 205002065 --expected-tokens-val 15001394] \\
         [--dry-run]                                  # inspect before writing
+
+The token-id bound defaults to the canonical ladder (``VOCAB_SIZE`` = 1024).
+A 1B corpus packed against the 49,152-vocab ``talos_1b_49k`` asset needs
+``--vocab-preset talos_1b_49k`` (or ``--vocab-size 49152``): the bound must
+equal the corpus's own packing contract, which ``prepare_corpus.py`` derives
+from the loaded tokenizer.
 """
 from __future__ import annotations
 
@@ -99,6 +107,17 @@ from configs.vocab import VOCAB_SIZE  # noqa: E402
 #: the *strings*.
 _SHARD_RE = re.compile(r"^shard-(val|train)-(\d+)\.npy$")
 
+#: Token-id bounds this tool has a NAMED option for (``--vocab-preset``).
+#: ``--vocab-size N`` stays the raw escape hatch for a custom tokenizer; these
+#: names exist so a 1B corpus can be recovered without memorizing the number,
+#: and so the bound cannot silently differ from the packing contract
+#: ``scripts/prepare_corpus.py`` derived from the loaded tokenizer.
+VOCAB_PRESETS: Dict[str, int] = {
+    "canonical": VOCAB_SIZE,   # 1024 — the tiny ladder (configs.vocab.VOCAB_SIZE)
+    "talos_1b_49k": 49_152,    # talos_1b — the primary 1B asset
+    "talos_1b_32k": 32_000,    # talos_1b_21l / talos_1b_spec16
+}
+
 TOOL_VERSION = "1.0.0"
 RECOVERY_SCHEMA = "talos-manifest-recovery-v1"
 _NPY_MAGIC = b"\x93NUMPY"
@@ -110,6 +129,33 @@ EXIT_FATAL = 3  # integrity failure / unresolvable fields / source conflict
 
 class RecoveryError(Exception):
     """Fatal recovery condition — nothing was written. Exit code 3."""
+
+
+def resolve_vocab_bound(
+    vocab_size: Optional[int], vocab_preset: Optional[str] = None,
+) -> int:
+    """The token-id upper bound the integrity checks run against.
+
+    ``--vocab-preset`` names a committed tokenizer asset (:data:`VOCAB_PRESETS`);
+    ``--vocab-size`` is the raw integer escape hatch. Giving both is allowed
+    only when they agree — a silent override would check the shards against a
+    bound that is not the corpus's packing contract, which is exactly the
+    mismatch class this tool exists to catch.
+    """
+    if vocab_preset is None:
+        return int(VOCAB_SIZE if vocab_size is None else vocab_size)
+    if vocab_preset not in VOCAB_PRESETS:
+        known = ", ".join(f"{n}={s}" for n, s in VOCAB_PRESETS.items())
+        raise RecoveryError(
+            f"unknown --vocab-preset {vocab_preset!r} — known: {known}"
+        )
+    bound = VOCAB_PRESETS[vocab_preset]
+    if vocab_size is not None and int(vocab_size) != bound:
+        raise RecoveryError(
+            f"--vocab-size {vocab_size} contradicts --vocab-preset "
+            f"{vocab_preset} (bound {bound}) — pass only one of them"
+        )
+    return bound
 
 
 # ---------------------------------------------------------------------------
@@ -555,9 +601,14 @@ def make_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--pad-id", type=int, default=None, metavar="N",
                    help="explicit PAD id (last resort; verified against the "
                         "shard structure before any counting)")
-    p.add_argument("--vocab-size", type=int, default=VOCAB_SIZE, metavar="N",
+    p.add_argument("--vocab-size", type=int, default=None, metavar="N",
                    help="token-id upper bound for integrity checks (default "
-                        "configs.vocab.VOCAB_SIZE = 1024)")
+                        "configs.vocab.VOCAB_SIZE = 1024; use 49152 for the "
+                        "1B 49K corpus)")
+    p.add_argument("--vocab-preset", default=None, choices=sorted(VOCAB_PRESETS),
+                   metavar="NAME",
+                   help="named token-id bound instead of --vocab-size: "
+                        + ", ".join(f"{n}={s}" for n, s in VOCAB_PRESETS.items()))
     p.add_argument("--expected-tokens-train", type=int, default=None, metavar="N",
                    help="owner-known real train token count (cross-check; a "
                         "mismatch beyond tolerance requires --force)")
@@ -624,7 +675,8 @@ def recover_manifest(
     checkpoint: Optional[str] = None,
     eos_id: Optional[int] = None,
     pad_id: Optional[int] = None,
-    vocab_size: int = VOCAB_SIZE,
+    vocab_size: Optional[int] = None,
+    vocab_preset: Optional[str] = None,
     expected_tokens_train: Optional[int] = None,
     expected_tokens_val: Optional[int] = None,
     expected_token_tolerance: int = 0,
@@ -642,6 +694,7 @@ def recover_manifest(
         raise RecoveryError(f"--packed-dir is not a directory: {packed_dir}")
     if (train_glob is None) != (val_glob is None):
         raise RecoveryError("--train-glob and --val-glob must be given together")
+    vocab_size = resolve_vocab_bound(vocab_size, vocab_preset)
     if vocab_size <= 0:
         raise RecoveryError(f"--vocab-size must be positive, got {vocab_size}")
     if output is None:
@@ -1058,6 +1111,8 @@ def recover_manifest(
                 "run_metadata_json": (run_meta_path if os.path.isfile(run_meta_path) else None),
                 "expected_tokens_train": expected_tokens_train,
                 "expected_tokens_val": expected_tokens_val,
+                "vocab_preset": vocab_preset,
+                "vocab_size_bound": vocab_bound,
             },
             "field_provenance": field_notes,
             "notes": [
@@ -1096,7 +1151,9 @@ def recover_manifest(
     print(f"  shard rule   : {order_note}")
     print(f"  shards       : {num_shards} total ({len(phases['val'])} val, "
           f"{len(phases['train'])} train)")
-    print(f"  dtype / seq  : {dtype_str} / {seq_len} | vocab bound {vocab_bound}")
+    bound_note = f" [{vocab_preset}]" if vocab_preset else ""
+    print(f"  dtype / seq  : {dtype_str} / {seq_len} | vocab bound "
+          f"{vocab_bound}{bound_note}")
     print(f"  rows         : val {val_rows:,} | train {train_rows:,}")
     print(f"  real tokens  : val {val_tokens:,} | train {train_tokens:,}")
     print(f"  pad tokens   : val {pad_tokens['val']:,} | train {pad_tokens['train']:,}")
@@ -1165,6 +1222,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             eos_id=args.eos_id,
             pad_id=args.pad_id,
             vocab_size=args.vocab_size,
+            vocab_preset=args.vocab_preset,
             expected_tokens_train=args.expected_tokens_train,
             expected_tokens_val=args.expected_tokens_val,
             expected_token_tolerance=args.expected_token_tolerance,

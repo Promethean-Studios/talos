@@ -1,4 +1,4 @@
-"""W4 — ``scripts/benchmark_1b.py``: the owner's RTX 3060 benchmark harness.
+"""W4 — ``scripts/benchmark_1b.py``: the owner's Colab-GPU benchmark harness.
 
 The team has no GPU, so these tests pin the parts that must be right *before*
 the owner runs it on hardware: the OOM ladder's halving logic, the activation
