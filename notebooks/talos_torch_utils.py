@@ -187,6 +187,79 @@ def clip_and_norm(parameters: Iterable[Any], max_norm: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Non-finite detection (the skipped-update path)
+# ---------------------------------------------------------------------------
+def loss_is_finite(loss: "torch.Tensor") -> bool:
+    """True when every element of ``loss`` is finite (NaN/Inf -> ``False``).
+
+    Called **before** ``backward()``: a non-finite loss produces non-finite
+    gradients that poison every parameter they touch, so the loop skips the
+    update instead of applying it.
+    """
+    _require_torch()
+    if not torch.is_tensor(loss):
+        raise TypeError(f"loss must be a tensor, got {type(loss).__name__}")
+    try:
+        return bool(torch.isfinite(loss.detach()).all().item())
+    except Exception:  # noqa: BLE001 - an unreadable value is not finite
+        return False
+
+
+def grad_norm(parameters: Iterable[Any]) -> float:
+    """Total L2 norm of the existing gradients, **without** clipping.
+
+    Separate from :func:`clip_and_norm` because the loop must be able to see a
+    non-finite norm *before* clipping: ``clip_grad_norm_`` on an Inf gradient
+    multiplies by ``max_norm / Inf == 0``, which silently converts Inf grads to
+    NaN instead of reporting them. Returns ``0.0`` when no parameter has a grad.
+    """
+    _require_torch()
+    params = [p for p in parameters if getattr(p, "grad", None) is not None]
+    if not params:
+        return 0.0
+    total = torch.nn.utils.get_total_norm(
+        [p.grad.detach() for p in params], foreach=False
+    ) if hasattr(torch.nn.utils, "get_total_norm") else None
+    if total is None:  # older torch: sum of squares in float32
+        total = torch.sqrt(sum((p.grad.detach().to(torch.float32) ** 2).sum()
+                               for p in params))
+    return float(total.detach().to(torch.float32).item())
+
+
+def grads_are_finite(parameters: Iterable[Any]) -> bool:
+    """True when every existing gradient element is finite."""
+    _require_torch()
+    for parameter in parameters:
+        grad = getattr(parameter, "grad", None)
+        if grad is None:
+            continue
+        if not bool(torch.isfinite(grad).all().item()):
+            return False
+    return True
+
+
+def zero_gradients(optimizer: Any) -> None:
+    """Drop the accumulated gradients of a skipped update (``set_to_none``)."""
+    _require_torch()
+    optimizer.zero_grad(set_to_none=True)
+
+
+def clip_gradients(parameters: Iterable[Any], max_norm: float) -> None:
+    """Clip the existing gradients to ``max_norm`` in place.
+
+    Called only **after** :func:`grads_are_finite` has passed: clipping an Inf
+    gradient would turn it into NaN (``max_norm / Inf == 0``) and hide the
+    anomaly instead of reporting it.
+    """
+    _require_torch()
+    if max_norm <= 0:
+        raise ValueError("max_norm must be positive")
+    params = [p for p in parameters if getattr(p, "grad", None) is not None]
+    if params:
+        torch.nn.utils.clip_grad_norm_(params, max_norm)
+
+
+# ---------------------------------------------------------------------------
 # Batching
 # ---------------------------------------------------------------------------
 def rows_to_tensor(
@@ -223,7 +296,12 @@ __all__ = [
     "autocast_kwargs",
     "build_optimizer",
     "clip_and_norm",
+    "clip_gradients",
+    "grad_norm",
+    "grads_are_finite",
+    "loss_is_finite",
     "make_grad_scaler",
     "masked_cross_entropy",
     "rows_to_tensor",
+    "zero_gradients",
 ]
