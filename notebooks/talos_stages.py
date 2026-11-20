@@ -875,6 +875,42 @@ def validate_stage_resume(
         )
 
 
+def validate_stage_b_init(ckpt: Mapping[str, Any]) -> str:
+    """Refuse a Stage-B initialisation that did not come from Stage A.
+
+    Stage B is conversational tuning *of the pretrained base model*, so its init
+    checkpoint must be the Stage-A final checkpoint. :func:`validate_stage_resume`
+    guards the resume path (a stage may only resume itself); this guards the other
+    direction — Stage B starting **fresh** — which otherwise accepted any
+    checkpoint of the right format and preset. Loading a Stage-B (or an untagged)
+    checkpoint there silently skips the pretraining and reports a run that never
+    happened.
+
+    Returns the stage tag it accepted (``"A"``); raises ``ValueError`` naming the
+    fix otherwise.
+    """
+    metadata = ckpt.get("run_metadata") or {}
+    if not isinstance(metadata, Mapping):
+        raise ValueError("checkpoint run_metadata is not a mapping")
+    recorded = metadata.get(STAGE_METADATA_KEY)
+    if recorded is None:
+        raise ValueError(
+            "Stage B initializes only from a Stage-A checkpoint; got stage=None "
+            f"(the checkpoint records no {STAGE_METADATA_KEY!r} tag). Set "
+            "STAGE_A_INIT_CKPT to the Stage-A final checkpoint (its run_metadata "
+            "carries stage='A'), or run Stage A first"
+        )
+    if str(recorded) != STAGE_A:
+        raise ValueError(
+            "Stage B initializes only from a Stage-A checkpoint; got "
+            f"stage={recorded!r} ({STAGE_NAMES.get(str(recorded), 'unknown')}). "
+            "Point STAGE_A_INIT_CKPT at the Stage-A final checkpoint under "
+            "<out>/stage-a — a Stage-B checkpoint is already conversationally "
+            "tuned and cannot pretrain itself"
+        )
+    return str(recorded)
+
+
 def resume_position(ckpt: Mapping[str, Any]) -> Dict[str, Any]:
     """The resumable state a checkpoint carries, in one dict.
 
@@ -931,6 +967,7 @@ __all__ = [
     "stage_spec",
     "steps_for_budget",
     "tokens_per_parameter",
+    "validate_stage_b_init",
     "validate_stage_resume",
     "warmup_steps",
 ]
