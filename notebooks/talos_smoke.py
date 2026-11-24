@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import sys
 import tempfile
@@ -296,6 +297,11 @@ def run_smoke(out_dir: Optional[str] = None, *,
                         POSITION_METADATA_KEY: position.as_dict(),
                         "skipped_updates": info.skipped_updates,
                         "supervised_tokens": info.supervised_tokens,
+                        # Additive: the cumulative wall clock of this stage so
+                        # far. A resumed session adds it back, so elapsed time
+                        # (and the ETA derived from it) continues instead of
+                        # restarting at zero.
+                        "elapsed_s": float(info.elapsed_s),
                         "smoke": True,
                     },
                 ),
@@ -338,13 +344,14 @@ def run_smoke(out_dir: Optional[str] = None, *,
     accountant_b = TokenAccountant(tokens_per_step * SMOKE_RESUME_AFTER)
     stream_b = RowStream(doc_source(train_docs), seq_len=SMOKE_SEQ_LEN,
                          vocab_size=SMOKE_MODEL_VOCAB, epochs=1)
+    metrics_rows_1: List[Any] = []
     result_b1 = train_stage(
         model=model_b, optimizer=optimizer_b, scaler=None, accountant=accountant_b,
         stream=stream_b, forward_loss=make_forward_loss(model_b),
         config=make_config(SMOKE_STEPS), stage_key=spec.key, device=device,
         on_checkpoint=make_saver(model_b, optimizer_b, root / "stage-b-resume", spec,
                                  lambda: stream_b.position),
-        evaluate=None, say=say,
+        evaluate=None, on_log=metrics_rows_1.append, say=say,
     )
     if result_b1.steps != SMOKE_RESUME_AFTER:
         raise AssertionError(
@@ -370,13 +377,20 @@ def run_smoke(out_dir: Optional[str] = None, *,
         (ckpt.get("run_metadata") or {}).get(POSITION_METADATA_KEY) or {})
     stream_b2 = RowStream(doc_source(train_docs), seq_len=SMOKE_SEQ_LEN,
                           vocab_size=SMOKE_MODEL_VOCAB, epochs=1, start=position)
+    # The resumed session continues the run's clock and its loss instead of
+    # restarting both: `elapsed_s` is cumulative across sessions and the loss is
+    # seeded from the checkpoint (the four metrics the owner reported broken).
+    prior_elapsed = float((ckpt.get("run_metadata") or {}).get("elapsed_s") or 0.0)
+    metrics_rows_2: List[Any] = []
     result_b2 = train_stage(
         model=model_b, optimizer=optimizer_b, scaler=None, accountant=accountant_b,
         stream=stream_b2, forward_loss=make_forward_loss(model_b),
         config=make_config(SMOKE_STEPS), stage_key=spec.key, device=device,
         on_checkpoint=make_saver(model_b, optimizer_b, root / "stage-b-resume", spec,
                                  lambda: stream_b2.position),
-        evaluate=lambda: evaluate(model_b), say=say,
+        evaluate=lambda: evaluate(model_b), on_log=metrics_rows_2.append,
+        say=say, elapsed_offset_s=prior_elapsed,
+        initial_train_loss=ckpt.get("train_loss"),
     )
     if result_b2.tokens_consumed != result_a.tokens_consumed:
         raise AssertionError(
@@ -388,6 +402,32 @@ def run_smoke(out_dir: Optional[str] = None, *,
             f"resumed run did {result_b2.steps} steps, the uninterrupted run "
             f"{result_a.steps}"
         )
+    # --- the four metrics across the save -> resume -> save boundary --------
+    metric_rows = list(metrics_rows_1) + list(metrics_rows_2)
+    if not metrics_rows_1 or not metrics_rows_2:
+        raise AssertionError("the resumed run published no metrics rows")
+    last_before = max(row.elapsed_s for row in metrics_rows_1)
+    for row in metrics_rows_2:
+        if row.elapsed_s < last_before:
+            raise AssertionError(
+                f"elapsed time went backwards across the resume: "
+                f"{row.elapsed_s:.2f}s after {last_before:.2f}s")
+        if not math.isfinite(row.train_loss):
+            raise AssertionError(f"a resumed metrics row carries train_loss="
+                                 f"{row.train_loss!r}")
+        if row.tokens_per_sec is not None and not math.isfinite(row.tokens_per_sec):
+            raise AssertionError(f"non-finite tokens/sec: {row.tokens_per_sec!r}")
+        if row.eta_s is not None and row.eta_s < 0:
+            raise AssertionError(f"negative ETA: {row.eta_s!r}")
+    for row in metric_rows:
+        if not math.isfinite(row.train_loss):
+            raise AssertionError(f"a metrics row carries train_loss={row.train_loss!r}")
+    say(f"metrics    : {len(metrics_rows_1)} rows before the resume, "
+        f"{len(metrics_rows_2)} after; elapsed continues "
+        f"{last_before:.2f}s -> {max(r.elapsed_s for r in metrics_rows_2):.2f}s, "
+        f"tokens/sec {metrics_rows_2[-1].tokens_per_sec:,.0f}, "
+        f"ETA {metrics_rows_2[-1].eta_s:.1f}s, every train_loss finite")
+
     loss_delta = abs(float(result_b2.train_loss) - float(result_a.train_loss))
     say(f"resume     : {result_b2.steps} steps, {result_b2.tokens_consumed:,} tokens "
         f"(identical to run A), |Δ train loss| {loss_delta:.2e}")

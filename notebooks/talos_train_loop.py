@@ -39,6 +39,7 @@ from talos_stages import (MAX_CONSECUTIVE_SKIPPED, NonFiniteAbort, SkipTracker,
                           TokenAccountant, lr_at, plan_step)
 from talos_torch_utils import (clip_gradients, grad_norm, grads_are_finite,
                                loss_is_finite, rows_to_tensor)
+from talos_training_lib import ThroughputWindow
 
 
 @dataclass
@@ -62,6 +63,10 @@ class TrainLoopConfig:
     #: Tokens in one full pass over the training data, when known: used only to
     #: report ``epochs_completed`` as a fraction (Stage B).
     tokens_per_epoch: Optional[int] = None
+    #: Trailing window for the published tokens/sec (seconds). The rate is
+    #: measured over the CURRENT session's deltas inside this window, never
+    #: lifetime-from-zero (which spikes after a resume).
+    throughput_window_s: float = 300.0
 
     def __post_init__(self) -> None:
         for name in ("micro_batch", "grad_accum", "seq_len", "total_steps"):
@@ -78,6 +83,8 @@ class TrainLoopConfig:
                 raise ValueError(f"{name} must be positive")
         if self.max_consecutive_skips < 1:
             raise ValueError("max_consecutive_skips must be >= 1")
+        if float(self.throughput_window_s) <= 0:
+            raise ValueError("throughput_window_s must be positive")
 
 
 @dataclass
@@ -96,6 +103,12 @@ class StepInfo:
     skipped_updates: int
     stage: str
     rows_in_epoch: int = 0
+    #: Rolling tokens/sec over the CURRENT session's deltas (``None`` until the
+    #: session has measured anything). Additive: the metrics row's own field
+    #: names and order are unchanged; the notebook passes this value through.
+    tokens_per_sec: Optional[float] = None
+    #: Seconds to the budget at :attr:`tokens_per_sec`; ``None`` = no estimate.
+    eta_s: Optional[float] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -111,6 +124,8 @@ class StepInfo:
             "skipped_updates": self.skipped_updates,
             "stage": self.stage,
             "rows_in_epoch": self.rows_in_epoch,
+            "tokens_per_sec": self.tokens_per_sec,
+            "eta_s": self.eta_s,
         }
 
 
@@ -190,6 +205,8 @@ def train_stage(
     skip_tracker: Optional[SkipTracker] = None,
     clock: Callable[[], float] = time.time,
     say: Callable[[str], None] = print,
+    elapsed_offset_s: float = 0.0,
+    initial_train_loss: Optional[float] = None,
 ) -> TrainResult:
     """Run one stage until the budget is spent or the data is exhausted.
 
@@ -211,6 +228,14 @@ def train_stage(
         skip_tracker: injectable counter (tests inspect it).
         clock: monotonic seconds (injectable for tests).
         say: line printer (``print`` in the notebook, ``list.append`` in tests).
+        elapsed_offset_s: wall-clock seconds this stage had already spent in
+            **earlier sessions** (the resumed checkpoint's cumulative
+            ``elapsed_s``). Added to every ``StepInfo.elapsed_s`` so the
+            published elapsed time is the run's, not the session's.
+        initial_train_loss: the last finite training loss from the checkpoint.
+            Seeds ``train_loss`` so the first interval of a resumed session
+            reports a real number instead of ``nan`` (a ``nan`` row is not
+            plottable and breaks the dashboard's loss graph).
 
     Returns:
         :class:`TrainResult`.
@@ -223,8 +248,17 @@ def train_stage(
     skips = skip_tracker or SkipTracker(max_consecutive=config.max_consecutive_skips)
     start = clock()
     last_ckpt_at = start
+    #: Prior sessions' wall clock: without it, every resumed run reported an
+    #: elapsed time that restarted at zero (and an ETA computed from it).
+    elapsed_offset = max(0.0, float(elapsed_offset_s))
+    #: Current-session throughput. Seeded with the resume point so a rate can
+    #: never span two sessions (the "5B tokens in 30 seconds" spike).
+    throughput = ThroughputWindow(window_s=config.throughput_window_s)
+    throughput.reset(0.0, int(accountant.consumed))
 
     train_loss: float = float("nan")
+    if initial_train_loss is not None and math.isfinite(float(initial_train_loss)):
+        train_loss = float(initial_train_loss)
     val_loss: Optional[float] = None
     last_grad_norm: Optional[float] = None
     last_checkpoint = ""
@@ -240,7 +274,7 @@ def train_stage(
             epoch=int(getattr(stream.position, "epoch", 1)),
             tokens_consumed=int(accountant.consumed),
             supervised_tokens=int(supervised_tokens),
-            elapsed_s=float(clock() - start),
+            elapsed_s=float(elapsed_offset + (clock() - start)),
             train_loss=float(train_loss),
             val_loss=None if val_loss is None else float(val_loss),
             last_grad_norm=None if last_grad_norm is None else float(last_grad_norm),
@@ -248,6 +282,9 @@ def train_stage(
             skipped_updates=int(skips.total),
             stage=str(stage_key),
             rows_in_epoch=int(getattr(stream.position, "rows_in_epoch", 0)),
+            tokens_per_sec=throughput.tokens_per_sec(),
+            eta_s=throughput.eta_s(int(accountant.consumed),
+                                   int(accountant.token_budget)),
         )
 
     model.train()
@@ -289,6 +326,9 @@ def train_stage(
                 # it is actually applied (a skipped update must not advance the
                 # step counter or the LR schedule).
                 accountant.add(int(ids.numel()), steps=0)
+                # Current-session throughput sample: tokens are counted whether
+                # or not the update is applied, so this matches the accounting.
+                throughput.update(clock() - start, int(accountant.consumed))
                 step_supervised += _count_supervised(ids, mask)
 
                 if not loss_is_finite(loss):
@@ -404,7 +444,7 @@ def train_stage(
         if on_checkpoint is not None:
             last_checkpoint = on_checkpoint(_info())
 
-    elapsed = clock() - start
+    elapsed = elapsed_offset + (clock() - start)
     epochs_completed = _epochs_completed(stream, config)
     result = TrainResult(
         steps=int(accountant.steps),

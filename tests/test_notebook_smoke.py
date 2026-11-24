@@ -29,6 +29,11 @@ def test_the_cpu_smoke_run_passes_end_to_end(tmp_path):
     # It really trained, resumed and evaluated — not a dry run.
     assert "resume" in stdout and "evaluation" in stdout
     assert "stage B" in stdout
+    # The four tracker metrics across the save -> resume -> save boundary:
+    # cumulative elapsed, rolling tokens/sec, a non-negative ETA and a finite
+    # train_loss on every row (checked inside the run, printed here).
+    assert "metrics    :" in stdout
+    assert "elapsed continues" in stdout
 
     # Artifacts: at least one checkpoint, and tracker payloads naming Argo.
     checkpoints = [p for p in out.rglob("*.pt")]

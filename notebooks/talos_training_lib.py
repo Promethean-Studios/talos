@@ -35,9 +35,10 @@ import logging
 import math
 import os
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import (Any, Callable, Dict, Iterable, List, Mapping, Optional,
+                    Sequence, Tuple)
 
 logger = logging.getLogger("talos.notebook.training_lib")
 
@@ -220,6 +221,89 @@ def compute_eta_s(tokens_so_far: int, total_tokens: int, elapsed_s: float) -> Op
 
 
 # ---------------------------------------------------------------------------
+# Rolling throughput — the CURRENT session's deltas, never lifetime-from-zero
+# ---------------------------------------------------------------------------
+@dataclass
+class ThroughputWindow:
+    """Tokens/sec measured from this session's deltas over a trailing window.
+
+    Why not :func:`compute_tokens_per_sec`: that helper divides the run's
+    *lifetime* token count by the *current session's* elapsed time. A resumed
+    session therefore published a rate that spiked to absurd values on its first
+    row (5B tokens over 30 seconds) and then decayed for hours — and the ETA,
+    derived from the same rate, was nonsense in the opposite direction.
+
+    A window is seeded with the resume point (``reset(0.0, tokens_at_resume)``)
+    and then fed the running token count, so a delta can never span two
+    sessions: the first row of a session reports the session's mean rate so
+    far, later rows report the trailing-window rate. Values are always finite
+    and non-negative; ``None`` means "not measurable yet" and the caller
+    publishes ``0.0`` / ``None`` rather than a fabricated number.
+
+    Args:
+        window_s: trailing window length in seconds (default 300 = 5 min, the
+            metrics-sync cadence, so a row's rate covers its own interval).
+    """
+
+    window_s: float = 300.0
+    _samples: List[Tuple[float, int]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if float(self.window_s) <= 0:
+            raise ValueError("window_s must be positive")
+        self.window_s = float(self.window_s)
+
+    def reset(self, wall_s: float = 0.0, tokens: int = 0) -> None:
+        """Start a session: the only sample is the resume point."""
+        if tokens < 0:
+            raise ValueError("tokens must be >= 0")
+        self._samples = [(float(wall_s), int(tokens))]
+
+    def update(self, wall_s: float, tokens: int) -> None:
+        """Record the running token count at ``wall_s`` seconds into the session."""
+        if wall_s < 0:
+            raise ValueError("wall_s must be >= 0")
+        if tokens < 0:
+            raise ValueError("tokens must be >= 0")
+        self._samples.append((float(wall_s), int(tokens)))
+        edge = float(wall_s) - self.window_s
+        # Keep the newest sample plus the oldest one still inside the window;
+        # never prune below two points, or a window holding a single long step
+        # would stop producing a rate at all.
+        while len(self._samples) > 2 and self._samples[1][0] <= edge:
+            self._samples.pop(0)
+
+    def tokens_per_sec(self) -> Optional[float]:
+        """Trailing-window tokens/sec, or ``None`` before anything was measured."""
+        if len(self._samples) < 2:
+            return None
+        (first_wall, first_tokens), (last_wall, last_tokens) = (
+            self._samples[0], self._samples[-1])
+        span = last_wall - first_wall
+        delta = last_tokens - first_tokens
+        if span <= 0:
+            return None
+        if delta < 0:            # impossible; never publish a negative rate
+            return 0.0
+        rate = float(delta) / span
+        return rate if math.isfinite(rate) else None
+
+    def eta_s(self, tokens_so_far: int, total_tokens: int) -> Optional[float]:
+        """Seconds to the budget at the current rate; never negative."""
+        if total_tokens <= 0:
+            raise ValueError("total_tokens must be positive")
+        if tokens_so_far < 0:
+            raise ValueError("tokens_so_far must be >= 0")
+        if tokens_so_far >= total_tokens:
+            return 0.0
+        rate = self.tokens_per_sec()
+        if rate is None or rate <= 0:
+            return None
+        remaining = float(total_tokens) - float(tokens_so_far)
+        return max(0.0, remaining / rate)
+
+
+# ---------------------------------------------------------------------------
 # Metrics row
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
@@ -285,12 +369,22 @@ def build_metrics_row(
     stage: str = "",
     timestamp: Optional[datetime] = None,
     skipped_updates: int = 0,
+    tokens_per_sec: Optional[float] = None,
+    eta_s: Optional[float] = None,
 ) -> MetricsRow:
     """Build a validated :class:`MetricsRow`; throughput and ETA are derived.
 
+    ``tokens_per_sec`` / ``eta_s`` may be supplied by the caller — the training
+    loop measures them over a rolling window of the *current session's* deltas
+    (:class:`ThroughputWindow`), which is the only correct source after a
+    resume. When they are ``None`` the lifetime-mean helpers are used, exactly
+    as before (the schema, the field order and the derived-value contract are
+    unchanged either way).
+
     Raises ``ValueError`` on impossible inputs (negative step/tokens, a
-    non-positive budget, a non-finite loss) so a corrupt log line is caught at
-    the source instead of silently polluting the metrics dataset.
+    non-positive budget, a non-finite loss, a negative/non-finite rate or ETA)
+    so a corrupt log line is caught at the source instead of silently polluting
+    the metrics dataset.
     """
     if step < 0:
         raise ValueError("step must be >= 0")
@@ -316,14 +410,28 @@ def build_metrics_row(
         if val != val or val in (float("inf"), float("-inf")):
             raise ValueError(f"val_loss must be finite when set, got {val_loss!r}")
         val_loss = val
+    if tokens_per_sec is None:
+        rate = compute_tokens_per_sec(tokens_so_far, elapsed_s)
+    else:
+        rate = float(tokens_per_sec)
+        if not math.isfinite(rate) or rate < 0:
+            raise ValueError(f"tokens_per_sec must be finite and >= 0, got "
+                             f"{tokens_per_sec!r}")
+    if eta_s is None:
+        eta = compute_eta_s(tokens_so_far, total_tokens, elapsed_s)
+    else:
+        eta = float(eta_s)
+        if not math.isfinite(eta) or eta < 0:
+            raise ValueError(f"eta_s must be finite and >= 0 when set, got "
+                             f"{eta_s!r}")
     return MetricsRow(
         step=int(step),
         epoch=int(epoch),
         tokens_so_far=int(tokens_so_far),
         total_tokens=int(total_tokens),
-        tokens_per_sec=compute_tokens_per_sec(tokens_so_far, elapsed_s),
+        tokens_per_sec=float(rate),
         elapsed_s=float(elapsed_s),
-        eta_s=compute_eta_s(tokens_so_far, total_tokens, elapsed_s),
+        eta_s=None if eta is None else float(eta),
         train_loss=train,
         val_loss=val_loss,
         checkpoint=str(checkpoint),
@@ -461,6 +569,93 @@ def rows_to_jsonl(rows: Iterable[MetricsRow]) -> str:
     return "".join(row.to_jsonl() + "\n" for row in rows)
 
 
+def _row_key(payload: Mapping[str, Any]) -> Tuple[str, int]:
+    """Identity of a metrics row across sessions: ``(stage, step)``.
+
+    A row is unique per stage and step. Wall-clock time is *not* part of the
+    identity: a resumed session re-treads the steps between the checkpoint it
+    loaded and the one it crashed at, and those must replace, not duplicate, the
+    earlier rows.
+    """
+    try:
+        step = int(payload.get("step") or 0)
+    except (TypeError, ValueError):
+        step = 0
+    return (str(payload.get("stage") or ""), step)
+
+
+def merge_metric_payloads(
+    existing: Iterable[Any], new: Iterable[Any]
+) -> List[Dict[str, Any]]:
+    """Merge row lists across sessions: newest write wins on ``(stage, step)``.
+
+    Order is first-appearance order, so the merged history stays chronological
+    (the rows already on disk are older). This is what keeps the training-loss
+    graph continuous across a resume: without it, every session rewrote
+    ``metrics.jsonl``/``history.json`` from its own in-memory rows and the graph
+    restarted at the resume point with the earlier history erased.
+    """
+    merged: List[Dict[str, Any]] = []
+    index: Dict[Tuple[str, int], int] = {}
+    for payload in list(existing) + list(new):
+        if not isinstance(payload, Mapping):
+            continue
+        key = _row_key(payload)
+        if key in index:
+            merged[index[key]] = dict(payload)      # newer value, same position
+        else:
+            index[key] = len(merged)
+            merged.append(dict(payload))
+    return merged
+
+
+def merge_checkpoint_entries(
+    existing: Iterable[Any], new: Iterable[Any]
+) -> List[Dict[str, int]]:
+    """Merge ``history.json``'s ``checkpoints`` list by step (newest wins, sorted)."""
+    merged: Dict[int, Dict[str, int]] = {}
+    for entry in list(existing) + list(new):
+        if not isinstance(entry, Mapping):
+            continue
+        try:
+            step = int(entry.get("step") or 0)
+        except (TypeError, ValueError):
+            continue
+        merged[step] = {
+            "step": step,
+            "tokens_consumed": int(entry.get("tokens_consumed") or 0),
+        }
+    return [merged[step] for step in sorted(merged)]
+
+
+def _finite_or_none(value: Optional[float]) -> Optional[float]:
+    """``float`` when finite, else ``None`` (never publish NaN/Inf as a loss)."""
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _loss_is_publishable(payload: Mapping[str, Any]) -> bool:
+    """Is this row's ``train_loss`` a finite float? (a plottable point)
+
+    A row carrying ``NaN``/``Inf``/``None`` is not a plottable point: it breaks
+    the training-loss graph and, written verbatim, produces JSON that strict
+    parsers reject. Such rows are dropped on read (a poisoned history heals
+    itself on the next push) and never produced by the notebook, which
+    republishes the last finite loss for a skipped update instead.
+    """
+    value = payload.get("train_loss")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(number)
+
+
 #: Uploader signature: ``(repo_id, local_path, path_in_repo, token) -> None``.
 Uploader = Callable[[str, str, str, Optional[str]], None]
 
@@ -564,6 +759,32 @@ class MetricsSync:
                            self.local_path, exc)
 
     # -- uploads ------------------------------------------------------------
+    def _payloads_on_disk(self) -> List[Dict[str, Any]]:
+        """Rows already in the local jsonl — a previous session's history."""
+        try:
+            with open(self.local_path, encoding="utf-8") as handle:
+                text = handle.read()
+        except OSError:
+            return []
+        payloads: List[Dict[str, Any]] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except ValueError:
+                logger.warning("dropping an unreadable metrics line in %s",
+                               self.local_path)
+                continue
+            if isinstance(payload, Mapping):
+                if not _loss_is_publishable(payload):
+                    logger.warning("dropping a metrics row with a non-finite "
+                                   "train_loss from %s", self.local_path)
+                    continue
+                payloads.append(dict(payload))
+        return payloads
+
     def push(self, rows: Optional[Sequence[MetricsRow]] = None) -> bool:
         """Upload the metrics jsonl now; never raises.
 
@@ -571,6 +792,12 @@ class MetricsSync:
         to the history first, so nothing is lost), or ``None`` to publish the
         full history. Returns ``True`` on success (or on a dry run, where the
         network step is skipped by design), ``False`` when the upload failed.
+
+        The file that is written (and uploaded) is the **merged** history: the
+        rows already on disk plus this session's, de-duplicated on
+        ``(stage, step)``. Before this, a resumed session rewrote the file from
+        its own in-memory rows and the pre-resume metrics — the training-loss
+        graph's earlier points — were silently dropped.
         """
         if isinstance(rows, MetricsRow):
             rows = [rows]
@@ -588,8 +815,12 @@ class MetricsSync:
             parent = os.path.dirname(os.path.abspath(self.local_path))
             if parent:
                 os.makedirs(parent, exist_ok=True)
+            payloads = merge_metric_payloads(
+                self._payloads_on_disk(), [row.as_dict() for row in self.rows])
             with open(self.local_path, "w", encoding="utf-8") as handle:
-                handle.write(rows_to_jsonl(self.rows))
+                for payload in payloads:
+                    handle.write(json.dumps(payload, ensure_ascii=False,
+                                            allow_nan=False) + "\n")
             self._uploader(self.repo_id, self.local_path, self.path_in_repo, self.token)
         except Exception as exc:  # noqa: BLE001 — sync must never kill training
             self.last_error = f"{type(exc).__name__}: {exc}"
@@ -852,8 +1083,8 @@ class TrackerPublisher:
             "step_target": math.ceil(self.token_target / self.tokens_per_step),
             "tokens_consumed": int(tokens_consumed),
             "token_target": self.token_target,
-            "train_loss": None if train_loss is None else float(train_loss),
-            "val_loss": None if val_loss is None else float(val_loss),
+            "train_loss": _finite_or_none(train_loss),
+            "val_loss": _finite_or_none(val_loss),
             "checkpoint": str(checkpoint),
             "checkpoint_timestamp": now,
             "gpu": self.gpu,
@@ -867,11 +1098,27 @@ class TrackerPublisher:
         payload["skipped_updates"] = int(self.skipped_updates)
         return payload
 
+    def _history_on_disk(self) -> Mapping[str, Any]:
+        """The ``history.json`` already in ``local_dir`` (a previous session's)."""
+        try:
+            with open(self.history_path, encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, ValueError):
+            return {}
+        return payload if isinstance(payload, Mapping) else {}
+
     def build_history(
         self,
         epoch_rows: Optional[Iterable[Any]] = None,
     ) -> Dict[str, Any]:
-        """The owner's ``history.json``: checkpoint list + metric rows."""
+        """The owner's ``history.json``: checkpoint list + metric rows.
+
+        The rows and checkpoints already on disk are merged in (de-duplicated
+        on stage+step / step, this session winning), so the published history is
+        the run's whole history rather than the current session's slice. That is
+        what keeps the dashboard's loss graph continuous across a resume — it
+        used to restart at the resume point with everything before it erased.
+        """
         if epoch_rows is None:
             rows: List[Any] = list(self.epoch_rows)
         else:
@@ -879,9 +1126,11 @@ class TrackerPublisher:
         serialized = [
             row.as_dict() if isinstance(row, MetricsRow) else dict(row) for row in rows
         ]
+        existing = self._history_on_disk()
         history = {
-            "checkpoints": [dict(item) for item in self.checkpoints],
-            "epochs": serialized,
+            "checkpoints": merge_checkpoint_entries(
+                existing.get("checkpoints") or (), self.checkpoints),
+            "epochs": merge_metric_payloads(existing.get("epochs") or (), serialized),
         }
         return {key: history[key] for key in TRACKER_HISTORY_FIELDS}
 
@@ -919,9 +1168,9 @@ class TrackerPublisher:
         try:
             os.makedirs(self.local_dir or ".", exist_ok=True)
             with open(self.status_path, "w", encoding="utf-8") as handle:
-                handle.write(json.dumps(status, indent=2))
+                handle.write(json.dumps(status, indent=2, allow_nan=False))
             with open(self.history_path, "w", encoding="utf-8") as handle:
-                handle.write(json.dumps(history, indent=2))
+                handle.write(json.dumps(history, indent=2, allow_nan=False))
         except (OSError, TypeError, ValueError) as exc:
             self.last_error = f"local write failed: {exc}"
             logger.warning("tracker local write failed (%s): %s",
