@@ -132,6 +132,49 @@ clone.
 
 Reference: [`docs/trainer.md`](docs/trainer.md).
 
+## Checkpoint storage (Colab runs)
+
+Argo writes checkpoints to `OUT_DIR` on the mounted Google Drive: it is the only
+store that survives a runtime recycle, and it has a quota. The policy in
+[`notebooks/talos_checkpoints_storage.py`](notebooks/talos_checkpoints_storage.py)
+(owner decision 2026-11-24) is what the notebook's save cell goes through:
+
+- **Tiering.** The newest checkpoint stays on Drive (`OUT_DIR`, unchanged
+  semantics). Every older one is *moved* to Colab's local disk
+  (`/content/talos_checkpoints`): copy → verify (byte size, streaming sha256,
+  and a real load through the existing checkpoint loader/validator) → and only
+  then delete the Drive original. A copy that fails verification keeps the
+  Drive original, warns loudly, retries once, then leaves it alone.
+- **Bounded local disk.** 10 GiB by default; past that, the oldest local
+  checkpoint is evicted first.
+- **Two never-delete guards, one implementation** shared by eviction and the
+  quota fallback: the globally newest checkpoint and the only valid recovery
+  checkpoint are never deleted. A store that cannot shrink safely stays over
+  budget and says so.
+- **Resume** tries candidates newest → older across both stores through the
+  existing validator, so a corrupt newest checkpoint falls back to an older one
+  instead of ending the run.
+- **Drive-quota save fallback.** A save that fails with a quota-shaped error —
+  `EDQUOT`/`ENOSPC`, or a message matching "quota exceeded" /
+  "storageQuotaExceeded" / "disk quota exceeded" — frees Drive space by
+  deleting older Drive checkpoints (verified-local copies first, then Drive-only
+  ones, oldest first, under the same two guards) and retries the save **once**.
+  A retry that still fails warns loudly and re-raises the original error, so a
+  step is never reported as saved when it was not. Any other error re-raises
+  untouched with nothing deleted.
+
+Checkpoint format (`talos-training-checkpoint-v1`), the save/load APIs and
+`OUT_DIR` semantics are unchanged. Overrides: `TALOS_LOCAL_CHECKPOINT_DIR` and
+`TALOS_LOCAL_CHECKPOINT_LIMIT_BYTES`.
+
+**Verified:** the policy is CPU-only unit-tested (24 tests in
+[`tests/test_checkpoint_storage.py`](tests/test_checkpoint_storage.py) —
+verified moves, failed-verification retention, eviction order, both never-delete
+guards, cross-store resume, and four quota-fallback cases), and the notebook
+cells that wire it run under CI integration tests. **Not verified:** nothing
+here has run on a GPU — notebook execution on a T4 or A100 is unverified, and
+the quota fallback has not yet been exercised against a genuinely full Drive.
+
 ## Quick start
 
 ```bash
