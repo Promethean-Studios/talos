@@ -450,3 +450,172 @@ def test_verdict_reports_an_unknown_stage_a_count(notebook):
 
     assert recorded["stage_a_tokens"] == 0
     assert "Stage-A token count unknown" in buffer.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint tiering + the four metrics, executed from the real cells
+# ---------------------------------------------------------------------------
+def _exec_nodes(source: str, namespace: Dict[str, Any], *, functions: tuple = (),
+                assignments: tuple = (), name: str = "cell") -> None:
+    """Run only the named top-level defs/assignments of a cell, in order."""
+    tree = ast.parse(source)
+    body = []
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in functions:
+            body.append(node)
+        elif isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id in assignments
+                for target in node.targets):
+            body.append(node)
+    assert body, f"none of {functions + assignments} found in the cell"
+    exec(compile(ast.Module(body=body, type_ignores=[]),
+                 f"<notebook:{name}>", "exec"), namespace)
+
+
+def _retain_checkpoints(notebook, *, raises=False):
+    cell = _cell(notebook, "# 8. Model -> GPU")
+
+    class _Report:
+        def summary(self):
+            return "newest step 12 on Drive; moved 2 to local disk"
+
+    tier = types.SimpleNamespace(
+        after_save=(lambda: (_ for _ in ()).throw(RuntimeError("disk full"))
+                    if raises else _Report()))
+    namespace = {"CHECKPOINT_TIERING": tier}
+    _exec_nodes(cell, namespace, functions=("retain_checkpoints",), name="retain")
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        result = namespace["retain_checkpoints"]()
+    return result, buffer.getvalue()
+
+
+def test_cell_8_retention_pass_runs_and_reports(notebook):
+    report, output = _retain_checkpoints(notebook)
+    assert report is not None
+    assert "checkpoints : newest step 12 on Drive" in output
+
+
+def test_cell_8_retention_pass_never_kills_the_run(notebook):
+    """A storage failure is a warning, not the end of a 20B-token run."""
+    report, output = _retain_checkpoints(notebook, raises=True)
+    assert report is None
+    assert "WARNING: checkpoint retention failed" in output
+    assert "training continues" in output
+
+
+def test_cell_8_builds_the_tiering_from_out_dir(notebook):
+    cell = _cell(notebook, "# 8. Model -> GPU")
+    assert "CheckpointTiering(" in cell and "str(OUT_DIR)" in cell
+    assert "LOCAL_CHECKPOINT_LIMIT_BYTES" in cell
+    assert "TALOS_LOCAL_CHECKPOINT_DIR" in cell, "the local dir must be overridable"
+
+
+def test_cell_9_calls_the_retention_pass_after_every_save(notebook):
+    cell = _cell(notebook, "# 9. Training loop")
+    body = cell[cell.index("def on_checkpoint(info):"):]
+    body = body[:body.index("def on_log(info):")]
+    assert "save_step(info, stream.position)" in body
+    assert body.index("save_step(") < body.index("retain_checkpoints()"), (
+        "the retention pass must run AFTER the checkpoint is written")
+    # The elapsed time written to run_state.json is already cumulative.
+    assert '"elapsed_s": info.elapsed_s' in body
+    assert "prior_elapsed + info.elapsed_s" not in body
+
+
+def test_cell_9_resumes_across_both_stores(notebook):
+    cell = _cell(notebook, "# 9. Training loop")
+    assert "CHECKPOINT_TIERING.resume_candidates()" in cell
+    assert "list_checkpoint_candidates(str(OUT_DIR))" not in cell
+    assert 'run_metadata") or {}).get("elapsed_s")' in cell
+    assert "elapsed_offset_s=prior_elapsed" in cell
+    assert "initial_train_loss=train_loss" in cell
+
+
+def _on_log(notebook, *, last_finite):
+    """Cell 9's real ``on_log`` with the publisher/display stubbed."""
+    cell = _cell(notebook, "# 9. Training loop")
+    rows: List[Dict[str, Any]] = []
+    printed = io.StringIO()
+
+    def _build(**kwargs):
+        rows.append(kwargs)
+        return types.SimpleNamespace()
+
+    namespace = {
+        "math": __import__("math"), "train_loss": float("nan"),
+        "build_metrics_row": _build, "render_display_table": lambda row: "<table>",
+        "HTML": lambda html: html,
+        "display_handle": types.SimpleNamespace(update=lambda html: None),
+        "metrics_sync": types.SimpleNamespace(maybe_push=lambda row: True),
+        "tracker": types.SimpleNamespace(maybe_push=lambda row: True),
+        "spec": types.SimpleNamespace(token_budget=4_000_000_000, key="A"),
+        "GPU": types.SimpleNamespace(label="NVIDIA L4"),
+        "MODEL_DISPLAY_NAME": "Argo 1B", "n_params": 1_036_060_672,
+        "tokenizer": types.SimpleNamespace(vocab_size=49_152), "SEQ_LEN": 2048,
+    }
+    _exec_nodes(cell, namespace, functions=("on_log",), assignments=("LAST_FINITE_LOSS",),
+                name="on_log")
+    if last_finite is not None:
+        namespace["LAST_FINITE_LOSS"]["value"] = last_finite
+    return namespace["on_log"], rows, printed
+
+
+def _info(**overrides):
+    base = dict(step=10, epoch=1, tokens_consumed=1_000, elapsed_s=600.0,
+                train_loss=2.5, val_loss=None, checkpoint="step-10.pt",
+                skipped_updates=0, tokens_per_sec=2_000.0, eta_s=60.0)
+    base.update(overrides)
+    return types.SimpleNamespace(**base)
+
+
+def test_cell_9_publishes_a_finite_loss_and_the_rolling_rate(notebook):
+    on_log, rows, _ = _on_log(notebook, last_finite=None)
+    on_log(_info())
+    assert len(rows) == 1
+    assert rows[0]["train_loss"] == 2.5
+    assert rows[0]["tokens_per_sec"] == 2_000.0
+    assert rows[0]["eta_s"] == 60.0
+    assert rows[0]["elapsed_s"] == 600.0
+
+
+def test_cell_9_republishes_the_last_finite_loss_on_a_skipped_update(notebook):
+    on_log, rows, _ = _on_log(notebook, last_finite=None)
+    on_log(_info(train_loss=2.5))
+    on_log(_info(step=11, train_loss=float("nan"), skipped_updates=1))
+    assert [row["train_loss"] for row in rows] == [2.5, 2.5]
+    assert rows[1]["skipped_updates"] == 1
+
+
+def test_cell_9_publishes_nothing_when_no_finite_loss_exists_yet(notebook):
+    on_log, rows, _ = _on_log(notebook, last_finite=None)
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        on_log(_info(train_loss=float("nan")))
+    assert rows == [], "a NaN point must never reach the graph"
+    assert "no metrics row published" in buffer.getvalue()
+
+
+def test_cell_9_on_checkpoint_records_the_cumulative_elapsed(notebook, tmp_path):
+    cell = _cell(notebook, "# 9. Training loop")
+    run_state = tmp_path / "run_state.json"
+    saved: List[str] = []
+    recorded: List[Any] = []
+    namespace = {
+        "json": json, "RUN_STATE": run_state, "prior_elapsed": 999.0,
+        "save_step": lambda info, position: saved.append("step-10.pt") or "step-10.pt",
+        "retain_checkpoints": lambda: recorded.append("retain"),
+        "stream": types.SimpleNamespace(position="position"),
+        "tracker": types.SimpleNamespace(note_checkpoint=lambda *a: recorded.append(a),
+                                         note_skipped=lambda n: None),
+        "spec": types.SimpleNamespace(key="A"), "last_ckpt_name": "",
+    }
+    _exec_nodes(cell, namespace, functions=("on_checkpoint",), name="on_checkpoint")
+    namespace["on_checkpoint"](_info(elapsed_s=1_234.5))
+
+    assert saved == ["step-10.pt"]
+    assert "retain" in recorded, "the retention pass runs after every save"
+    state = json.loads(run_state.read_text())
+    assert state["elapsed_s"] == 1_234.5, (
+        "elapsed_s is cumulative already: adding prior_elapsed would double-count")
+    assert state["tokens_consumed"] == 1_000
