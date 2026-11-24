@@ -26,16 +26,24 @@ The policy, made precise (owner's directive, 2026-11-24):
 5. Resume tries candidates newest → older **across both stores** through the
    existing validator, so a corrupt newest checkpoint falls back to the next
    older one instead of ending the run.
+6. If a **save itself** fails because Drive is full (a quota-shaped error and
+   nothing else), older Drive checkpoints are deleted — those with a verified
+   local copy first, then Drive-only ones, oldest first, under the same
+   never-delete rules — and the save is retried **once**. A save that still
+   fails re-raises, so training never believes a checkpoint exists when it does
+   not. Any non-quota error is re-raised untouched with nothing deleted.
 
 Nothing here changes the checkpoint format (``talos-training-checkpoint-v1``),
-the save/load APIs, or what ``OUT_DIR`` means: the module is called *after* a
-successful save and only moves whole files around.
+the save/load APIs, or what ``OUT_DIR`` means: the retention pass is called
+*after* a successful save and only moves whole files around, and the quota
+fallback wraps the save call itself.
 
 The module imports no ``torch`` at import time (the loader is imported lazily),
 so it is unit-testable with plain files and a stub loader.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import logging
 import os
@@ -67,10 +75,48 @@ Loader = Callable[[str], Any]
 Validator = Callable[[Any], None]
 #: ``(message) -> None``; the notebook passes ``print``, tests collect.
 Warn = Callable[[str], None]
+#: ``() -> Any``; the save call the quota fallback wraps and retries once.
+Save = Callable[[], Any]
 
 
 class CopyVerificationError(RuntimeError):
     """A copied checkpoint did not match its source (size, sha256 or load)."""
+
+
+#: ``errno`` values that mean "the drive is full" when a save raises them.
+QUOTA_ERRNOS = frozenset({errno.EDQUOT, errno.ENOSPC})
+
+#: Message fragments (lower-cased) that mark a save error as a quota failure.
+#: Deliberately narrow: the fallback deletes checkpoints, so it must only ever
+#: run for a *confidently* quota-shaped failure. Anything else re-raises with
+#: nothing deleted.
+QUOTA_MESSAGE_SIGNALS = (
+    "quota exceeded",
+    "storagequotaexceeded",
+    "disk quota exceeded",
+)
+
+
+def is_quota_error(exc: BaseException) -> bool:
+    """Is ``exc`` (or the exception it wraps) a Drive-quota failure?
+
+    Strict on purpose: ``EDQUOT``/``ENOSPC`` by ``errno``, or one of
+    :data:`QUOTA_MESSAGE_SIGNALS` in the message. The ``__cause__``/
+    ``__context__`` chain is inspected because a write error arrives wrapped
+    (``RuntimeError: ... No space left on device`` from a library, the
+    ``OSError`` inside it). Every other error is *not* quota-shaped.
+    """
+    seen: set = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if getattr(current, "errno", None) in QUOTA_ERRNOS:
+            return True
+        text = f"{type(current).__name__}: {current}".lower()
+        if any(signal in text for signal in QUOTA_MESSAGE_SIGNALS):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +228,29 @@ class RetentionReport:
         return "; ".join(parts)
 
 
+@dataclass
+class QuotaCleanup:
+    """What the Drive-quota fallback did for one save attempt."""
+
+    deleted: List[str] = field(default_factory=list)
+    freed_bytes: int = 0
+    needed_bytes: int = 0
+    retried: bool = False
+    error: Optional[str] = None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.retried and self.error is None
+
+    def summary(self) -> str:
+        parts = [f"deleted {len(self.deleted)} older Drive checkpoint(s), "
+                 f"freed {_human_bytes(self.freed_bytes)} of "
+                 f"{_human_bytes(self.needed_bytes)} needed"]
+        parts.append("retry succeeded" if self.succeeded
+                     else f"retry FAILED: {self.error}")
+        return "; ".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Tiering
 # ---------------------------------------------------------------------------
@@ -224,6 +293,8 @@ class CheckpointTiering:
         self._warn: Warn = warn or (lambda message: logger.warning("%s", message))
         #: path -> is a valid resumable checkpoint (one load per file per pass).
         self._valid_cache: Dict[str, bool] = {}
+        #: What the last Drive-quota fallback did (``None`` = never ran).
+        self.last_fallback: Optional[QuotaCleanup] = None
 
     # -- stores -------------------------------------------------------------
     def drive_checkpoints(self) -> List[str]:
@@ -365,35 +436,48 @@ class CheckpointTiering:
                 return path
         return None
 
+    def _never_delete_reason(self, path: str) -> Optional[str]:
+        """Why the never-delete policy protects ``path``; ``None`` = deletable.
+
+        The single implementation of the two guards, used by both deletion
+        paths (local eviction and the Drive-quota fallback):
+
+        (a) the globally newest checkpoint is never deleted;
+        (b) the only valid recovery checkpoint is never deleted — i.e. at least
+            one *other* checkpoint must still load and validate afterwards.
+        """
+        newest = self.newest_step()
+        if checkpoint_step(path) == newest:
+            return "it is the newest checkpoint in either store"
+        if self._valid_alternative(path) is None:
+            return ("it is the only valid recovery checkpoint (no other copy "
+                    "loads and validates)")
+        return None
+
     def enforce_local_limit(self) -> List[str]:
         """Delete the OLDEST local checkpoints until the budget is met.
 
         Never deletes (a) the globally newest checkpoint or (b) the only valid
-        recovery checkpoint. Returns the paths it deleted; when nothing can be
-        deleted safely it warns and leaves the local store over budget rather
-        than destroying the run's last good copy.
+        recovery checkpoint — both come from :meth:`_never_delete_reason`.
+        Returns the paths it deleted; when nothing can be deleted safely it
+        warns and leaves the local store over budget rather than destroying the
+        run's last good copy.
         """
         paths = self.local_checkpoints()          # newest first
         if not paths:
             return []
-        newest = self.newest_step()
         current = total_bytes(paths)
         evicted: List[str] = []
         for path in reversed(paths):              # oldest first
             if current <= self.limit_bytes:
                 break
-            if checkpoint_step(path) == newest:
+            reason = self._never_delete_reason(path)
+            if reason is not None:
                 self._warn(
-                    f"not evicting {os.path.basename(path)}: it is the newest "
-                    "checkpoint in either store")
+                    f"not evicting {os.path.basename(path)}: {reason} — leaving "
+                    "the local store over its limit instead")
                 continue
-            alternative = self._valid_alternative(path)
-            if alternative is None:
-                self._warn(
-                    f"not evicting {os.path.basename(path)}: it is the only valid "
-                    "recovery checkpoint (no other copy loads and validates) — "
-                    "leaving the local store over its limit instead")
-                continue
+            alternative = self._valid_alternative(path)   # cached: one validation
             size = os.path.getsize(path) if os.path.exists(path) else 0
             try:
                 os.remove(path)
@@ -405,8 +489,136 @@ class CheckpointTiering:
             evicted.append(path)
             logger.info("evicted local checkpoint %s (%s); resume still possible "
                         "from %s", os.path.basename(path), _human_bytes(size),
-                        os.path.basename(alternative))
+                        os.path.basename(str(alternative)))
         return evicted
+
+    # -- Drive quota fallback ----------------------------------------------
+    def _has_verified_local_copy(self, drive_path: str) -> bool:
+        """Does ``drive_path`` already have a local copy that loads+validates?"""
+        local = os.path.join(self.local_dir, os.path.basename(drive_path))
+        if not os.path.isfile(local):
+            return False
+        return self.is_valid(local)
+
+    def _drive_deletion_candidates(self) -> List[str]:
+        """Older Drive checkpoints in the order the fallback may delete them.
+
+        Oldest first within each group, and group 1 before group 2:
+
+        1. ones that already have a verified local copy (deleting the Drive
+           copy loses nothing — the safest space to reclaim),
+        2. Drive-only ones (nothing else holds them; deleted only if group 1
+           cannot free enough).
+        """
+        oldest_first = list(reversed(self.drive_checkpoints()))
+        safe = [path for path in oldest_first
+                if self._has_verified_local_copy(path)]
+        drive_only = [path for path in oldest_first if path not in safe]
+        return safe + drive_only
+
+    def _estimate_save_bytes(self, path: Optional[str]) -> int:
+        """How much Drive space the retried save needs, best effort.
+
+        The partial file the failed write left behind is the best evidence; with
+        no partial file, one existing checkpoint's size stands in for it.
+        """
+        if path and os.path.exists(path):
+            try:
+                return os.path.getsize(path)
+            except OSError:
+                pass
+        sizes = []
+        for candidate in self.drive_checkpoints():
+            try:
+                sizes.append(os.path.getsize(candidate))
+            except OSError:
+                continue
+        return max(sizes) if sizes else 0
+
+    def free_drive_space_for_save(self, path: Optional[str] = None) -> QuotaCleanup:
+        """Delete older Drive checkpoints, safest first, until the save fits.
+
+        Deletion order is :meth:`_drive_deletion_candidates` (verified-local
+        copies before Drive-only, oldest first) and every candidate passes
+        :meth:`_never_delete_reason` first, so the newest checkpoint and the only
+        valid recovery checkpoint survive exactly as they do in eviction. Never
+        raises: a file that cannot be removed is warned about and skipped.
+        """
+        cleanup = QuotaCleanup(needed_bytes=self._estimate_save_bytes(path))
+        target = os.path.abspath(path) if path else None
+        for candidate in self._drive_deletion_candidates():
+            if cleanup.freed_bytes >= cleanup.needed_bytes and cleanup.freed_bytes:
+                break
+            if target is not None and os.path.abspath(candidate) == target:
+                continue          # the file the retry will overwrite
+            reason = self._never_delete_reason(candidate)
+            if reason is not None:
+                self._warn(
+                    f"not deleting {os.path.basename(candidate)} to free Drive "
+                    f"space: {reason}")
+                continue
+            try:
+                size = os.path.getsize(candidate)
+            except OSError:
+                size = 0
+            try:
+                os.remove(candidate)
+            except OSError as exc:
+                self._warn(f"could not delete {candidate} to free Drive space: "
+                           f"{exc}")
+                continue
+            self._valid_cache.pop(candidate, None)
+            cleanup.freed_bytes += size
+            cleanup.deleted.append(candidate)
+            logger.info("deleted Drive checkpoint %s (%s) to free quota; resume "
+                        "still possible from another copy", os.path.basename(candidate),
+                        _human_bytes(size))
+        return cleanup
+
+    def save_with_drive_fallback(self, path: str, save: Save) -> Any:
+        """Run ``save()``; on a Drive-quota failure, free space and retry once.
+
+        Args:
+            path: the checkpoint path the save writes (``OUT_DIR/step-N.pt``).
+                Only used to protect it from deletion and to size the cleanup.
+            save: a zero-argument callable that performs the write and raises on
+                failure (the notebook wraps its ``save_checkpoint(...)`` call).
+
+        Returns whatever ``save()`` returns. Only a *quota-shaped* error triggers
+        any deletion (:func:`is_quota_error`); every other error re-raises
+        untouched with nothing deleted. After cleanup the save is retried
+        **exactly once**; if that also fails the original error is re-raised so
+        training never believes a checkpoint exists when it does not.
+        """
+        try:
+            return save()
+        except Exception as exc:  # noqa: BLE001 — re-raised unless it is quota
+            if not is_quota_error(exc):
+                raise
+            original = exc
+        self._warn(
+            f"checkpoint save to {path} failed with a Drive-quota error "
+            f"({type(original).__name__}: {original}) — freeing older Drive "
+            "checkpoints and retrying once")
+        cleanup = self.free_drive_space_for_save(path)
+        self.last_fallback = cleanup
+        cleanup.retried = True
+        try:
+            result = save()
+        except Exception as retry_exc:  # noqa: BLE001 — reported, then re-raised
+            cleanup.error = f"{type(retry_exc).__name__}: {retry_exc}"
+            self._warn(
+                "CHECKPOINT SAVE FAILED AFTER CLEANUP: the retry still raised "
+                f"{cleanup.error} after deleting {len(cleanup.deleted)} older "
+                f"Drive checkpoint(s) ({_human_bytes(cleanup.freed_bytes)}). "
+                f"{os.path.basename(path)} WAS NOT WRITTEN — this step is not "
+                "saved. Re-raising the original error.")
+            raise original from retry_exc
+        self._warn(
+            f"checkpoint save to {path} succeeded after freeing "
+            f"{_human_bytes(cleanup.freed_bytes)} on Drive "
+            f"({len(cleanup.deleted)} older checkpoint(s) deleted)")
+        return result
 
     # -- the pass the notebook calls ---------------------------------------
     def after_save(self) -> RetentionReport:
@@ -502,9 +714,13 @@ __all__ = [
     "CopyVerificationError",
     "LOCAL_CHECKPOINT_DIR",
     "LOCAL_CHECKPOINT_LIMIT_BYTES",
+    "QUOTA_ERRNOS",
+    "QUOTA_MESSAGE_SIGNALS",
+    "QuotaCleanup",
     "RetentionReport",
     "checkpoint_step",
     "default_loader",
+    "is_quota_error",
     "list_checkpoints",
     "make_validator",
     "sha256_file",
