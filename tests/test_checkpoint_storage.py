@@ -19,6 +19,7 @@ files and prove the *policy*, not torch's deserializer.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import sys
@@ -327,6 +328,141 @@ def test_resume_reports_every_failure_when_nothing_valid_exists(tmp_path):
     message = str(excinfo.value)
     assert "either store" in message
     assert "step-3" in message and "step-2" in message
+
+
+# ---------------------------------------------------------------------------
+# Drive-quota save fallback: free older Drive space, retry exactly once
+# ---------------------------------------------------------------------------
+def quota_error(message: str = "disk quota exceeded") -> OSError:
+    """The error a full Drive produces on a write (``ENOSPC`` + quota text)."""
+    return OSError(errno.ENOSPC, message)
+
+
+def failing_save(drive: Path, step: int, *, failures: int = 1,
+                 error: BaseException | None = None, filler: int = 1024):
+    """A save callable: raise ``error`` ``failures`` times, then write the step.
+
+    Returns ``(save, calls)``; ``calls`` records every attempt so a test can
+    prove the fallback retried exactly once and never looped.
+    """
+    calls: list = []
+
+    def save():
+        calls.append(1)
+        if len(calls) <= failures:
+            raise error if error is not None else quota_error()
+        return write_checkpoint(drive, step, filler=filler).name
+
+    return save, calls
+
+
+def test_a_quota_failure_deletes_oldest_drive_checkpoints_and_the_retry_succeeds(
+        tmp_path):
+    """Verified-local copies go first, then Drive-only ones; newest survives."""
+    drive, local = tmp_path / "drive", tmp_path / "local"
+    for step in (1, 2, 3, 4, 5):
+        write_checkpoint(drive, step)                 # equal sizes
+    write_checkpoint(local, 1)                        # verified local copies
+    write_checkpoint(local, 2)
+    size = os.path.getsize(drive / "step-1.pt")
+    # The failed write left a partial step-6 behind: it is what the retry needs,
+    # so three older checkpoints have to go before it fits.
+    (drive / "step-6.pt").write_bytes(b"x" * (size * 3 - 100))
+    tier = tiering(drive, local)
+    save, calls = failing_save(drive, 6)
+
+    result = tier.save_with_drive_fallback(str(drive / "step-6.pt"), save)
+
+    assert result == "step-6.pt" and len(calls) == 2, "exactly one retry"
+    cleanup = tier.last_fallback
+    assert cleanup is not None and cleanup.retried and cleanup.succeeded
+    assert [storage.checkpoint_step(p) for p in cleanup.deleted] == [1, 2, 3], (
+        "oldest first, and the two with verified local copies before the "
+        "Drive-only step-3")
+    remaining = [storage.checkpoint_step(p) for p in tier.drive_checkpoints()]
+    assert remaining == [6, 5, 4], "the newest checkpoints are untouched"
+    assert (drive / "step-5.pt").exists()
+    # Nothing was lost: the deleted Drive copies still exist locally.
+    assert [storage.checkpoint_step(p) for p in tier.local_checkpoints()] == [2, 1]
+    assert any("Drive-quota error" in message for message in warnings)
+
+
+def test_a_quota_failure_that_persists_warns_loudly_and_reraises_the_original(
+        tmp_path):
+    """A save that still fails must never look like a saved checkpoint."""
+    drive, local = tmp_path / "drive", tmp_path / "local"
+    for step in (1, 2, 3):
+        write_checkpoint(drive, step)
+    write_checkpoint(local, 1)
+    tier = tiering(drive, local)
+    original = quota_error("storageQuotaExceeded")
+    save, calls = failing_save(drive, 4, failures=99, error=original)
+
+    with pytest.raises(OSError) as excinfo:
+        tier.save_with_drive_fallback(str(drive / "step-4.pt"), save)
+
+    assert excinfo.value is original, "the ORIGINAL error must be re-raised"
+    assert len(calls) == 2, "one retry, never a loop"
+    cleanup = tier.last_fallback
+    assert cleanup is not None and cleanup.retried and not cleanup.succeeded
+    # Only as much as the policy allows: enough for one checkpoint, no more.
+    assert [storage.checkpoint_step(p) for p in cleanup.deleted] == [1]
+    assert [storage.checkpoint_step(p) for p in tier.drive_checkpoints()] == [3, 2]
+    assert any("CHECKPOINT SAVE FAILED AFTER CLEANUP" in message
+               for message in warnings)
+    assert any("WAS NOT WRITTEN" in message for message in warnings)
+
+
+def test_a_non_quota_error_deletes_nothing_and_propagates_untouched(tmp_path):
+    drive, local = tmp_path / "drive", tmp_path / "local"
+    for step in (1, 2, 3):
+        write_checkpoint(drive, step)
+    write_checkpoint(local, 1)
+    tier = tiering(drive, local)
+    original = RuntimeError("CUDA error: an illegal memory access was encountered")
+    save, calls = failing_save(drive, 4, failures=99, error=original)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        tier.save_with_drive_fallback(str(drive / "step-4.pt"), save)
+
+    assert excinfo.value is original
+    assert len(calls) == 1, "a non-quota error is never retried"
+    assert tier.last_fallback is None
+    assert [storage.checkpoint_step(p) for p in tier.drive_checkpoints()] == [3, 2, 1]
+    assert not any("Drive-quota" in message for message in warnings)
+
+
+def test_both_never_delete_guards_hold_in_the_fallback_path(tmp_path):
+    """The newest checkpoint and the only valid recovery copy are never freed."""
+    # (a) the globally newest Drive checkpoint, even over what the save needs.
+    drive, local = tmp_path / "drive", tmp_path / "local"
+    write_checkpoint(drive, 1, filler=100)
+    write_checkpoint(drive, 2, filler=5000)           # the newest, and the biggest
+    tier = tiering(drive, local)
+    save, _ = failing_save(drive, 3, failures=99)
+
+    with pytest.raises(OSError):
+        tier.save_with_drive_fallback(str(drive / "step-3.pt"), save)
+
+    assert [storage.checkpoint_step(p) for p in tier.last_fallback.deleted] == [1]
+    assert (drive / "step-2.pt").exists(), "the newest checkpoint must survive"
+    assert any("newest checkpoint" in message for message in warnings)
+
+    # (b) the only valid recovery checkpoint: the newest Drive copy is corrupt,
+    # so the older valid one is all a resume has left.
+    drive2, local2 = tmp_path / "drive2", tmp_path / "local2"
+    write_checkpoint(drive2, 1)
+    write_corrupt_checkpoint(drive2, 2)               # newest, unreadable
+    tier2 = tiering(drive2, local2)
+    save2, _ = failing_save(drive2, 3, failures=99)
+
+    with pytest.raises(OSError):
+        tier2.save_with_drive_fallback(str(drive2 / "step-3.pt"), save2)
+
+    assert tier2.last_fallback.deleted == []
+    assert (drive2 / "step-1.pt").exists()
+    assert (drive2 / "step-2.pt").exists()
+    assert any("only valid recovery checkpoint" in message for message in warnings)
 
 
 # ---------------------------------------------------------------------------
