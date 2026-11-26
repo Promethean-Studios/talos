@@ -241,17 +241,18 @@ notebook intro, the live display table and the tracker's `model_name` say Argo.
 Code identifiers (`talos_1b`, `talos_1b_49k`, `step-<N>.pt`) are unchanged, and
 the tracker schema keeps every key — only the `model_name` value changes.
 
-**Stage A budget — what the old rule actually produced.** With
-`tokens/sec = peak_TFLOPS × 1e12 × MFU / (8 × 1,036,060,672)`:
+**Stage A budget — short-session defaults fell far short; the corrected targets.**
+With `tokens/sec = peak_TFLOPS × 1e12 × MFU / (8 × 1,036,060,672)`:
 
-| GPU (MFU) | est. tokens/sec | old default 10 h | tokens/param | corrected 4B target | 2B floor |
-|---|---|---|---|---|---|
-| T4 16 GB (0.22) | 1,725 | 62.1M | 0.06 | 644 h (54 × 12 h sessions) | 322 h |
-| L4 24 GB (0.30) | 4,379 | 157.6M | 0.15 | 254 h (21 sessions) | 127 h |
-| A100 40 GB (0.30) | 11,293 | 406.6M | 0.39 | 98 h (8 sessions) | 49 h |
+| GPU (MFU) | est. tokens/sec | corrected 4B target | 2B floor |
+|---|---|---|---|
+| T4 16 GB (0.22) | 1,725 | 644 h (54 × 12 h sessions) | 322 h |
+| L4 24 GB (0.30) | 4,379 | 254 h (21 sessions) | 127 h |
+| A100 40 GB (0.30) | 11,293 | 98 h (8 sessions) | 49 h |
 
-That is the owner's "severely insufficient": all three land far below **1**
-token/parameter. The budget rule is now, in order: `STAGE_A_TOKENS_OVERRIDE` >
+The short-session defaults the old rule produced (tens to hundreds of millions
+of tokens — fractions of a token per parameter) are retired: all three landed
+far below **1** token/parameter. The budget rule is now, in order: `STAGE_A_TOKENS_OVERRIDE` >
 `STAGE_A_HOURS` (time-box) > `STAGE_A_TOKENS_DEFAULT = 4B`. Anything below
 `STAGE_A_TOKENS_FLOOR = 2B` prints a loud WARNING before training. Chinchilla
 (~20.7B, ≈20 tokens/param) stays the reference point and is **not** imposed:
