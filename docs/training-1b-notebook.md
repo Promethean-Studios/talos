@@ -29,7 +29,7 @@ chat, and the second thing is not a substitute for the first.
 | model init | random | the final Stage-A checkpoint |
 | data | `allenai/c4`, config `en`, splits `train` / `validation` | `HuggingFaceH4/ultrachat_200k`, splits `train_sft` / `test_sft` |
 | objective | next-token prediction, every token supervised | next-token prediction on **assistant turns only** (user/system turns masked out of the loss) |
-| budget | derived from the compute you have (`STAGE_A_HOURS × tokens/sec`) | measured tokens/epoch × `STAGE_B_EPOCHS` (1–3) |
+| budget | **4B tokens** default (`STAGE_A_TOKENS_DEFAULT`), **2B floor** with a loud warning; `STAGE_A_HOURS` only as a deliberate time-box | measured tokens/epoch × `STAGE_B_EPOCHS` (1–3) |
 | LR | 3e-4 peak, cosine to 10 % | 5e-5 peak, cosine to 10 % |
 | checkpoints | `<out>/stage-a/step-<N>.pt` | `<out>/stage-b/step-<N>.pt` |
 
@@ -67,15 +67,21 @@ Measured with the `talos_1b_49k` tokenizer over 200 `train_sft` documents:
 Our own FineWeb-Edu packed corpus (`/home/team/shared/corpus-1b-49k`) is **not**
 touched or read by this notebook.
 
-## 3. Token budget: justified by compute, not imposed
+## 3. Token budget: the 4B default and the 2B floor
 
-There is no 20B default. Stage A's budget is
+Stage A's budget no longer comes from a wall-clock guess. The rule, in order:
 
-```
-budget = STAGE_A_HOURS × 3600 × estimated tokens/sec(GPU)
-```
+1. `STAGE_A_TOKENS_OVERRIDE > 0` — an explicit token budget;
+2. `STAGE_A_HOURS > 0` — a deliberate time-box (`hours × 3600 × est. tokens/sec`);
+3. otherwise `STAGE_A_TOKENS_DEFAULT = 4,000,000,000` — **4B tokens**
+   (≈3.9 tokens/parameter, ≈19 % of Chinchilla-optimal).
 
-and the notebook prints it, with the estimate it used, before training starts.
+Anything below `STAGE_A_TOKENS_FLOOR = 2,000,000,000` (**2B tokens**, ≈1.9
+tokens/parameter) prints a loud WARNING before training: at that budget a
+from-scratch 1B model learns token statistics and word shapes, not language. The
+notebook prints the budget it derived, and the estimate behind it, before
+training starts.
+
 The throughput estimate is FLOPs arithmetic, not a measurement:
 `tokens/sec ≈ peak_TFLOPS × 1e12 × MFU / (8 × 1,036,060,672)`, where the `8N`
 (not `6N`) accounts for the extra forward pass that gradient checkpointing
@@ -83,26 +89,27 @@ performs, and MFU is assumed 0.30 for Ada/Hopper-class parts and 0.22 for
 T4/V100. **The ±40 % spread is real: this team has no GPU and has measured
 none of these numbers.**
 
-| Colab GPU | VRAM | precision | micro × accum | tokens/step | est. tokens/sec | tokens in 10 h | steps | tokens/param |
-|---|---|---|---|---|---|---|---|---|
-| A100 SXM4-40GB | 40 GB | bf16 | 8 × 8 | 131,072 | ~11,300 | ~407M | 3,102 | 0.39 |
-| L4 | 24 GB | bf16 | 4 × 16 | 131,072 | ~4,380 | ~158M | 1,203 | 0.15 |
-| T4 | 16 GB | fp16 + scaler | 2 × 32 | 131,072 | ~1,730 | ~62M | 474 | 0.06 |
+| Colab GPU | VRAM | precision | micro × accum | tokens/step | est. tokens/sec | 4B target (wall clock) | 2B floor (wall clock) |
+|---|---|---|---|---|---|---|---|
+| A100 SXM4-40GB | 40 GB | bf16 | 8 × 8 | 131,072 | ~11,300 | ~98 h (8 × 12 h sessions) | ~49 h |
+| L4 | 24 GB | bf16 | 4 × 16 | 131,072 | ~4,380 | ~254 h (21 sessions) | ~127 h |
+| T4 | 16 GB | fp16 + scaler | 2 × 32 | 131,072 | ~1,730 | ~644 h (54 sessions) | ~322 h |
 
-Every GPU gets the **same 131,072 tokens per optimizer step**, so the schedule
+Every GPU gets the same 131,072 tokens per optimizer step, so the schedule
 (steps, warmup, LR curve) is identical across hardware and only wall-clock
-differs. Stage B at 2 epochs costs ~510M tokens, i.e. ~12.5 h on an A100, ~32 h
-on an L4, ~82 h on a T4 — Stage B is the cheaper stage per token seen but is
-usually run for far fewer tokens than Stage A.
+differs; 4B tokens is 30,518 optimizer steps. Stage B at 2 epochs costs ~510M
+tokens, i.e. ~12.5 h on an A100, ~32 h on an L4, ~82 h on a T4 — Stage B is the
+cheaper stage per token seen but is usually run for far fewer tokens than
+Stage A.
 
-**What that buys, honestly.** Chinchilla-scale is ~20 tokens/parameter; these
-budgets are 0.06–0.4. At that ratio the model is an early-training artifact: it
-produces locally plausible word sequences, mimics the `User:/Assistant:` format,
-and fails at facts, arithmetic and long-range coherence. Stage B adds the chat
-*behaviour* on top of that weak base — it does not add knowledge. To get a base
-model that can actually hold a conversation you need orders of magnitude more
-compute than a Colab session; the notebook is built so that a bigger budget is a
-one-line change (`STAGE_A_HOURS`, or `STAGE_A_TOKENS_OVERRIDE`) once you have it.
+**What that buys, honestly.** Chinchilla-scale is ~20 tokens/parameter
+(~20.7B tokens for this model) and is **not** imposed: ~1,833 A100-hours is not
+a Colab run. 4B tokens (≈3.9 tokens/parameter) sits at the low end of useful;
+from `budget_capability()`: <1 token/parameter is babble, 2-8 is grammatical and
+locally coherent English with unreliable facts, 8-15 is readable paragraphs,
+>=15 is a genuine small base model. Stage B adds the chat *behaviour* on top of
+that base — it does not add knowledge. A bigger budget is a one-line change
+(`STAGE_A_TOKENS_OVERRIDE`, or `STAGE_A_HOURS`) once you have the compute.
 
 ## 4. Dataset pipeline
 
@@ -156,8 +163,16 @@ ids/mask), the optimisation settings, the hardware plan and the last grad norm.
 
 On resume the notebook validates, in order: format, preset + parameter count +
 tensor shapes (repo contract), stage, dataset identity, tokenizer fingerprint,
-presence of optimizer and RNG state, and that the recorded token count fits the
-budget. A corrupt newest checkpoint is skipped with the reason printed and the
+presence of optimizer and RNG state, that the recorded token count fits the
+budget, and then — before any weight is touched — the full
+`training_config` snapshot field by field. A changed seed, shuffle buffer,
+optimizer identity, precision, effective batch, LR schedule or a **shrunk**
+budget rejects outright (every mismatched field is listed with both values); a
+changed repo pin, a torch major/minor change or a **larger** budget rejects
+unless the operator names that exact field in
+`RESUME_ACKNOWLEDGE=repo_pin,token_budget` (or `RESUME_ACKNOWLEDGE_BUDGET=1`).
+A torch patch-version change only warns. A checkpoint written before the
+snapshot existed warns loudly and resumes under the checks above. A corrupt newest checkpoint is skipped with the reason printed and the
 next-newest valid one is used.
 
 ## 7. Tracker and metrics
@@ -200,9 +215,15 @@ of a working chatbot. Nothing in the notebook claims otherwise.
 - **OOM:** `oom_guidance()` prints the ordered fix list; halving `MICRO_BATCH`
   and doubling `GRAD_ACCUM` keeps tokens/step (and therefore the schedule) the
   same.
-- **Storage:** Google Drive when it mounts (`MyDrive/Talos/Talos_1B`), otherwise
-  a local directory with a loud warning that Colab's local disk is deleted when
-  the runtime ends. Each checkpoint is ~4.2 GB (bf16 weights + optimizer state).
+- **Storage:** Google Drive when it mounts, under
+  `/content/drive/MyDrive/Talos/Argo_1B/stage-a` (or `stage-b`) — that is
+  `OUT_DIR` as the code resolves it (`USE_DRIVE = True`); otherwise a local
+  directory (`TALOS_1B_OUT`, default `<workdir>/argo_1b_runs`) with a loud
+  warning that Colab's local disk is deleted when the runtime ends.
+- **Checkpoint size:** ~6.4 GiB each with 8-bit AdamW — fp32 master
+  weights 3.86 GiB + ~2.07 GB of 8-bit optimizer state; ~12.6 GiB with plain
+  fp32 AdamW (8.29 GB of state). **Computed** from the 1,036,060,672
+  parameters and the state-dict layout, **not yet measured** by a real run.
 - **Tested:** the whole pipeline on CPU — budget/schedule arithmetic, the
   overshoot guard, packing/masking, mid-epoch resume alignment, checkpoint stage
   validation, tracker/metrics payloads and failure isolation, the loss and

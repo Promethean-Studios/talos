@@ -132,6 +132,34 @@ clone.
 
 Reference: [`docs/trainer.md`](docs/trainer.md).
 
+## Argo training run on Colab (the notebook)
+
+The 1B run is [`notebooks/talos_colab_train.ipynb`](notebooks/talos_colab_train.ipynb);
+the full workflow is in
+[`docs/training-1b-notebook.md`](docs/training-1b-notebook.md). The numbers that
+matter before you start it:
+
+- **Budget:** Stage A defaults to **4B tokens** (`STAGE_A_TOKENS_DEFAULT`, ≈3.9
+  tokens/parameter) with a **2B floor** — anything below `STAGE_A_TOKENS_FLOOR`
+  prints a loud warning. `STAGE_A_HOURS` is a deliberate time-box, not the
+  default. 4B tokens is 30,518 optimizer steps at the fixed 131,072 tokens/step.
+- **Precision:** parameters stay **fp32 (master weights)** with bf16 (L4/A100) or
+  fp16 + GradScaler (T4) autocast — never bf16/fp16 *parameters*, which rounds
+  away sub-resolution updates and which bitsandbytes' `AdamW8bit` refuses. 8-bit
+  AdamW is **required** on the L4 tier: a bitsandbytes failure stops the run with
+  instructions instead of silently falling back to plain AdamW.
+- **Checkpoint size:** ~6.4 GiB each with 8-bit AdamW (3.86 GiB of fp32 weights +
+  ~2.07 GB of optimizer state), ~12.6 GiB with plain fp32 AdamW — computed from
+  the 1,036,060,672-parameter count, not measured on a GPU yet.
+- **Where they go:** `/content/drive/MyDrive/Talos/Argo_1B/stage-a` (or
+  `stage-b`) when Drive mounts; otherwise a local directory with a loud warning
+  that Colab deletes it when the runtime ends.
+- **Resume:** every checkpoint records the full training config (seed, shuffle
+  buffer, optimizer identity, precision, effective batch, LR schedule, budget,
+  repo pin, dependency versions) and all three skip counters. A resume that
+  disagrees is refused, listing every mismatched field, unless the change is
+  explicitly acknowledged (`RESUME_ACKNOWLEDGE=repo_pin,token_budget`).
+
 ## Checkpoint storage (Colab runs)
 
 Argo writes checkpoints to `OUT_DIR` on the mounted Google Drive: it is the only
