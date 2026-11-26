@@ -18,9 +18,11 @@ So every checkpoint now carries a ``training_config`` snapshot
   the fp32-master-weights flag), effective batch, LR schedule, a **shrunk**
   budget, and any change in bitsandbytes availability (an 8-bit optimizer state
   is not loadable by plain AdamW);
-* **acknowledgeable rejects** — the repo pin, a torch major/minor change, and a
-  **larger** budget. They reject by default and are accepted only when named in
-  ``RESUME_ACKNOWLEDGE`` (``RESUME_ACKNOWLEDGE=repo_pin,token_budget``);
+* **acknowledgeable rejects** — the repo pin, a torch major/minor change, a
+  **larger** budget, and a deliberate grad-clip or weight-decay change. They
+  reject by default and are accepted only when named in
+  ``RESUME_ACKNOWLEDGE`` (``RESUME_ACKNOWLEDGE=repo_pin,token_budget``, or
+  ``RESUME_ACKNOWLEDGE=grad_clip`` for a corrected clip value);
 * **warnings only** — a torch patch-version change and changes in the other
   dependency versions.
 
@@ -63,7 +65,8 @@ HARD_REJECT_FIELDS = (
 )
 
 #: Fields that reject by default but can be acknowledged by name.
-ACKNOWLEDGEABLE_FIELDS = ("repo_pin", "torch_version", "token_budget")
+ACKNOWLEDGEABLE_FIELDS = ("repo_pin", "torch_version", "token_budget",
+                          "grad_clip", "weight_decay")
 
 _TRUTHY = {"1", "true", "yes", "on"}
 
@@ -367,11 +370,16 @@ def validate_training_config(
                 f"WARNING: {name} version changed: {saved_versions.get(name)} -> "
                 f"{current_versions.get(name)} (recorded, not fatal)")
 
-    # ---- warnings-only settings -----------------------------------------
+    # ---- grad clip / weight decay ---------------------------------------
+    # Both change the update the optimizer actually applies, so a resume
+    # across either is a different run; the change is deliberate often enough
+    # (a corrected clip value) that it is acknowledgeable by name.
     for field in ("grad_clip", "weight_decay"):
         if saved.get(field) != current.get(field):
-            warnings.append(f"WARNING: {field} changed: {saved.get(field)} -> "
-                            f"{current.get(field)} (recorded, not fatal)")
+            reject(field, f"saved {_fmt(saved.get(field))} vs current "
+                          f"{_fmt(current.get(field))} — the optimizer applies a "
+                          "different update than the checkpoint was trained with",
+                   acknowledgeable=True)
 
     if rejections:
         raise ResumeConfigError(
@@ -381,7 +389,8 @@ def validate_training_config(
             "another). Mismatched fields:\n"
             + "\n".join(rejections)
             + "\nStart a fresh run, or — for the deliberate cases only (a code "
-              f"pin bump, a torch upgrade, a larger budget) — re-run with "
+              f"pin bump, a torch upgrade, a larger budget, a corrected "
+              f"grad-clip or weight-decay value) — re-run with "
               f"{ACKNOWLEDGE_ENV}=<field>[,<field>] naming exactly the fields you "
               f"mean (or {ACKNOWLEDGE_BUDGET_ENV}=1 for the budget)."
         )

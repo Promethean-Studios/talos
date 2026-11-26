@@ -11,7 +11,8 @@ These tests pin the contract:
 * the snapshot round-trips through the checkpoint and through JSON;
 * every rejected field is named in the error, with both values;
 * ``RESUME_ACKNOWLEDGE`` acknowledges **exactly** the named fields (repo pin, a
-  torch major/minor change, a larger budget) and nothing else;
+  torch major/minor change, a larger budget, a deliberate grad-clip or
+  weight-decay change) and nothing else;
 * a budget extension needs the acknowledgement, a shrunk budget never passes;
 * a torch patch-version change only warns, and a bitsandbytes availability
   change always rejects;
@@ -167,6 +168,40 @@ def test_acknowledging_another_field_does_not_unlock_the_repo_pin():
     with pytest.raises(ResumeConfigError, match="repo_pin"):
         validate_training_config(_config(repo_pin="aaa"), _config(repo_pin="bbb"),
                                  acknowledge={"seed", "token_budget"})
+
+
+# ---------------------------------------------------------------------------
+# Grad clip / weight decay: reject by default, acknowledgeable by name
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("field,override", [
+    ("grad_clip", {"grad_clip": 0.5}),
+    ("weight_decay", {"weight_decay": 0.01}),
+])
+def test_a_grad_clip_or_weight_decay_change_rejects_by_default(field, override):
+    with pytest.raises(ResumeConfigError) as excinfo:
+        validate_training_config(_config(), _config(**override))
+    message = str(excinfo.value)
+    assert field in message
+    assert "saved" in message and "current" in message
+
+
+@pytest.mark.parametrize("field,override", [
+    ("grad_clip", {"grad_clip": 0.5}),
+    ("weight_decay", {"weight_decay": 0.01}),
+])
+def test_a_grad_clip_or_weight_decay_change_is_accepted_when_acknowledged(field, override):
+    warnings = validate_training_config(_config(), _config(**override),
+                                        acknowledge={field})
+    assert any(f"ACKNOWLEDGED {field}" in line for line in warnings)
+
+
+def test_acknowledging_grad_clip_does_not_unlock_an_unnamed_second_mismatch():
+    current = _config(grad_clip=0.5, weight_decay=0.01)
+    with pytest.raises(ResumeConfigError) as excinfo:
+        validate_training_config(_config(), current, acknowledge={"grad_clip"})
+    message = str(excinfo.value)
+    assert "weight_decay" in message
+    assert "ACKNOWLEDGED" not in message
 
 
 # ---------------------------------------------------------------------------

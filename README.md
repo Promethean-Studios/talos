@@ -155,10 +155,12 @@ matter before you start it:
   `stage-b`) when Drive mounts; otherwise a local directory with a loud warning
   that Colab deletes it when the runtime ends.
 - **Resume:** every checkpoint records the full training config (seed, shuffle
-  buffer, optimizer identity, precision, effective batch, LR schedule, budget,
-  repo pin, dependency versions) and all three skip counters. A resume that
-  disagrees is refused, listing every mismatched field, unless the change is
-  explicitly acknowledged (`RESUME_ACKNOWLEDGE=repo_pin,token_budget`).
+  buffer, optimizer identity, precision, effective batch, LR schedule,
+  grad-clip, weight decay, budget, repo pin, dependency versions) and all three
+  skip counters. A resume that disagrees is refused, listing every mismatched
+  field, unless the change is explicitly acknowledged
+  (`RESUME_ACKNOWLEDGE=repo_pin,token_budget`, or `RESUME_ACKNOWLEDGE=grad_clip`
+  for a deliberate clip-value change — likewise `weight_decay`).
 
 ## Checkpoint storage (Colab runs)
 

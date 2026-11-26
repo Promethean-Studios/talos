@@ -168,9 +168,11 @@ budget, and then — before any weight is touched — the full
 `training_config` snapshot field by field. A changed seed, shuffle buffer,
 optimizer identity, precision, effective batch, LR schedule or a **shrunk**
 budget rejects outright (every mismatched field is listed with both values); a
-changed repo pin, a torch major/minor change or a **larger** budget rejects
-unless the operator names that exact field in
-`RESUME_ACKNOWLEDGE=repo_pin,token_budget` (or `RESUME_ACKNOWLEDGE_BUDGET=1`).
+changed repo pin, a torch major/minor change, a **larger** budget or a
+deliberate grad-clip / weight-decay change rejects unless the operator names
+that exact field in `RESUME_ACKNOWLEDGE=repo_pin,token_budget` — or
+`RESUME_ACKNOWLEDGE=grad_clip` (likewise `weight_decay`) — or
+`RESUME_ACKNOWLEDGE_BUDGET=1` for the budget.
 A torch patch-version change only warns. A checkpoint written before the
 snapshot existed warns loudly and resumes under the checks above. A corrupt newest checkpoint is skipped with the reason printed and the
 next-newest valid one is used.
