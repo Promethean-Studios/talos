@@ -186,6 +186,21 @@ def test_oom_guidance_names_the_levers_in_order():
     text = hw.oom_guidance(plan)
     assert "MICRO_BATCH = 2" in text and "GRAD_ACCUM = 32" in text
     assert "8BIT" in text and "checkpoint" in text.lower()
+    # 8-bit is required on this tier, so the OOM list must not tell the reader
+    # to "set USE_8BIT_ADAM = True" as if it were an optional lever.
+    assert "USE_8BIT_ADAM stays True" in text
+
+
+def test_the_l4_plan_forces_8bit_adam():
+    """8-bit is required on the L4 tier, not left to the reader (fix 1)."""
+    plan = hw.plan_for_gpu(hw.detect_gpu(_torch("NVIDIA L4", 24.0, (8, 9))), seq_len=SEQ)
+    assert plan.use_8bit_adam is True
+    assert plan.as_dict()["use_8bit_adam"] is True
+    assert any("required" in note and "bitsandbytes" in note for note in plan.notes)
+    # The report the notebook prints states it too.
+    report = hw.format_hardware_report(
+        hw.detect_gpu(_torch("NVIDIA L4", 24.0, (8, 9))), plan)
+    assert "8-bit AdamW    : True" in report
 
 
 def test_install_guidance_forbids_reinstalling_torch():

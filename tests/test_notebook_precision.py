@@ -70,9 +70,10 @@ def test_only_fp16_gets_a_grad_scaler():
 # ---------------------------------------------------------------------------
 def test_parameters_stay_fp32_master_weights():
     model = torch.nn.Linear(4, 4)
-    optimizer, note = build_optimizer(model.parameters(), lr=1e-3, use_8bit_adam=False)
+    optimizer, identity = build_optimizer(model.parameters(), lr=1e-3,
+                                          use_8bit_adam=False)
     assert isinstance(optimizer, torch.optim.AdamW)
-    assert "8-bit disabled" in note
+    assert identity == "AdamW"
     assert all(p.dtype == torch.float32 for p in model.parameters())
     # One step must not change the parameter dtype either.
     model(torch.zeros(1, 4)).sum().backward()
@@ -80,7 +81,7 @@ def test_parameters_stay_fp32_master_weights():
     assert all(p.dtype == torch.float32 for p in model.parameters())
 
 
-def test_8bit_adam_falls_back_without_bitsandbytes():
+def test_8bit_adam_is_required_and_never_downgraded_without_bitsandbytes():
     try:
         import bitsandbytes  # noqa: F401
     except Exception:
@@ -88,12 +89,14 @@ def test_8bit_adam_falls_back_without_bitsandbytes():
     else:
         pytest.skip("bitsandbytes is installed on this box")
     model = torch.nn.Linear(4, 4)
-    optimizer, note = build_optimizer(model.parameters(), lr=1e-3, use_8bit_adam=True)
-    assert isinstance(optimizer, torch.optim.AdamW)
-    assert "bitsandbytes unavailable" in note
-    # The note is what goes into the checkpoint metadata, so it must name the
-    # optimizer that was actually built.
-    assert "plain AdamW" in note
+    # 8-bit was requested by the plan => it is required: no plain AdamW is
+    # built, and the error names the dependency and the fix.
+    with pytest.raises(RuntimeError) as excinfo:
+        build_optimizer(model.parameters(), lr=1e-3, use_8bit_adam=True)
+    message = str(excinfo.value)
+    assert "bitsandbytes" in message
+    assert "pip install bitsandbytes" in message
+    assert "NOT downgraded" in message
 
 
 def test_build_optimizer_rejects_an_empty_or_unusable_configuration():

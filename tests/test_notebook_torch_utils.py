@@ -104,11 +104,12 @@ def test_grad_scaler_only_for_fp16():
 # ---------------------------------------------------------------------------
 # Optimizer and clipping
 # ---------------------------------------------------------------------------
-def test_build_optimizer_falls_back_to_plain_adamw():
+def test_build_optimizer_builds_plain_adamw_when_the_plan_says_plain():
     model = torch.nn.Linear(3, 2)
-    optimizer, note = tu.build_optimizer(model.parameters(), lr=1e-3, use_8bit_adam=False)
+    optimizer, identity = tu.build_optimizer(model.parameters(), lr=1e-3,
+                                             use_8bit_adam=False)
     assert isinstance(optimizer, torch.optim.AdamW)
-    assert "plain AdamW" in note
+    assert identity == tu.OPTIMIZER_PLAIN == "AdamW"
     with pytest.raises(ValueError):
         tu.build_optimizer([], lr=1e-3)
 

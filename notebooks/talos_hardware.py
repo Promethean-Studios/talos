@@ -348,6 +348,21 @@ def plan_for_gpu(
         + ("" if bf16 else " (this GPU has no bf16 — GradScaler enabled)"),
         f"~{profile.mfu:.0%} MFU assumed; throughput is an estimate (±40%), not a measurement",
     ]
+    # 8-bit AdamW is REQUIRED on the small-VRAM tiers, not a suggestion: fp32
+    # AdamW needs ~8.3 GB of state for the 1B model on top of 4.14 GB of weights
+    # and 4.14 GB of gradients, which does not fit 16/24 GB cards. An L4 is
+    # always one of those tiers (24 GB nominal, ~15 GB free after the display
+    # driver), so the plan forces it there explicitly rather than leaving the
+    # reader to set USE_8BIT_ADAM by hand; `build_optimizer` then raises instead
+    # of silently falling back to plain AdamW.
+    forced_8bit = profile.match == "L4" or info.vram_gib < 48.0
+    use_8bit_adam = bool(forced_8bit)
+    if use_8bit_adam:
+        notes.append(
+            "8-bit AdamW (bitsandbytes) is required on this tier — it is not "
+            "optional and there is no plain-AdamW fallback: a bitsandbytes "
+            "failure stops the run with instructions instead"
+        )
     if info.vram_gib and info.vram_gib < 16:
         notes.append("under 16 GiB: expect to drop MICRO_BATCH by hand if the first step OOMs")
     return TrainPlan(
@@ -356,7 +371,7 @@ def plan_for_gpu(
         precision=precision,
         use_grad_scaler=precision == "fp16",
         gradient_checkpointing=True,
-        use_8bit_adam=info.vram_gib < 48.0,
+        use_8bit_adam=use_8bit_adam,
         seq_len=int(seq_len),
         tokens_per_step=tokens_per_step,
         est_tokens_per_sec=rate,
@@ -377,8 +392,10 @@ def oom_guidance(plan: Optional[TrainPlan] = None) -> str:
         "cell (tokens/step stays the same, so the schedule does not change);\n"
         "  2. keep GRADIENT_CHECKPOINTING = True (it is on by default and is what "
         "makes a 1B model fit at all);\n"
-        "  3. set USE_8BIT_ADAM = True (bitsandbytes), which cuts optimizer "
-        "memory from ~4.1 GB to ~2.1 GB;\n"
+        "  3. USE_8BIT_ADAM stays True (bitsandbytes): it is required on this "
+        "tier, not a knob — it is already what keeps optimizer state at ~2.1 GB "
+        "instead of ~8.3 GB, so do not disable it to save memory; if bitsandbytes "
+        "itself fails, fix that (the error names the fix) rather than downgrading;\n"
         "  4. lower SEQ_LEN only as a last resort — the 1B preset is trained at "
         "2,048 and a shorter context changes the objective;\n"
         "  5. if it still OOMs, the GPU is too small: switch to a larger Colab "

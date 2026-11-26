@@ -10,8 +10,10 @@ this module holds only the pieces that genuinely need tensors:
   full float32 copy (the 1B logits are ~0.8 GB bf16 and would be ~1.6 GB fp32);
 * :func:`autocast_kwargs` / :func:`make_grad_scaler` — bf16 needs no scaler,
   fp16 (T4/V100) does;
-* :func:`build_optimizer` — 8-bit AdamW when available, plain AdamW as the
-  functional fallback;
+* :func:`build_optimizer` — 8-bit AdamW when the hardware plan asks for it
+  (and it is then **required**: a failed bitsandbytes import raises instead of
+  silently downgrading to plain AdamW), plain AdamW only when the plan itself
+  says plain;
 * :func:`clip_and_norm` — returns the **pre-clip** norm, which is what the
   checkpoint's ``last_grad_norm`` records and what catches a diverging run;
 * :func:`rows_to_tensor` — packed rows (+ optional masks) → device tensors.
@@ -134,6 +136,32 @@ def make_grad_scaler(*, enabled: bool) -> Optional[Any]:
 # ---------------------------------------------------------------------------
 # Optimizer
 # ---------------------------------------------------------------------------
+#: Identity strings recorded in the run log and in the checkpoint's
+#: ``training_config.optimizer``. They are the resume path's optimizer contract:
+#: an 8-bit state dict cannot be loaded by a plain AdamW (different state
+#: tensors: uint8 + absmax versus two fp32 moments), and vice versa.
+OPTIMIZER_8BIT = "AdamW8bit (bitsandbytes)"
+OPTIMIZER_PLAIN = "AdamW"
+
+
+def _8bit_unavailable_message(detail: str) -> str:
+    """The actionable error raised when 8-bit AdamW was requested and failed."""
+    return (
+        "the hardware plan requested 8-bit AdamW (bitsandbytes), but "
+        f"bitsandbytes could not be used: {detail}.\n"
+        "This is NOT downgraded to plain AdamW: an fp32 AdamW needs ~8.3 GB of "
+        "optimizer state for the 1B model, which does not fit a 16/24 GB GPU, and "
+        "the run would then have to be thrown away. Fix the dependency instead:\n"
+        "  1. `pip install bitsandbytes` (the notebook's setup cell already does);\n"
+        "  2. check the CUDA build: bitsandbytes needs a CUDA torch "
+        "(`python -c \"import torch;print(torch.version.cuda)\"` must not be None); "
+        "in Colab, restore the factory runtime rather than pip-installing torch;\n"
+        "  3. if the runtime genuinely cannot run bitsandbytes, set "
+        "USE_8BIT_ADAM = False explicitly — that is a deliberate choice on a "
+        "larger GPU, not a silent fallback."
+    )
+
+
 def build_optimizer(
     parameters: Iterable[Any],
     *,
@@ -142,12 +170,22 @@ def build_optimizer(
     weight_decay: float = 0.1,
     use_8bit_adam: bool = True,
 ) -> Tuple[Any, str]:
-    """8-bit AdamW if bitsandbytes is usable, otherwise plain AdamW.
+    """Build the optimizer the plan asks for — and never a downgraded one.
 
-    Returns ``(optimizer, note)`` — the note goes into the run log and the
-    checkpoint metadata, so a run always records which optimizer it actually
-    used (an 8-bit optimizer state dict is not loadable by a plain AdamW and
-    vice versa; the resume path relies on the same class being rebuilt).
+    ``use_8bit_adam=True`` means 8-bit AdamW is **required**: a failed
+    bitsandbytes import or a failed ``AdamW8bit`` construction raises
+    :class:`RuntimeError` with the fix, and plain AdamW is never built in that
+    case (owner directive, 2026-11-25: no silent optimizer downgrade — it hides
+    a run that cannot fit the GPU and silently changes what the checkpoint's
+    optimizer state means).
+
+    ``use_8bit_adam=False`` means the plan itself says plain AdamW (a CPU smoke
+    run, a CI run, a >48 GiB GPU): that is not a fallback and is built as asked.
+
+    Returns ``(optimizer, identity)``; the identity string is exactly
+    :data:`OPTIMIZER_8BIT` or :data:`OPTIMIZER_PLAIN` and is what the run log
+    and the checkpoint's ``training_config.optimizer`` record (fix 2 compares it
+    on resume).
     """
     _require_torch()
     params = list(parameters)
@@ -155,19 +193,26 @@ def build_optimizer(
         raise ValueError("build_optimizer got no parameters")
     if lr <= 0:
         raise ValueError("lr must be positive")
-    if use_8bit_adam:
-        try:
-            import bitsandbytes as bnb
-
-            optimizer = bnb.optim.AdamW8bit(params, lr=lr, betas=betas,
-                                            weight_decay=weight_decay)
-            return optimizer, "AdamW8bit (bitsandbytes)"
-        except Exception as exc:  # noqa: BLE001 — fall back, never fail the run
-            note = f"bitsandbytes unavailable ({type(exc).__name__}: {exc}) — plain AdamW"
-    else:
-        note = "plain AdamW (8-bit disabled by the hardware plan)"
-    return torch.optim.AdamW(params, lr=lr, betas=betas,
-                             weight_decay=weight_decay), note
+    if not use_8bit_adam:
+        # The plan says plain AdamW: build exactly that, and say so.
+        return torch.optim.AdamW(params, lr=lr, betas=betas,
+                                 weight_decay=weight_decay), OPTIMIZER_PLAIN
+    try:
+        import bitsandbytes as bnb
+    except Exception as exc:  # noqa: BLE001 — any import failure is fatal here
+        raise RuntimeError(
+            _8bit_unavailable_message(f"import failed ({type(exc).__name__}: {exc})")
+        ) from exc
+    try:
+        optimizer = bnb.optim.AdamW8bit(params, lr=lr, betas=betas,
+                                        weight_decay=weight_decay)
+    except Exception as exc:  # noqa: BLE001 — a CUDA/build problem, not a fallback
+        raise RuntimeError(
+            _8bit_unavailable_message(
+                f"AdamW8bit construction failed ({type(exc).__name__}: {exc}) — "
+                "usually a bitsandbytes/CUDA build mismatch")
+        ) from exc
+    return optimizer, OPTIMIZER_8BIT
 
 
 def clip_and_norm(parameters: Iterable[Any], max_norm: float) -> float:
@@ -293,6 +338,8 @@ def rows_to_tensor(
 
 __all__ = [
     "HAS_TORCH",
+    "OPTIMIZER_8BIT",
+    "OPTIMIZER_PLAIN",
     "autocast_kwargs",
     "build_optimizer",
     "clip_and_norm",
