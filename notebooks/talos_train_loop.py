@@ -33,7 +33,8 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import (Any, Callable, Dict, Iterator, List, Mapping,
+                    Optional)
 
 from talos_stages import (MAX_CONSECUTIVE_SKIPPED, NonFiniteAbort, SkipTracker,
                           TokenAccountant, lr_at, plan_step)
@@ -103,6 +104,10 @@ class StepInfo:
     skipped_updates: int
     stage: str
     rows_in_epoch: int = 0
+    #: The rest of ``SkipTracker``'s state (fix 3), so every checkpoint carries
+    #: the counters a resumed session restores instead of restarting at zero.
+    consecutive_skips: int = 0
+    last_skip_reason: str = ""
     #: Rolling tokens/sec over the CURRENT session's deltas (``None`` until the
     #: session has measured anything). Additive: the metrics row's own field
     #: names and order are unchanged; the notebook passes this value through.
@@ -124,6 +129,8 @@ class StepInfo:
             "skipped_updates": self.skipped_updates,
             "stage": self.stage,
             "rows_in_epoch": self.rows_in_epoch,
+            "consecutive_skips": self.consecutive_skips,
+            "last_skip_reason": self.last_skip_reason,
             "tokens_per_sec": self.tokens_per_sec,
             "eta_s": self.eta_s,
         }
@@ -203,6 +210,7 @@ def train_stage(
     on_log: Optional[Callable[[StepInfo], None]] = None,
     on_skip: Optional[Callable[[str, StepInfo], None]] = None,
     skip_tracker: Optional[SkipTracker] = None,
+    skip_state: Optional[Mapping[str, Any]] = None,
     clock: Callable[[], float] = time.time,
     say: Callable[[str], None] = print,
     elapsed_offset_s: float = 0.0,
@@ -226,6 +234,13 @@ def train_stage(
         on_log: ``(StepInfo) -> None``; builds the metrics row / display.
         on_skip: ``(reason, StepInfo) -> None``; logs a skipped update.
         skip_tracker: injectable counter (tests inspect it).
+        skip_state: the resumed run's skip counters
+            (``{"total", "consecutive", "last_reason"}``, from the loaded
+            checkpoint's metadata via ``skip_state_from_metadata``). Restored
+            into a fresh tracker so ``total`` continues across sessions and a
+            session that starts with ``consecutive`` already at the limit aborts
+            on its next skip — correct behaviour; the abort message already
+            advises resuming from an older step.
         clock: monotonic seconds (injectable for tests).
         say: line printer (``print`` in the notebook, ``list.append`` in tests).
         elapsed_offset_s: wall-clock seconds this stage had already spent in
@@ -245,7 +260,16 @@ def train_stage(
             (a checkpoint is written first).
     """
     rows: Iterator[Any] = iter(stream)
-    skips = skip_tracker or SkipTracker(max_consecutive=config.max_consecutive_skips)
+    if skip_tracker is not None:
+        skips = skip_tracker
+    elif skip_state:
+        skips = SkipTracker.from_state(skip_state,
+                                       max_consecutive=config.max_consecutive_skips)
+        say(f"skip counters restored: {skips.total} skipped update(s) total, "
+            f"{skips.consecutive} consecutive"
+            + (f" (last reason: {skips.last_reason})" if skips.last_reason else ""))
+    else:
+        skips = SkipTracker(max_consecutive=config.max_consecutive_skips)
     start = clock()
     last_ckpt_at = start
     #: Prior sessions' wall clock: without it, every resumed run reported an
@@ -282,6 +306,8 @@ def train_stage(
             skipped_updates=int(skips.total),
             stage=str(stage_key),
             rows_in_epoch=int(getattr(stream.position, "rows_in_epoch", 0)),
+            consecutive_skips=int(skips.consecutive),
+            last_skip_reason=str(skips.last_reason),
             tokens_per_sec=throughput.tokens_per_sec(),
             eta_s=throughput.eta_s(int(accountant.consumed),
                                    int(accountant.token_budget)),

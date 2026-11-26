@@ -743,6 +743,46 @@ class SkipTracker:
             "last_skip_reason": self.last_reason,
         }
 
+    @classmethod
+    def from_state(cls, state: Mapping[str, Any], *, max_consecutive: int) -> "SkipTracker":
+        """Restore a tracker from a checkpoint's persisted counters.
+
+        ``state`` is what :func:`skip_state_from_metadata` returns; the limit
+        always comes from the current config, never from the checkpoint (the
+        policy is this session's, the history is the run's).
+        """
+        if not isinstance(state, Mapping):
+            raise ValueError("skip_state must be a mapping")
+        return cls(
+            max_consecutive=int(max_consecutive),
+            total=max(0, int(state.get("total") or 0)),
+            consecutive=max(0, int(state.get("consecutive") or 0)),
+            last_reason=str(state.get("last_reason") or ""),
+        )
+
+
+def skip_state_from_metadata(
+    metadata: Optional[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """A checkpoint's persisted skip counters, or ``None`` when it has none.
+
+    All three of :class:`SkipTracker`'s fields live in the checkpoint's
+    ``run_metadata`` (``skipped_updates`` / ``consecutive_skips`` /
+    ``last_skip_reason``). A checkpoint written before they existed returns
+    ``None``: the caller warns once and the counters start at zero, rather than
+    crashing on a missing field (the audit round's ``_fmt_int`` lesson).
+    """
+    if not isinstance(metadata, Mapping):
+        return None
+    keys = ("skipped_updates", "consecutive_skips", "last_skip_reason")
+    if not any(key in metadata for key in keys):
+        return None
+    return {
+        "total": max(0, int(metadata.get("skipped_updates") or 0)),
+        "consecutive": max(0, int(metadata.get("consecutive_skips") or 0)),
+        "last_reason": str(metadata.get("last_skip_reason") or ""),
+    }
+
 
 
 # ---------------------------------------------------------------------------
@@ -961,6 +1001,7 @@ __all__ = [
     "plan_step",
     "resume_position",
     "simulate_run",
+    "skip_state_from_metadata",
     "stage_a_budget",
     "stage_b_budget",
     "stage_out_dir",
