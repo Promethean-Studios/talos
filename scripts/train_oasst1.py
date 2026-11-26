@@ -116,6 +116,18 @@ from tokenizer.tokenizer import (  # noqa: E402
 )
 from tokenizer.train import train_tokenizer  # noqa: E402
 
+# The resume-config contract lives in a torch-free module so its comparison
+# logic is unit-tested without torch (tests/test_resume_training_config.py).
+_NOTEBOOKS_DIR = os.path.join(_REPO_ROOT, "notebooks")
+if _NOTEBOOKS_DIR not in sys.path:
+    sys.path.append(_NOTEBOOKS_DIR)
+
+from talos_resume_config import (  # noqa: E402
+    ResumeConfigError,
+    token_budget_extension,
+    validate_training_config,
+)
+
 log = get_logger("scripts.train_oasst1")
 
 CHECKPOINT_FORMAT = "talos-training-checkpoint-v1"
@@ -451,7 +463,13 @@ def list_checkpoint_candidates(checkpoint_dir: str) -> List[str]:
     return [path for _, path in entries]
 
 
-def validate_resume_checkpoint(ckpt: dict, preset: str) -> None:
+def validate_resume_checkpoint(
+    ckpt: dict,
+    preset: str,
+    *,
+    training_config: Optional[dict] = None,
+    acknowledge: Optional[Iterable[str]] = None,
+) -> List[str]:
     """Sanity checks a checkpoint must pass to resume from (shared by the
     explicit-file and directory-scan paths). Raises ``ValueError`` naming the
     failing contract — reused verbatim by the corrupt-fallback scanner.
@@ -464,6 +482,23 @@ def validate_resume_checkpoint(ckpt: dict, preset: str) -> None:
     ~386 MiB load/compare, and the directory scanner falls back to the previous
     valid checkpoint. Full tensor *values* are still verified implicitly by
     ``load_state_dict`` inside :func:`train_epochs`.
+
+    Fix 2 (2026-11-25): when the caller passes this run's
+    ``training_config`` snapshot, the checkpoint's own snapshot is compared
+    field by field (:func:`talos_resume_config.validate_training_config`) and a
+    mismatch raises :class:`talos_resume_config.ResumeConfigError` naming every
+    rejected field and both values. ``acknowledge`` is the set of field names
+    the operator has explicitly acknowledged (``RESUME_ACKNOWLEDGE``), which is
+    the only way a repo-pin change, a torch major/minor change or a **larger**
+    budget is accepted; a shrunk budget and any optimizer/precision/batch/seed/
+    shuffle/schedule change are never acknowledged. Callers that pass no
+    ``training_config`` (the storage tiering's load check, the Stage-B init
+    load) keep the pre-existing behaviour exactly.
+
+    Returns the warning lines to print (a missing snapshot on an old
+    checkpoint, a torch patch-version change, an acknowledged change); the
+    notebook's resume cell prints them. Never raises on a *missing* field — an
+    old checkpoint still resumes under the pre-existing checks.
     """
     if ckpt.get("format") != CHECKPOINT_FORMAT:
         raise ValueError(
@@ -511,6 +546,12 @@ def validate_resume_checkpoint(ckpt: dict, preset: str) -> None:
                 f"{tuple(exp_shape)} \u2014 truncated or mismatched state dict "
                 "(e.g. an interrupted Drive upload); refusing to resume"
             )
+    # ---- fix 2: the full training-config snapshot ----
+    if training_config is None:
+        return []
+    return validate_training_config(
+        ckpt.get("training_config"), training_config, acknowledge=acknowledge
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -986,6 +1027,8 @@ def save_checkpoint(
     run_metadata: Optional[dict] = None,
     tokenizer_fingerprint: Optional[str] = None,
     last_grad_norm: Optional[float] = None,
+    # Fix 2 (2026-11-25): the full training-config snapshot (additive metadata)
+    training_config: Optional[dict] = None,
     # T4 engine pass (P5): staging + fsync
     stager: Optional["CheckpointStager"] = None,
     fsync: bool = True,
@@ -1007,7 +1050,8 @@ def save_checkpoint(
     numeric-newest resume scan would otherwise select. ``last_grad_norm`` is
     the pre-clip total grad norm of the most recent clipped step
     (``--grad-clip`` > 0; ``None`` when clipping is off or before the first
-    clipped step).
+    clipped step). ``training_config`` is the additive training-config snapshot
+    (fix 2) that a resume is validated against.
     """
     cfg = model.config
     if tokenizer_fingerprint is None:
@@ -1044,6 +1088,14 @@ def save_checkpoint(
         #: ``None`` when --grad-clip is off. The *flag* lives in
         #: run_metadata.training_config; this is the dynamic value.
         "last_grad_norm": None if last_grad_norm is None else float(last_grad_norm),
+        #: Full training-config snapshot (additive, v1 format): repo pin, seed,
+        #: shuffle buffer, dependency versions, optimizer identity, precision +
+        #: master-weight dtype, effective batch, LR schedule and token/step
+        #: budget. ``validate_resume_checkpoint`` compares it field by field.
+        #: ``None`` for callers that do not build one (the trainer's own
+        #: resume path, the CPU smoke run) — a checkpoint without it still
+        #: loads, and a resume only warns about the missing snapshot.
+        "training_config": training_config,
     }
     # P5 (atomic + durable, Drive-aware). When a local staging dir is
     # configured the write goes to the LOCAL filesystem (tmp + fsync +
